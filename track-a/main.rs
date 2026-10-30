@@ -434,7 +434,7 @@ fn main() {
                 let write_idx = t_write_pos[gid];
                 t_write_pos[gid] += 1;
                 unsafe {
-                    *arena.add(write_idx) = lat;
+                    *arena.add(write_idx as usize) = lat;
                 }
             }
         }));

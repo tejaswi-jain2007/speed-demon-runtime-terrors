@@ -96,25 +96,28 @@ impl MinHeap {
         let min = self.data[0];
         let last = self.data.pop().unwrap();
         if !self.data.is_empty() {
-            self.data[0] = last;
             let mut idx = 0;
             let len = self.data.len();
             loop {
-                let mut best = idx;
                 let child = (idx << 2) + 1;
+                if child >= len {
+                    break;
+                }
+                let mut best = child;
                 let end = (child + 4).min(len);
-                for c in child..end {
+                for c in (child + 1)..end {
                     if unsafe { self.data.get_unchecked(c).0 < self.data.get_unchecked(best).0 } {
                         best = c;
                     }
                 }
-                if best != idx {
-                    self.data.swap(idx, best);
+                if unsafe { self.data.get_unchecked(best).0 < last.0 } {
+                    unsafe { *self.data.get_unchecked_mut(idx) = *self.data.get_unchecked(best); }
                     idx = best;
                 } else {
                     break;
                 }
             }
+            self.data[idx] = last;
         }
         min
     }
@@ -234,7 +237,7 @@ fn main() {
     drop(q_mmap);
 
     let num_queries = queries.len();
-    let num_workers = 4.min(num_queries).max(1);
+    let num_workers = 10.min(num_queries).max(1);
     let per_worker = (num_queries + num_workers - 1) / num_workers;
 
     let head_arc = Arc::new(head);
