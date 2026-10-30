@@ -75,25 +75,17 @@ int main(int argc, char* argv[]) {
     gp = parse_u32(gp, g_end, n);
     gp = parse_u32(gp, g_end, m);
 
-    // Temp raw edges to build CSR
-    struct RawEdge {
-        uint32_t u, v, w;
-    };
-    std::vector<RawEdge> raw_edges(m);
+    const char* gp_save = gp;
     std::vector<uint32_t> degree(n, 0);
-
     for (uint32_t i = 0; i < m; ++i) {
         uint32_t u = 0, v = 0, w = 0;
         gp = parse_u32(gp, g_end, u);
         gp = parse_u32(gp, g_end, v);
         gp = parse_u32(gp, g_end, w);
-        raw_edges[i] = {u, v, w};
         degree[u]++;
     }
-    munmap(const_cast<char*>(g_data), g_size);
-    close(g_fd);
 
-    // Build CSR
+    // Build CSR offsets
     std::vector<uint32_t> head(n + 1, 0);
     for (uint32_t i = 0; i < n; ++i) {
         head[i + 1] = head[i] + degree[i];
@@ -101,13 +93,18 @@ int main(int argc, char* argv[]) {
 
     std::vector<Edge> edges(m);
     std::vector<uint32_t> cur_pos = head;
+    gp = gp_save;
     for (uint32_t i = 0; i < m; ++i) {
-        uint32_t u = raw_edges[i].u;
+        uint32_t u = 0, v = 0, w = 0;
+        gp = parse_u32(gp, g_end, u);
+        gp = parse_u32(gp, g_end, v);
+        gp = parse_u32(gp, g_end, w);
         uint32_t idx = cur_pos[u]++;
-        edges[idx] = {raw_edges[i].v, raw_edges[i].w};
+        edges[idx] = {v, w};
     }
-    raw_edges.clear();
-    raw_edges.shrink_to_fit();
+
+    munmap(const_cast<char*>(g_data), g_size);
+    close(g_fd);
 
     // 2. Read queries.txt
     int q_fd = open(queries_path.c_str(), O_RDONLY);
@@ -139,14 +136,15 @@ int main(int argc, char* argv[]) {
         qp = parse_u32(qp, q_end, t);
         queries.push_back({s, t});
     }
+
     munmap(const_cast<char*>(q_data), q_size);
     close(q_fd);
 
     size_t num_queries = queries.size();
     std::vector<int64_t> answers(num_queries, -1);
 
-    // 3. Parallel Dijkstra on 6 dedicated physical P-cores
-    unsigned int num_threads = 6;
+    // 3. Parallel Dijkstra across 12 hardware threads
+    unsigned int num_threads = 12;
     unsigned int hw = std::thread::hardware_concurrency();
     if (hw > 0 && hw < num_threads) num_threads = hw;
     if (num_queries < num_threads) num_threads = static_cast<unsigned int>(num_queries);
