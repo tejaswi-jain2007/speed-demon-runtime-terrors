@@ -268,9 +268,9 @@ fn main() {
         let end = splits[t + 1];
         parse_handles.push(thread::spawn(move || {
             let d = mmap_ref.as_slice();
-            let mut ep_table = EpTable::new(2048);
+            let mut ep_table = EpTable::new(4096);
             let mut records: Vec<(u32, u32)> = Vec::with_capacity((end - start) / 40);
-            let mut errors = vec![0u32; 72 * 1024];
+            let mut errors = vec![0u32; 72 * 2048];
 
             let mut p = start;
             let mut last_evict = start;
@@ -319,7 +319,7 @@ fn main() {
                 while p < end && d[p] != b'\n' { p += 1; }
                 if p < end { p += 1; }
 
-                let key = (h_idx as u32) * 1024 + local_ep_id;
+                let key = (h_idx as u32) * 2048 + local_ep_id;
                 records.push((key, lat));
                 if is_err {
                     errors[key as usize] += 1;
@@ -374,8 +374,8 @@ fn main() {
         let t_map = &thread_to_global[t];
         let mut t_counts = vec![0u32; total_groups];
         for &(key, _) in t_records {
-            let h = (key / 1024) as usize;
-            let local_id = (key % 1024) as usize;
+            let h = (key / 2048) as usize;
+            let local_id = (key % 2048) as usize;
             let g_id = t_map[local_id] as usize;
             let target_gid = h * num_global_eps + g_id;
             t_counts[target_gid] += 1;
@@ -383,8 +383,8 @@ fn main() {
         }
         for (key, &err) in t_errors.iter().enumerate() {
             if err > 0 {
-                let h = key / 1024;
-                let local_id = key % 1024;
+                let h = key / 2048;
+                let local_id = key % 2048;
                 if local_id < t_map.len() {
                     let g_id = t_map[local_id] as usize;
                     let target_gid = h * num_global_eps + g_id;
@@ -440,8 +440,8 @@ fn main() {
         scatter_handles.push(thread::spawn(move || {
             let arena = flat_arena_ptr as *mut u32;
             for (key, lat) in records {
-                let h = (key / 1024) as usize;
-                let local_id = (key % 1024) as usize;
+                let h = (key / 2048) as usize;
+                let local_id = (key % 2048) as usize;
                 let g_id = t_map[local_id] as usize;
                 let target_gid = h * num_global_eps + g_id;
                 let write_idx = t_pos[target_gid];
