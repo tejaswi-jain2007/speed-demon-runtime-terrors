@@ -289,6 +289,7 @@ fn main() {
     }
     drop(q_mmap);
 
+    let num_queries = queries.len();
     // 6 workers with ultra-compact 3.48MB u16 distance arrays = 20.8MB worker RAM (68.0MB peak process RSS, sub-0.8s runtime)
     let num_workers = 6.min(num_queries).max(1);
 
