@@ -154,8 +154,19 @@ fn parse_csv_chunk(
     let mut p = start;
     let chunk_end = end;
     let mut filter = vec![0u64; 65536];
+    let mut last_evict = start;
 
     while p < chunk_end {
+        if p - last_evict >= 256 * 1024 {
+            let evict_len = ((p - last_evict) / 4096) * 4096;
+            if evict_len > 0 {
+                unsafe {
+                    madvise(rec_data.as_ptr().add(last_evict) as *mut u8, evict_len, 4);
+                }
+                last_evict += evict_len;
+            }
+        }
+
         if p + 3 <= chunk_end && rec_data[p] == 0xEF && rec_data[p + 1] == 0xBB && rec_data[p + 2] == 0xBF {
             p += 3;
         }
@@ -307,6 +318,12 @@ fn parse_csv_chunk(
         if filter[slot] != packed {
             filter[slot] = packed;
             local_names.push(packed);
+        }
+    }
+
+    if chunk_end > last_evict {
+        unsafe {
+            madvise(rec_data.as_ptr().add(last_evict) as *mut u8, chunk_end - last_evict, 4);
         }
     }
 }
@@ -540,20 +557,20 @@ fn main() {
     }
     drop(thread_results);
 
-    // Parallel in-place country distinct counting across 12 threads
-    let cn_arc = Arc::new(country_names);
+    // Parallel in-place country distinct counting across threads (zero clone)
+    let country_names_ptr = country_names.as_mut_ptr() as usize;
     let mut dedup_handles = Vec::with_capacity(num_threads);
     let c_per_thread = (num_countries + num_threads - 1) / num_threads;
 
     for t in 0..num_threads {
-        let cn_ref = Arc::clone(&cn_arc);
         let start_c = t * c_per_thread;
         let end_c = (start_c + c_per_thread).min(num_countries);
 
         dedup_handles.push(thread::spawn(move || {
+            let c_ptr = country_names_ptr as *mut Vec<u64>;
             let mut counts = Vec::with_capacity(end_c - start_c);
             for c in start_c..end_c {
-                let mut list = cn_ref[c].clone();
+                let list = unsafe { &mut *c_ptr.add(c) };
                 if list.is_empty() {
                     counts.push((c, 0));
                 } else {

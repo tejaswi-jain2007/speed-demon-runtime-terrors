@@ -285,8 +285,8 @@ fn main() {
     drop(q_mmap);
 
     let num_queries = queries.len();
-    // 10 workers with ultra-compact 3.48MB u16 distance arrays = sub-0.70s runtime
-    let num_workers = 10.min(num_queries).max(1);
+    // 5 workers: 5 * 3.48MB dist16 + 47.5MB graph = 65MB peak RSS (strictly <= 70MB)
+    let num_workers = 5.min(num_queries).max(1);
 
     let head_arc = Arc::new(head);
     let edges_arc = Arc::new(edges);
@@ -353,8 +353,8 @@ fn main() {
                         break;
                     }
 
-                    let start = head_ref[u as usize] as usize;
-                    let end = head_ref[(u + 1) as usize] as usize;
+                    let start = *unsafe { head_ref.get_unchecked(u as usize) } as usize;
+                    let end = *unsafe { head_ref.get_unchecked((u + 1) as usize) } as usize;
                     for ei in start..end {
                         let e = unsafe { edges_ref.get_unchecked(ei) };
                         let nd = d + e.weight;
@@ -375,7 +375,7 @@ fn main() {
                             if cur_stored == 0 {
                                 touched.push(e.to);
                             }
-                            dist16[e.to as usize] = (nd + 1) as u16;
+                            unsafe { *dist16.get_unchecked_mut(e.to as usize) = (nd + 1) as u16; }
                             pq.push(nd, e.to);
                         }
                     }
@@ -385,7 +385,7 @@ fn main() {
                 }
 
                 for &u in &touched {
-                    dist16[u as usize] = 0;
+                    unsafe { *dist16.get_unchecked_mut(u as usize) = 0; }
                 }
                 touched.clear();
                 pq.clear();
