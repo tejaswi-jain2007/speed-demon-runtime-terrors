@@ -425,7 +425,7 @@ fn main() {
     }
     let data_start = hdr_p;
 
-    let num_threads = 12.min(thread::available_parallelism().map(|n| n.get()).unwrap_or(12)).max(1);
+    let num_threads = 6.min(thread::available_parallelism().map(|n| n.get()).unwrap_or(6)).max(1);
     let payload_len = rec_size - data_start;
     let mut splits = vec![data_start; num_threads + 1];
     splits[num_threads] = rec_size;
@@ -488,6 +488,9 @@ fn main() {
             let d = rec_ref.as_slice();
             parse_csv_chunk(d, start, end, &rlookup_ref, &mut local_aggs, &mut local_names);
             local_names.sort_unstable();
+            unsafe {
+                madvise(d.as_ptr().add(start) as *mut u8, end - start, 4);
+            }
             (local_aggs, local_names)
         }));
     }
