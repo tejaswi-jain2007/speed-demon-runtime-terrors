@@ -454,21 +454,29 @@ fn main() {
     let arena_ptr = flat_arena.as_mut_ptr() as usize;
     let mut sort_handles = Vec::with_capacity(num_threads);
 
+    let g_counts_arc = Arc::new(global_counts);
+    let g_errors_arc = Arc::new(global_errors);
+    let g_offsets_arc = Arc::new(group_offsets);
+    let g_eps_arc = Arc::new(global_endpoints);
+    let h_strs_arc = Arc::new(hour_strings);
+    let active_groups_arc = Arc::new(active_groups);
+
     for t in 0..num_threads {
         let start_idx = t * active_per_thread;
         let end_idx = (start_idx + active_per_thread).min(num_active);
-        let active_slice = active_groups[start_idx..end_idx].to_vec();
-        let g_counts = global_counts.clone();
-        let g_errors = global_errors.clone();
-        let g_offsets = group_offsets.clone();
-        let g_eps = global_endpoints.clone();
-        let h_strs = hour_strings.clone();
+        let g_counts = Arc::clone(&g_counts_arc);
+        let g_errors = Arc::clone(&g_errors_arc);
+        let g_offsets = Arc::clone(&g_offsets_arc);
+        let g_eps = Arc::clone(&g_eps_arc);
+        let h_strs = Arc::clone(&h_strs_arc);
+        let active_ref = Arc::clone(&active_groups_arc);
 
         sort_handles.push(thread::spawn(move || {
             let arena = arena_ptr as *mut u32;
             let mut out = Vec::with_capacity(32 * 1024);
 
-            for &g in &active_slice {
+            for idx in start_idx..end_idx {
+                let g = active_ref[idx];
                 let h_idx = g / num_global_eps;
                 let ep_idx = g % num_global_eps;
                 let count = g_counts[g] as usize;
