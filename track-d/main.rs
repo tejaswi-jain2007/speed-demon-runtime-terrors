@@ -164,7 +164,7 @@ fn main() {
     drop(q_mmap);
 
     let num_queries = queries.len();
-    let num_workers = 4.min(num_queries).max(1);
+    let num_workers = 5.min(num_queries).max(1);
     let (head_arc, edges_arc, in_arc, queries_arc, next_q_arc) =
         (Arc::new(head), Arc::new(edges), Arc::new(has_in_edges), Arc::new(queries), Arc::new(AtomicUsize::new(0)));
     let mut all_answers = vec![0i64; num_queries];
