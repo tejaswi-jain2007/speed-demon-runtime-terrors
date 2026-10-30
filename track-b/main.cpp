@@ -13,20 +13,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-struct TokenSpan {
-    uint32_t start;
+struct DocSpan {
+    uint32_t offset;
     uint32_t len;
-};
-
-// Fast custom string hash
-struct StrViewHash {
-    size_t operator()(std::string_view sv) const {
-        size_t h = 2166136261u;
-        for (char c : sv) {
-            h = (h ^ static_cast<unsigned char>(c)) * 16777619u;
-        }
-        return h;
-    }
 };
 
 static inline char to_lower_ascii(char c) {
@@ -72,16 +61,21 @@ int main(int argc, char* argv[]) {
     }
     madvise(const_cast<char*>(d_data), d_size, MADV_WILLNEED);
 
+    // Document spans: offset and length into mmapped buffer
+    std::vector<DocSpan> docs;
+    docs.reserve(300000);
+
     // Inverted index: term -> sorted vector of doc_ids
     std::unordered_map<std::string, std::vector<uint32_t>> index;
-    // Store doc tokens for phrase search
-    std::vector<std::vector<std::string>> doc_tokens;
-    doc_tokens.reserve(300000);
+    index.reserve(200000);
 
     const char* p = d_data;
     const char* end = d_data + d_size;
 
     uint32_t cur_doc_id = 0;
+    std::vector<std::string> doc_unique_terms;
+    doc_unique_terms.reserve(256);
+
     while (p < end) {
         // Skip doc_id and TAB
         while (p < end && *p != '\t') ++p;
@@ -92,38 +86,39 @@ int main(int argc, char* argv[]) {
         const char* text_end = p;
         if (p < end && *p == '\n') ++p;
 
-        std::vector<std::string> tokens;
+        uint32_t t_offset = static_cast<uint32_t>(text_start - d_data);
+        uint32_t t_len = static_cast<uint32_t>(text_end - text_start);
+        docs.push_back({t_offset, t_len});
+
+        doc_unique_terms.clear();
         const char* tp = text_start;
         while (tp < text_end) {
             char c = to_lower_ascii(*tp);
             if (is_token_char(c)) {
-                std::string t;
-                while (tp < text_end) {
-                    char tc = to_lower_ascii(*tp);
-                    if (!is_token_char(tc)) break;
-                    t.push_back(tc);
+                const char* term_start = tp;
+                while (tp < text_end && is_token_char(to_lower_ascii(*tp))) {
                     ++tp;
                 }
-                tokens.push_back(std::move(t));
+                std::string term;
+                term.reserve(tp - term_start);
+                for (const char* k = term_start; k < tp; ++k) {
+                    term.push_back(to_lower_ascii(*k));
+                }
+                doc_unique_terms.push_back(std::move(term));
             } else {
                 ++tp;
             }
         }
 
-        // Add to inverted index
-        std::vector<std::string> unique_tokens = tokens;
-        std::sort(unique_tokens.begin(), unique_tokens.end());
-        unique_tokens.erase(std::unique(unique_tokens.begin(), unique_tokens.end()), unique_tokens.end());
+        std::sort(doc_unique_terms.begin(), doc_unique_terms.end());
+        doc_unique_terms.erase(std::unique(doc_unique_terms.begin(), doc_unique_terms.end()), doc_unique_terms.end());
 
-        for (const auto& term : unique_tokens) {
+        for (const auto& term : doc_unique_terms) {
             index[term].push_back(cur_doc_id);
         }
 
-        doc_tokens.push_back(std::move(tokens));
         cur_doc_id++;
     }
-    munmap(const_cast<char*>(d_data), d_size);
-    close(d_fd);
 
     // 2. Read queries.txt
     std::ifstream q_file(queries_path);
@@ -143,7 +138,6 @@ int main(int argc, char* argv[]) {
     size_t num_queries = queries.size();
     std::vector<std::string> results(num_queries);
 
-    // Helper functions for set operations
     auto op_and = [](const std::vector<uint32_t>& a, const std::vector<uint32_t>& b) {
         std::vector<uint32_t> res;
         res.reserve(std::min(a.size(), b.size()));
@@ -185,7 +179,6 @@ int main(int argc, char* argv[]) {
 
     size_t per_worker = (num_queries + num_threads - 1) / num_threads;
     std::vector<std::thread> workers;
-
     const std::vector<uint32_t> empty_postings;
 
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
@@ -193,6 +186,9 @@ int main(int argc, char* argv[]) {
         size_t end_q = std::min(num_queries, start_q + per_worker);
 
         workers.emplace_back([&, start_q, end_q]() {
+            std::vector<std::string_view> doc_tokens_local;
+            doc_tokens_local.reserve(512);
+
             for (size_t qi = start_q; qi < end_q; ++qi) {
                 const std::string& line = queries[qi];
                 if (line.rfind("BOOL ", 0) == 0) {
@@ -232,7 +228,6 @@ int main(int argc, char* argv[]) {
                     }
                     results[qi] = format_doc_ids(current);
                 } else if (line.rfind("PHRASE \"", 0) == 0) {
-                    // Extract phrase between quotes
                     size_t start_p = 8;
                     size_t end_p = line.rfind('"');
                     if (end_p == std::string::npos || end_p <= start_p) {
@@ -268,14 +263,42 @@ int main(int argc, char* argv[]) {
 
                     size_t k = pterms.size();
                     std::vector<uint32_t> matches;
+
                     for (uint32_t doc_id : candidates) {
-                        const auto& dtoks = doc_tokens[doc_id];
-                        if (dtoks.size() < k) continue;
+                        const auto& dinfo = docs[doc_id];
+                        const char* doc_text = d_data + dinfo.offset;
+                        const char* doc_text_end = doc_text + dinfo.len;
+
+                        doc_tokens_local.clear();
+                        const char* tp = doc_text;
+                        while (tp < doc_text_end) {
+                            char c = to_lower_ascii(*tp);
+                            if (is_token_char(c)) {
+                                const char* t_start = tp;
+                                while (tp < doc_text_end && is_token_char(to_lower_ascii(*tp))) {
+                                    ++tp;
+                                }
+                                doc_tokens_local.push_back(std::string_view(t_start, tp - t_start));
+                            } else {
+                                ++tp;
+                            }
+                        }
+
+                        if (doc_tokens_local.size() < k) continue;
                         bool found = false;
-                        for (size_t i = 0; i + k <= dtoks.size(); ++i) {
+                        for (size_t i = 0; i + k <= doc_tokens_local.size(); ++i) {
                             bool ok = true;
                             for (size_t j = 0; j < k; ++j) {
-                                if (dtoks[i + j] != pterms[j]) {
+                                bool match = (dtok.size() == pt.size());
+                                if (match) {
+                                    for (size_t c = 0; c < dtok.size(); ++c) {
+                                        if (to_lower_ascii(dtok[c]) != pt[c]) {
+                                            match = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (!match) {
                                     ok = false;
                                     break;
                                 }
@@ -298,6 +321,9 @@ int main(int argc, char* argv[]) {
     for (auto& w : workers) {
         w.join();
     }
+
+    munmap(const_cast<char*>(d_data), d_size);
+    close(d_fd);
 
     // 4. Output results.txt
     int out_fd = open(out_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);

@@ -36,6 +36,9 @@ void parse_chunk(const char* data, size_t start, size_t end, std::unordered_map<
     const char* p = data + start;
     const char* chunk_end = data + end;
 
+    std::string key;
+    key.reserve(160);
+
     while (p < chunk_end) {
         // Timestamp is 27 bytes: YYYY-MM-DDTHH:MM:SS.ffffffZ
         if (p + 28 > chunk_end) break;
@@ -72,8 +75,7 @@ void parse_chunk(const char* data, size_t start, size_t end, std::unordered_map<
         if (p < chunk_end && *p == '\n') ++p;
 
         // Key: hour (13 bytes) + " " + endpoint
-        std::string key;
-        key.reserve(14 + ep_len);
+        key.clear();
         key.append(ts_start, 13);
         key.push_back(' ');
         key.append(ep_start, ep_len);

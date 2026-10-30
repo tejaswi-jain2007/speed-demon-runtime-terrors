@@ -145,8 +145,8 @@ int main(int argc, char* argv[]) {
     size_t num_queries = queries.size();
     std::vector<int64_t> answers(num_queries, -1);
 
-    // 3. Parallel Dijkstra
-    unsigned int num_threads = 12;
+    // 3. Parallel Dijkstra on 6 dedicated physical P-cores
+    unsigned int num_threads = 6;
     unsigned int hw = std::thread::hardware_concurrency();
     if (hw > 0 && hw < num_threads) num_threads = hw;
     if (num_queries < num_threads) num_threads = static_cast<unsigned int>(num_queries);
