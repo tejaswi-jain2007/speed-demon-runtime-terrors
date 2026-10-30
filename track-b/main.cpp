@@ -27,7 +27,6 @@ static inline char to_lower_ascii(char c) {
     return c;
 }
 
-// Two-pointer set intersection
 static inline std::vector<uint32_t> intersect_sorted(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b) {
     std::vector<uint32_t> res;
     res.reserve(std::min(a.size(), b.size()));
@@ -46,7 +45,6 @@ static inline std::vector<uint32_t> intersect_sorted(const std::vector<uint32_t>
     return res;
 }
 
-// Two-pointer set union
 static inline std::vector<uint32_t> union_sorted(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b) {
     std::vector<uint32_t> res;
     res.reserve(a.size() + b.size());
@@ -67,7 +65,6 @@ static inline std::vector<uint32_t> union_sorted(const std::vector<uint32_t>& a,
     return res;
 }
 
-// Two-pointer set difference: a - b
 static inline std::vector<uint32_t> diff_sorted(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b) {
     std::vector<uint32_t> res;
     res.reserve(a.size());
@@ -163,7 +160,7 @@ int main(int argc, char* argv[]) {
                     if (op_sp == std::string_view::npos) break;
                     p = op_sp + 1;
                 }
-            } else if (line.starts_with("PHRASE \"") && line.ends_with("\"")) {
+            } else if (line.starts_with("PHRASE \"") && line.back() == '"') {
                 std::string_view inner = line.substr(8, line.size() - 9);
                 size_t p = 0;
                 while (p < inner.size()) {
@@ -231,7 +228,7 @@ int main(int argc, char* argv[]) {
             term_buf.clear();
             for (const char* k = wstart; k < tp; ++k) term_buf.push_back(to_lower_ascii(*k));
 
-            if (query_vocab.contains(term_buf) && doc_seen_terms.insert(term_buf).second) {
+            if (query_vocab.count(term_buf) > 0 && doc_seen_terms.insert(term_buf).second) {
                 index[term_buf].push_back(cur_doc_id);
             }
         }
@@ -290,7 +287,7 @@ int main(int argc, char* argv[]) {
                     out_buf.append(std::to_string(running[i]));
                 }
                 out_buf.push_back('\n');
-            } else if (line.starts_with("PHRASE \"") && line.ends_with("\"")) {
+            } else if (line.starts_with("PHRASE \"") && line.back() == '"') {
                 std::string_view inner = line.substr(8, line.size() - 9);
                 std::vector<std::string> words;
                 size_t p = 0;

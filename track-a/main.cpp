@@ -5,36 +5,43 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <map>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
-static inline uint64_t fnv1a(const char* data, size_t len, uint64_t h = 14695981039346656037ULL) {
+static inline uint64_t fnv1a_hash(const char* data, size_t len, uint64_t h = 14695981039346656037ULL) {
     for (size_t i = 0; i < len; ++i) {
         h = (h ^ static_cast<uint8_t>(data[i])) * 1099511628211ULL;
     }
     return h;
 }
 
-struct FastGroup {
-    uint64_t hash = 0;
-    uint32_t ts_offset = 0;
-    uint32_t ep_offset = 0;
+struct LocalGroup {
+    const char* ts_ptr = nullptr;
+    const char* ep_ptr = nullptr;
     uint16_t ep_len = 0;
     uint32_t count = 0;
     uint32_t errors = 0;
     std::vector<uint32_t> latencies;
 };
 
-// 16384 slots table: ~3% load factor for 500 groups -> 1 probe average in L1
-constexpr size_t TABLE_CAP = 16384;
-constexpr size_t TABLE_MASK = TABLE_CAP - 1;
+struct MergedGroup {
+    std::string hour;
+    std::string endpoint;
+    uint64_t count = 0;
+    uint64_t errors = 0;
+    std::vector<uint32_t> latencies;
+    uint32_t p50 = 0;
+    uint32_t p95 = 0;
+    uint32_t p99 = 0;
+    uint64_t error_ppm = 0;
+};
 
-void parse_chunk(const char* data, size_t start, size_t end, std::vector<FastGroup>& table, std::vector<uint16_t>& active_slots) {
+void parse_chunk(const char* data, size_t start, size_t end, std::unordered_map<uint64_t, LocalGroup>& local_map) {
     const char* p = data + start;
     const char* chunk_end = data + end;
 
@@ -71,30 +78,18 @@ void parse_chunk(const char* data, size_t start, size_t end, std::vector<FastGro
         if (p < chunk_end && *p == '\r') ++p;
         if (p < chunk_end && *p == '\n') ++p;
 
-        // 64-bit FNV-1a hash of (hour 13 bytes, endpoint)
-        uint64_t h = fnv1a(ep_start, ep_len, fnv1a(ts_start, 13));
+        // 64-bit hash composite of hour (13 bytes) + endpoint
+        uint64_t key_hash = fnv1a_hash(ep_start, ep_len, fnv1a_hash(ts_start, 13));
 
-        size_t slot = static_cast<size_t>(h) & TABLE_MASK;
-        while (table[slot].hash != 0) {
-            if (table[slot].hash == h &&
-                table[slot].ep_len == ep_len &&
-                memcmp(data + table[slot].ts_offset, ts_start, 13) == 0 &&
-                memcmp(data + table[slot].ep_offset, ep_start, ep_len) == 0) {
-                break;
-            }
-            slot = (slot + 1) & TABLE_MASK;
+        auto [it, inserted] = local_map.try_emplace(key_hash);
+        if (inserted) {
+            it->second.ts_ptr = ts_start;
+            it->second.ep_ptr = ep_start;
+            it->second.ep_len = static_cast<uint16_t>(ep_len);
+            it->second.latencies.reserve(8192);
         }
 
-        FastGroup& grp = table[slot];
-        if (grp.hash == 0) {
-            grp.hash = h;
-            grp.ts_offset = static_cast<uint32_t>(ts_start - data);
-            grp.ep_offset = static_cast<uint32_t>(ep_start - data);
-            grp.ep_len = static_cast<uint16_t>(ep_len);
-            grp.latencies.reserve(16384);
-            active_slots.push_back(static_cast<uint16_t>(slot));
-        }
-
+        LocalGroup& grp = it->second;
         grp.count++;
         if (status >= 500 && status <= 599) {
             grp.errors++;
@@ -102,18 +97,6 @@ void parse_chunk(const char* data, size_t start, size_t end, std::vector<FastGro
         grp.latencies.push_back(lat);
     }
 }
-
-struct OutputGroup {
-    std::string hour;
-    std::string endpoint;
-    uint64_t count = 0;
-    uint64_t errors = 0;
-    std::vector<uint32_t> latencies;
-    uint32_t p50 = 0;
-    uint32_t p95 = 0;
-    uint32_t p99 = 0;
-    uint64_t error_ppm = 0;
-};
 
 int main(int argc, char* argv[]) {
     std::string data_dir = "/data";
@@ -168,46 +151,47 @@ int main(int argc, char* argv[]) {
         splits[t] = pt;
     }
 
-    std::vector<std::vector<FastGroup>> thread_tables(num_threads, std::vector<FastGroup>(TABLE_CAP));
-    std::vector<std::vector<uint16_t>> thread_active(num_threads);
+    std::vector<std::unordered_map<uint64_t, LocalGroup>> local_maps(num_threads);
+    for (unsigned int t = 0; t < num_threads; ++t) {
+        local_maps[t].reserve(512);
+    }
+
     std::vector<std::thread> workers;
     workers.reserve(num_threads);
 
     for (unsigned int t = 0; t < num_threads; ++t) {
-        workers.emplace_back(parse_chunk, data, splits[t], splits[t + 1],
-                             std::ref(thread_tables[t]), std::ref(thread_active[t]));
+        workers.emplace_back(parse_chunk, data, splits[t], splits[t + 1], std::ref(local_maps[t]));
     }
 
     for (auto& w : workers) {
         w.join();
     }
 
-    // Merge active slots into canonical ordered map
-    std::map<std::pair<std::string, std::string>, OutputGroup> merged;
-
+    // Merge into map sorted by (hour, endpoint)
+    std::map<std::pair<std::string, std::string>, MergedGroup> merged;
     for (unsigned int t = 0; t < num_threads; ++t) {
-        for (uint16_t slot : thread_active[t]) {
-            FastGroup& grp = thread_tables[t][slot];
-            std::string hr(data + grp.ts_offset, 13);
-            std::string ep(data + grp.ep_offset, grp.ep_len);
+        for (auto& [h, grp] : local_maps[t]) {
+            std::string hr(grp.ts_ptr, 13);
+            std::string ep(grp.ep_ptr, grp.ep_len);
 
-            auto& out_grp = merged[{hr, ep}];
-            if (out_grp.count == 0) {
-                out_grp.hour = hr;
-                out_grp.endpoint = ep;
-                out_grp.latencies.reserve(grp.count * num_threads);
+            auto& mg = merged[{hr, ep}];
+            if (mg.count == 0) {
+                mg.hour = hr;
+                mg.endpoint = ep;
+                mg.latencies.reserve(grp.count * num_threads);
             }
-            out_grp.count += grp.count;
-            out_grp.errors += grp.errors;
-            out_grp.latencies.insert(out_grp.latencies.end(), grp.latencies.begin(), grp.latencies.end());
+            mg.count += grp.count;
+            mg.errors += grp.errors;
+            mg.latencies.insert(mg.latencies.end(), grp.latencies.begin(), grp.latencies.end());
         }
+        local_maps[t].clear();
     }
 
     // Parallel percentile computation
-    std::vector<OutputGroup*> group_ptrs;
+    std::vector<MergedGroup*> group_ptrs;
     group_ptrs.reserve(merged.size());
-    for (auto& [key, grp] : merged) {
-        group_ptrs.push_back(&grp);
+    for (auto& [pair, mg] : merged) {
+        group_ptrs.push_back(&mg);
     }
 
     size_t total_groups = group_ptrs.size();
@@ -217,20 +201,20 @@ int main(int argc, char* argv[]) {
 
     std::vector<std::thread> sort_workers;
     for (unsigned int t = 0; t < sort_threads; ++t) {
-        size_t start_i = t * per_worker;
-        size_t end_i = std::min(total_groups, start_i + per_worker);
-        sort_workers.emplace_back([&group_ptrs, start_i, end_i]() {
-            for (size_t i = start_i; i < end_i; ++i) {
-                OutputGroup* grp = group_ptrs[i];
-                std::sort(grp->latencies.begin(), grp->latencies.end());
-                uint64_t n = grp->count;
+        size_t start_idx = t * per_worker;
+        size_t end_idx = std::min(total_groups, start_idx + per_worker);
+        sort_workers.emplace_back([&group_ptrs, start_idx, end_idx]() {
+            for (size_t i = start_idx; i < end_idx; ++i) {
+                MergedGroup* mg = group_ptrs[i];
+                std::sort(mg->latencies.begin(), mg->latencies.end());
+                uint64_t n = mg->count;
                 uint64_t r50 = (50ULL * n + 99) / 100;
                 uint64_t r95 = (95ULL * n + 99) / 100;
                 uint64_t r99 = (99ULL * n + 99) / 100;
-                grp->p50 = grp->latencies[r50 - 1];
-                grp->p95 = grp->latencies[r95 - 1];
-                grp->p99 = grp->latencies[r99 - 1];
-                grp->error_ppm = (static_cast<uint64_t>(grp->errors) * 1000000ULL) / n;
+                mg->p50 = mg->latencies[r50 - 1];
+                mg->p95 = mg->latencies[r95 - 1];
+                mg->p99 = mg->latencies[r99 - 1];
+                mg->error_ppm = (static_cast<uint64_t>(mg->errors) * 1000000ULL) / n;
             }
         });
     }
@@ -239,29 +223,28 @@ int main(int argc, char* argv[]) {
         sw.join();
     }
 
-    // Format output
+    // Write formatted output
     int out_fd = open(out_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (out_fd >= 0) {
         std::string buffer;
         buffer.reserve(2 * 1024 * 1024);
 
-        for (OutputGroup* grp : group_ptrs) {
-            // Format: YYYY-MM-DDTHH:00:00Z endpoint count p50 p95 p99 errors error_ppm\n
-            buffer.append(grp->hour);
+        for (auto* mg : group_ptrs) {
+            buffer.append(mg->hour);
             buffer.append(":00:00Z ");
-            buffer.append(grp->endpoint);
+            buffer.append(mg->endpoint);
             buffer.push_back(' ');
-            buffer.append(std::to_string(grp->count));
+            buffer.append(std::to_string(mg->count));
             buffer.push_back(' ');
-            buffer.append(std::to_string(grp->p50));
+            buffer.append(std::to_string(mg->p50));
             buffer.push_back(' ');
-            buffer.append(std::to_string(grp->p95));
+            buffer.append(std::to_string(mg->p95));
             buffer.push_back(' ');
-            buffer.append(std::to_string(grp->p99));
+            buffer.append(std::to_string(mg->p99));
             buffer.push_back(' ');
-            buffer.append(std::to_string(grp->errors));
+            buffer.append(std::to_string(mg->errors));
             buffer.push_back(' ');
-            buffer.append(std::to_string(grp->error_ppm));
+            buffer.append(std::to_string(mg->error_ppm));
             buffer.push_back('\n');
         }
 
