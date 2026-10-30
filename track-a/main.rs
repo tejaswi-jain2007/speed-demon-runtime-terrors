@@ -119,7 +119,7 @@ fn main() {
         None => { let _ = std::fs::create_dir_all(&out_dir); let _ = File::create(&out_path); return; }
     };
     let data = mmap.as_slice();
-    let (file_size, num_threads) = (data.len(), 6.min(thread::available_parallelism().map(|n| n.get()).unwrap_or(6)).max(1));
+    let (file_size, num_threads) = (data.len(), 10.min(thread::available_parallelism().map(|n| n.get()).unwrap_or(10)).max(1));
     let mut splits = vec![0usize; num_threads + 1];
     splits[num_threads] = file_size;
     for t in 1..num_threads {

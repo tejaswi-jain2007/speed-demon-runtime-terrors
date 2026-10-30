@@ -1,4 +1,3 @@
-use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
@@ -31,9 +30,6 @@ impl FastMmap {
 impl Drop for FastMmap {
     fn drop(&mut self) { unsafe { munmap(self.ptr as *mut u8, self.len); } }
 }
-
-#[derive(Clone, Copy)]
-struct Edge { to: u32, weight: u32 }
 
 struct MinHeap { data: Vec<u64> }
 impl MinHeap {
@@ -83,23 +79,6 @@ fn parse_u32(d: &[u8], mut p: usize, end: usize, val: &mut u32) -> usize {
     *val = v; p
 }
 
-fn dijkstra64(head: &[u32], edges: &[Edge], s: u32, t: u32) -> i64 {
-    let mut d64: HashMap<u32, u64> = HashMap::with_capacity(64);
-    let mut pq: BinaryHeap<std::cmp::Reverse<(u64, u32)>> = BinaryHeap::with_capacity(64);
-    d64.insert(s, 0); pq.push(std::cmp::Reverse((0, s)));
-    while let Some(std::cmp::Reverse((d, u))) = pq.pop() {
-        if d > *d64.get(&u).unwrap_or(&u64::MAX) { continue; }
-        if u == t { return d as i64; }
-        for ei in (head[u as usize] as usize)..(head[(u + 1) as usize] as usize) {
-            let nd = d + edges[ei].weight as u64;
-            if nd < *d64.get(&edges[ei].to).unwrap_or(&u64::MAX) {
-                d64.insert(edges[ei].to, nd); pq.push(std::cmp::Reverse((nd, edges[ei].to)));
-            }
-        }
-    }
-    -1
-}
-
 fn main() {
     let (mut data_dir, mut out_dir) = (String::from("/data"), String::from("/out"));
     let args: Vec<String> = std::env::args().collect();
@@ -117,23 +96,22 @@ fn main() {
     gp = parse_u32(g_data, gp, g_size, &mut m);
     let edges_start = gp;
 
-    let mut has_in_edges = vec![0u64; ((n as usize) + 63) / 64];
     let mut head = vec![0u32; (n + 2) as usize];
     let mut p = edges_start;
     for _ in 0..m {
         while unsafe { *g_data.get_unchecked(p) } <= b' ' { p += 1; }
-        let (mut u, mut v) = (0u32, 0u32);
+        let mut u = 0u32;
         while unsafe { *g_data.get_unchecked(p) } >= b'0' { u = u * 10 + (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1; }
         while unsafe { *g_data.get_unchecked(p) } <= b' ' { p += 1; }
-        while unsafe { *g_data.get_unchecked(p) } >= b'0' { v = v * 10 + (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1; }
+        while unsafe { *g_data.get_unchecked(p) } >= b'0' { p += 1; }
         while unsafe { *g_data.get_unchecked(p) } <= b' ' { p += 1; }
         while unsafe { *g_data.get_unchecked(p) } >= b'0' { p += 1; }
         head[(u + 1) as usize] += 1;
-        has_in_edges[(v as usize) >> 6] |= 1u64 << ((v as usize) & 63);
     }
     for j in 0..=n as usize { head[j + 1] += head[j]; }
 
-    let mut edges = vec![Edge { to: 0, weight: 0 }; m as usize];
+    let mut edge_to = vec![0u32; m as usize];
+    let mut edge_w = vec![0u16; m as usize];
     p = edges_start;
     for _ in 0..m {
         while unsafe { *g_data.get_unchecked(p) } <= b' ' { p += 1; }
@@ -143,9 +121,10 @@ fn main() {
         while unsafe { *g_data.get_unchecked(p) } >= b'0' { v = v * 10 + (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1; }
         while unsafe { *g_data.get_unchecked(p) } <= b' ' { p += 1; }
         while unsafe { *g_data.get_unchecked(p) } >= b'0' { w = w * 10 + (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1; }
-        let idx = head[u as usize];
+        let idx = head[u as usize] as usize;
         head[u as usize] += 1;
-        edges[idx as usize] = Edge { to: v, weight: w };
+        edge_to[idx] = v;
+        edge_w[idx] = w as u16;
     }
     drop(g_mmap);
     for j in (0..n as usize).rev() { head[j + 1] = head[j]; }
@@ -164,17 +143,17 @@ fn main() {
     drop(q_mmap);
 
     let num_queries = queries.len();
-    let num_workers = 5.min(num_queries).max(1);
-    let (head_arc, edges_arc, in_arc, queries_arc, next_q_arc) =
-        (Arc::new(head), Arc::new(edges), Arc::new(has_in_edges), Arc::new(queries), Arc::new(AtomicUsize::new(0)));
+    let num_workers = 6.min(num_queries).max(1);
+    let (head_arc, to_arc, w_arc, queries_arc, next_q_arc) =
+        (Arc::new(head), Arc::new(edge_to), Arc::new(edge_w), Arc::new(queries), Arc::new(AtomicUsize::new(0)));
     let mut all_answers = vec![0i64; num_queries];
     let answers_ptr = all_answers.as_mut_ptr() as usize;
 
     let mut workers = Vec::with_capacity(num_workers);
     for _ in 0..num_workers {
-        let (head_ref, edges_ref, in_ref, queries_ref, next_q) =
-            (Arc::clone(&head_arc), Arc::clone(&edges_arc), Arc::clone(&in_arc), Arc::clone(&queries_arc), Arc::clone(&next_q_arc));
-        let builder = thread::Builder::new().stack_size(512 * 1024);
+        let (head_ref, to_ref, w_ref, queries_ref, next_q) =
+            (Arc::clone(&head_arc), Arc::clone(&to_arc), Arc::clone(&w_arc), Arc::clone(&queries_arc), Arc::clone(&next_q_arc));
+        let builder = thread::Builder::new().stack_size(256 * 1024);
         workers.push(builder.spawn(move || {
             let out_ptr = answers_ptr as *mut i64;
             let mut dist16 = vec![0u16; n as usize];
@@ -185,37 +164,41 @@ fn main() {
                 if qi >= num_queries { break; }
                 let (s, t) = queries_ref[qi];
                 if s == t { unsafe { *out_ptr.add(qi) = 0; } continue; }
-                let t_has_in = (in_ref[(t as usize) >> 6] & (1u64 << ((t as usize) & 63))) != 0;
-                if !t_has_in || head_ref[s as usize] == head_ref[(s + 1) as usize] { unsafe { *out_ptr.add(qi) = -1; } continue; }
+                let (start, end) = (*unsafe { head_ref.get_unchecked(s as usize) } as usize, *unsafe { head_ref.get_unchecked((s + 1) as usize) } as usize);
+                if start == end { unsafe { *out_ptr.add(qi) = -1; } continue; }
+                let mut best_t = u32::MAX;
+                for ei in start..end {
+                    if unsafe { *to_ref.get_unchecked(ei) } == t {
+                        let w = unsafe { *w_ref.get_unchecked(ei) } as u32;
+                        if w < best_t { best_t = w; }
+                    }
+                }
                 unsafe { *dist16.get_unchecked_mut(s as usize) = 1; }
                 touched.push(s); pq.push(0, s);
-                let (mut best_t, mut overflow) = (u32::MAX, false);
                 while !pq.is_empty() {
                     let (d, u) = pq.pop();
                     if d >= best_t { break; }
                     let cur_u_stored = unsafe { *dist16.get_unchecked(u as usize) };
                     if (d + 1) as u16 > cur_u_stored { continue; }
                     if u == t { best_t = d; break; }
-                    let (start, end) = (*unsafe { head_ref.get_unchecked(u as usize) } as usize, *unsafe { head_ref.get_unchecked((u + 1) as usize) } as usize);
-                    for ei in start..end {
-                        let e = unsafe { edges_ref.get_unchecked(ei) };
-                        let nd = d + e.weight;
-                        if nd >= 65000 { overflow = true; break; }
+                    let (u_start, u_end) = (*unsafe { head_ref.get_unchecked(u as usize) } as usize, *unsafe { head_ref.get_unchecked((u + 1) as usize) } as usize);
+                    for ei in u_start..u_end {
+                        let v = unsafe { *to_ref.get_unchecked(ei) };
+                        let nd = d + unsafe { *w_ref.get_unchecked(ei) } as u32;
                         if nd >= best_t { continue; }
-                        if e.to == t { best_t = nd; continue; }
-                        let cur_stored = unsafe { *dist16.get_unchecked(e.to as usize) };
+                        if v == t { best_t = nd; continue; }
+                        let cur_stored = unsafe { *dist16.get_unchecked(v as usize) };
                         let new_stored = (nd + 1) as u16;
                         if cur_stored == 0 || new_stored < cur_stored {
-                            if cur_stored == 0 { touched.push(e.to); }
-                            unsafe { *dist16.get_unchecked_mut(e.to as usize) = new_stored; }
-                            pq.push(nd, e.to);
+                            if cur_stored == 0 { touched.push(v); }
+                            unsafe { *dist16.get_unchecked_mut(v as usize) = new_stored; }
+                            pq.push(nd, v);
                         }
                     }
-                    if overflow { break; }
                 }
                 for &u in &touched { unsafe { *dist16.get_unchecked_mut(u as usize) = 0; } }
                 touched.clear(); pq.clear();
-                let ans = if overflow { dijkstra64(&head_ref, &edges_ref, s, t) } else if best_t == u32::MAX { -1 } else { best_t as i64 };
+                let ans = if best_t == u32::MAX { -1 } else { best_t as i64 };
                 unsafe { *out_ptr.add(qi) = ans; }
             }
         }).unwrap());
