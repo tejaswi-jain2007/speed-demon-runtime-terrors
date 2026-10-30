@@ -1,15 +1,14 @@
-# Track B: Index
+# Track B (Index) - Runtime Terrors
 
-The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/b-index.md).
-
-## Approach
-
-How your solution works, in plain prose.
+## Approach Overview
+We engineered a high-throughput search and index evaluation engine in C++20:
+- **Zero Dependencies:** Pure standard library + POSIX system calls (`mmap`).
+- **Sorted Postings Inverted Index:** Inverted index storing sequential `uint32_t` doc IDs.
+- **Fast Linear Set Intersections:** Evaluates boolean queries (AND, OR, NOT) using cache-friendly linear set operations.
+- **12-Thread Query Parallelism:** Slices the 50,000 queries evenly across 12 worker threads.
 
 ## Dependencies
+None (`dependency_count = 0`).
 
-None.
-
-## With another 24 hours
-
-What you would do next.
+## What we would do with another 24 hours
+Implement SIMD bit-packing / roaring bitmaps for posting list intersections to reduce memory bandwidth by another 40%.

@@ -1,15 +1,14 @@
-# Track A: Ingest
+# Track A (Ingest) - Runtime Terrors
 
-The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/a-ingest.md).
-
-## Approach
-
-How your solution works, in plain prose.
+## Approach Overview
+We implemented an ultra-fast, zero-dependency log ingestion engine written in standard C++20:
+- **Zero Dependencies:** Pure standard library + POSIX system calls (`mmap`, `stat`).
+- **Parallel Execution:** File is sliced into 12 chunks aligned to newlines, matching the 6 P-cores (12 threads) of the target Hetzner Intel Core i5-13500 machine.
+- **Fast Parsing:** Direct ASCII arithmetic parsing for integers and timestamps; endpoint strings referenced directly from memory map.
+- **Efficient Aggregations:** Thread-local hash maps merged into a canonical ordered map, followed by parallel percentile sorting and streamed buffer output.
 
 ## Dependencies
+None (`dependency_count = 0`).
 
-None.
-
-## With another 24 hours
-
-What you would do next.
+## What we would do with another 24 hours
+Implement SIMD / AVX2 SWAR parsing for newline and space discovery across 32-byte registers to push parse time under 500 milliseconds.
