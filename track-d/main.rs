@@ -12,6 +12,13 @@ extern "C" {
     fn madvise(a: *mut u8, l: usize, adv: i32) -> i32;
 }
 
+#[inline(always)]
+unsafe fn madvise_dontneed(ptr: *const u8, len: usize) {
+    let p = ptr as usize;
+    let (s, e) = ((p + 4095) & !4095, (p + len) & !4095);
+    if e > s { madvise(s as *mut u8, e - s, 4); }
+}
+
 struct FastMmap { ptr: *const u8, len: usize }
 unsafe impl Send for FastMmap {}
 unsafe impl Sync for FastMmap {}
@@ -90,6 +97,23 @@ impl BinaryMinHeap {
 }
 
 #[inline(always)]
+fn skip_to_nl(d: &[u8], mut p: usize, end: usize) -> usize {
+    while p + 8 <= end {
+        let w = unsafe { std::ptr::read_unaligned(d.as_ptr().add(p) as *const u64) };
+        let has = (w ^ 0x0a0a0a0a0a0a0a0a)
+            .wrapping_sub(0x0101010101010101)
+            & !(w ^ 0x0a0a0a0a0a0a0a0a)
+            & 0x8080808080808080;
+        if has != 0 {
+            return p + (has.trailing_zeros() as usize >> 3) + 1;
+        }
+        p += 8;
+    }
+    while p < end && unsafe { *d.get_unchecked(p) } != b'\n' { p += 1; }
+    p + 1
+}
+
+#[inline(always)]
 fn parse_u32(d: &[u8], mut p: usize, end: usize, val: &mut u32) -> usize {
     while p < end && unsafe { *d.get_unchecked(p) } <= b' ' { p += 1; }
     let mut v = 0u32;
@@ -140,8 +164,7 @@ fn main() {
             u = u * 10 + (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1;
         }
         unsafe { *head.get_unchecked_mut((u + 1) as usize) += 1; }
-        while unsafe { *g_data.get_unchecked(p) } != b'\n' { p += 1; }
-        p += 1;
+        p = skip_to_nl(g_data, p, g_size);
     }
     for j in 0..=n as usize { head[j + 1] += head[j]; }
 
@@ -163,8 +186,7 @@ fn main() {
         while unsafe { *g_data.get_unchecked(p) } >= b'0' {
             w = w * 10 + (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1;
         }
-        while unsafe { *g_data.get_unchecked(p) } != b'\n' { p += 1; }
-        p += 1;
+        p = skip_to_nl(g_data, p, g_size);
 
         let idx = unsafe { *head.get_unchecked(u as usize) };
         unsafe {
@@ -189,7 +211,7 @@ fn main() {
     drop(q_mmap);
 
     let num_queries = queries.len();
-    let num_workers = 10.min(thread::available_parallelism().map(|n| n.get()).unwrap_or(10)).min(num_queries).max(1);
+    let num_workers = 6.min(num_queries).max(1);
     let (head_arc, edges_arc, queries_arc, next_q_arc) =
         (Arc::new(head), Arc::new(edges), Arc::new(queries), Arc::new(AtomicUsize::new(0)));
     let mut all_answers = vec![0i64; num_queries];
