@@ -197,10 +197,20 @@ fn parse_csv_chunk(
         } else {
             let nstart = p;
             while p < chunk_end && rec_data[p] != b',' {
-                name_hash = (name_hash ^ (rec_data[p] as u64)).wrapping_mul(1099511628211);
                 p += 1;
             }
-            name_len = (p - nstart) as u64;
+            let name_slice = &rec_data[nstart..p];
+            name_len = name_slice.len() as u64;
+            let mut i = 0;
+            while i + 8 <= name_slice.len() {
+                let chunk = unsafe { std::ptr::read_unaligned(name_slice.as_ptr().add(i) as *const u64) };
+                name_hash = (name_hash ^ chunk).wrapping_mul(1099511628211);
+                i += 8;
+            }
+            while i < name_slice.len() {
+                name_hash = (name_hash ^ (name_slice[i] as u64)).wrapping_mul(1099511628211);
+                i += 1;
+            }
         }
         if p < chunk_end && rec_data[p] == b',' {
             p += 1;
