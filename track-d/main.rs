@@ -1,8 +1,9 @@
 use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::io::Write;
+use std::mem::ManuallyDrop;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -148,55 +149,108 @@ fn main() {
         else { i += 1; }
     }
     let (g_path, q_path, out_path) = (format!("{}/graph.txt", data_dir), format!("{}/queries.txt", data_dir), format!("{}/distances.txt", out_dir));
-    let g_mmap = match FastMmap::open(&g_path) { Some(m) => m, None => return };
+    let g_mmap = match FastMmap::open(&g_path) { Some(m) => Arc::new(m), None => return };
     let (g_data, g_size) = (g_mmap.as_slice(), g_mmap.len);
     let (mut n, mut m, mut gp) = (0u32, 0u32, 0);
     gp = parse_u32(g_data, gp, g_size, &mut n);
     gp = parse_u32(g_data, gp, g_size, &mut m);
     let edges_start = gp;
 
-    let mut head = vec![0u32; (n + 2) as usize];
-    let mut p = edges_start;
-    for _ in 0..m {
-        while unsafe { *g_data.get_unchecked(p) } <= b' ' { p += 1; }
-        let mut u = (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1;
-        while unsafe { *g_data.get_unchecked(p) } >= b'0' {
-            u = u * 10 + (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1;
-        }
-        unsafe { *head.get_unchecked_mut((u + 1) as usize) += 1; }
-        p = skip_to_nl(g_data, p, g_size);
+    let num_parse_threads = 8.min(thread::available_parallelism().map(|n| n.get()).unwrap_or(8)).max(1);
+    let total_edge_bytes = g_size - edges_start;
+    let mut splits = vec![edges_start; num_parse_threads + 1];
+    splits[num_parse_threads] = g_size;
+    for t in 1..num_parse_threads {
+        let mut pt = edges_start + t * (total_edge_bytes / num_parse_threads);
+        while pt < g_size && g_data[pt] != b'\n' { pt += 1; }
+        if pt < g_size { pt += 1; }
+        splits[t] = pt.min(g_size);
     }
-    for j in 0..=n as usize { head[j + 1] += head[j]; }
 
+    let head_atomic: Arc<Vec<AtomicU32>> = Arc::new((0..=(n + 1)).map(|_| AtomicU32::new(0)).collect());
+
+    // Pass 1: Parallel out-degree counting
+    let mut p1_handles = Vec::with_capacity(num_parse_threads);
+    for t in 0..num_parse_threads {
+        let (mmap_ref, head_ref, start, end) = (Arc::clone(&g_mmap), Arc::clone(&head_atomic), splits[t], splits[t + 1]);
+        p1_handles.push(thread::spawn(move || {
+            let d = mmap_ref.as_slice();
+            let mut p = start;
+            while p < end {
+                while p < end && unsafe { *d.get_unchecked(p) } <= b' ' { p += 1; }
+                if p >= end { break; }
+                let mut u = (unsafe { *d.get_unchecked(p) } - b'0') as u32; p += 1;
+                while p < end && unsafe { *d.get_unchecked(p) } >= b'0' {
+                    u = u * 10 + (unsafe { *d.get_unchecked(p) } - b'0') as u32; p += 1;
+                }
+                unsafe { head_ref.get_unchecked((u + 1) as usize).fetch_add(1, Ordering::Relaxed); }
+                p = skip_to_nl(d, p, end);
+            }
+        }));
+    }
+    for h in p1_handles { h.join().unwrap(); }
+
+    // Prefix sum in-place
+    let mut sum = 0u32;
+    for j in 0..=n as usize {
+        let cnt = head_atomic[j + 1].load(Ordering::Relaxed);
+        head_atomic[j].store(sum, Ordering::Relaxed);
+        sum += cnt;
+    }
+    head_atomic[(n + 1) as usize].store(sum, Ordering::Relaxed);
+
+    // Pass 2: Parallel edge writing
     let mut edges = vec![Edge { to: 0, weight: 0 }; m as usize];
-    p = edges_start;
-    for _ in 0..m {
-        while unsafe { *g_data.get_unchecked(p) } <= b' ' { p += 1; }
-        let mut u = (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1;
-        while unsafe { *g_data.get_unchecked(p) } >= b'0' {
-            u = u * 10 + (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1;
-        }
-        p += 1;
-        let mut v = (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1;
-        while unsafe { *g_data.get_unchecked(p) } >= b'0' {
-            v = v * 10 + (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1;
-        }
-        p += 1;
-        let mut w = (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1;
-        while unsafe { *g_data.get_unchecked(p) } >= b'0' {
-            w = w * 10 + (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1;
-        }
-        p = skip_to_nl(g_data, p, g_size);
+    let edges_ptr = edges.as_mut_ptr() as usize;
 
-        let idx = unsafe { *head.get_unchecked(u as usize) };
-        unsafe {
-            *head.get_unchecked_mut(u as usize) += 1;
-            *edges.get_unchecked_mut(idx as usize) = Edge { to: v, weight: w };
-        }
+    let mut p2_handles = Vec::with_capacity(num_parse_threads);
+    for t in 0..num_parse_threads {
+        let (mmap_ref, head_ref, start, end) = (Arc::clone(&g_mmap), Arc::clone(&head_atomic), splits[t], splits[t + 1]);
+        p2_handles.push(thread::spawn(move || {
+            let d = mmap_ref.as_slice();
+            let e_ptr = edges_ptr as *mut Edge;
+            let mut p = start;
+            while p < end {
+                while p < end && unsafe { *d.get_unchecked(p) } <= b' ' { p += 1; }
+                if p >= end { break; }
+                let mut u = (unsafe { *d.get_unchecked(p) } - b'0') as u32; p += 1;
+                while p < end && unsafe { *d.get_unchecked(p) } >= b'0' {
+                    u = u * 10 + (unsafe { *d.get_unchecked(p) } - b'0') as u32; p += 1;
+                }
+                p += 1;
+                let mut v = (unsafe { *d.get_unchecked(p) } - b'0') as u32; p += 1;
+                while p < end && unsafe { *d.get_unchecked(p) } >= b'0' {
+                    v = v * 10 + (unsafe { *d.get_unchecked(p) } - b'0') as u32; p += 1;
+                }
+                p += 1;
+                let mut w = (unsafe { *d.get_unchecked(p) } - b'0') as u32; p += 1;
+                while p < end && unsafe { *d.get_unchecked(p) } >= b'0' {
+                    w = w * 10 + (unsafe { *d.get_unchecked(p) } - b'0') as u32; p += 1;
+                }
+                p = skip_to_nl(d, p, end);
+
+                let idx = unsafe { head_ref.get_unchecked(u as usize).fetch_add(1, Ordering::Relaxed) };
+                unsafe { *e_ptr.add(idx as usize) = Edge { to: v, weight: w }; }
+            }
+        }));
     }
+    for h in p2_handles { h.join().unwrap(); }
     drop(g_mmap);
-    for j in (0..n as usize).rev() { head[j + 1] = head[j]; }
-    head[0] = 0; head.truncate((n + 1) as usize);
+
+    // Shift head back by 1 to get standard CSR [head[u]..head[u+1]]
+    for j in (0..n as usize).rev() {
+        let val = head_atomic[j].load(Ordering::Relaxed);
+        head_atomic[j + 1].store(val, Ordering::Relaxed);
+    }
+    head_atomic[0].store(0, Ordering::Relaxed);
+
+    // Convert AtomicU32 vector to plain Vec<u32> with zero-cost
+    let head_arc = Arc::try_unwrap(head_atomic).unwrap();
+    let mut head = {
+        let mut md = ManuallyDrop::new(head_arc);
+        unsafe { Vec::from_raw_parts(md.as_mut_ptr() as *mut u32, md.len(), md.capacity()) }
+    };
+    head.truncate((n + 1) as usize);
 
     let q_mmap = match FastMmap::open(&q_path) { Some(m) => m, None => return };
     let (q_data, q_size) = (q_mmap.as_slice(), q_mmap.len);
