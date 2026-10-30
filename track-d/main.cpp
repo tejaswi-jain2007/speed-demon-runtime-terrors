@@ -1,16 +1,17 @@
-#include <iostream>
-#include <fstream>
-#include <vector>
-#include <queue>
-#include <string>
-#include <algorithm>
-#include <thread>
-#include <cstdint>
-#include <cstring>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <fcntl.h>
 #include <unistd.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <queue>
+#include <string>
+#include <thread>
+#include <vector>
 
 struct Edge {
     uint32_t to;
@@ -22,15 +23,14 @@ struct Query {
     uint32_t t;
 };
 
-// Fast unsigned integer parsing
 static inline const char* parse_u32(const char* p, const char* end, uint32_t& val) {
     while (p < end && (*p == ' ' || *p == '\n' || *p == '\r')) ++p;
-    uint64_t v = 0;
+    uint64_t res = 0;
     while (p < end && *p >= '0' && *p <= '9') {
-        v = v * 10 + (*p - '0');
+        res = res * 10 + (*p - '0');
         ++p;
     }
-    val = static_cast<uint32_t>(v);
+    val = static_cast<uint32_t>(res);
     return p;
 }
 
@@ -77,30 +77,38 @@ int main(int argc, char* argv[]) {
 
     const char* gp_save = gp;
     std::vector<uint32_t> degree(n, 0);
+    std::vector<uint32_t> rev_degree(n, 0);
+
     for (uint32_t i = 0; i < m; ++i) {
         uint32_t u = 0, v = 0, w = 0;
         gp = parse_u32(gp, g_end, u);
         gp = parse_u32(gp, g_end, v);
         gp = parse_u32(gp, g_end, w);
         degree[u]++;
+        rev_degree[v]++;
     }
 
-    // Build CSR offsets
+    // Build Forward & Reverse CSR offsets
     std::vector<uint32_t> head(n + 1, 0);
+    std::vector<uint32_t> rev_head(n + 1, 0);
     for (uint32_t i = 0; i < n; ++i) {
         head[i + 1] = head[i] + degree[i];
+        rev_head[i + 1] = rev_head[i] + rev_degree[i];
     }
 
     std::vector<Edge> edges(m);
+    std::vector<Edge> rev_edges(m);
     std::vector<uint32_t> cur_pos = head;
+    std::vector<uint32_t> rev_cur_pos = rev_head;
+
     gp = gp_save;
     for (uint32_t i = 0; i < m; ++i) {
         uint32_t u = 0, v = 0, w = 0;
         gp = parse_u32(gp, g_end, u);
         gp = parse_u32(gp, g_end, v);
         gp = parse_u32(gp, g_end, w);
-        uint32_t idx = cur_pos[u]++;
-        edges[idx] = {v, w};
+        edges[cur_pos[u]++] = {v, w};
+        rev_edges[rev_cur_pos[v]++] = {u, w};
     }
 
     munmap(const_cast<char*>(g_data), g_size);
@@ -143,7 +151,7 @@ int main(int argc, char* argv[]) {
     size_t num_queries = queries.size();
     std::vector<int64_t> answers(num_queries, -1);
 
-    // 3. Parallel Dijkstra across 12 hardware threads
+    // 3. Parallel Bidirectional Dijkstra across 12 hardware threads
     unsigned int num_threads = 12;
     unsigned int hw = std::thread::hardware_concurrency();
     if (hw > 0 && hw < num_threads) num_threads = hw;
@@ -158,13 +166,15 @@ int main(int argc, char* argv[]) {
         size_t end_q = std::min(num_queries, start_q + per_worker);
 
         workers.emplace_back([&, start_q, end_q]() {
-            // Thread-local generation distance array: O(1) query reset
-            std::vector<uint32_t> seen(n, 0);
-            std::vector<uint64_t> dist(n, 0);
+            std::vector<uint32_t> seen_f(n, 0);
+            std::vector<uint32_t> seen_b(n, 0);
+            std::vector<uint64_t> dist_f(n, 0);
+            std::vector<uint64_t> dist_b(n, 0);
             uint32_t query_id = 0;
 
             using HeapNode = std::pair<uint64_t, uint32_t>; // (dist, node)
-            std::priority_queue<HeapNode, std::vector<HeapNode>, std::greater<HeapNode>> pq;
+            std::priority_queue<HeapNode, std::vector<HeapNode>, std::greater<HeapNode>> pq_f;
+            std::priority_queue<HeapNode, std::vector<HeapNode>, std::greater<HeapNode>> pq_b;
 
             for (size_t qi = start_q; qi < end_q; ++qi) {
                 uint32_t s = queries[qi].s;
@@ -176,39 +186,67 @@ int main(int argc, char* argv[]) {
                 }
 
                 query_id++;
-                seen[s] = query_id;
-                dist[s] = 0;
-                pq.emplace(0, s);
+                seen_f[s] = query_id;
+                dist_f[s] = 0;
+                pq_f.emplace(0, s);
 
-                int64_t ans = -1;
-                while (!pq.empty()) {
-                    auto [d, u] = pq.top();
-                    pq.pop();
+                seen_b[t] = query_id;
+                dist_b[t] = 0;
+                pq_b.emplace(0, t);
 
-                    if (d > dist[u]) continue;
-                    if (u == t) {
-                        ans = static_cast<int64_t>(d);
+                uint64_t mu = UINT64_MAX;
+
+                while (!pq_f.empty() && !pq_b.empty()) {
+                    if (pq_f.top().first + pq_b.top().first >= mu) {
                         break;
                     }
 
-                    uint32_t e_start = head[u];
-                    uint32_t e_end = head[u + 1];
+                    if (pq_f.top().first <= pq_b.top().first) {
+                        auto [df, u] = pq_f.top();
+                        pq_f.pop();
+                        if (df > dist_f[u]) continue;
 
-                    for (uint32_t ei = e_start; ei < e_end; ++ei) {
-                        uint32_t v = edges[ei].to;
-                        uint64_t nd = d + edges[ei].weight;
+                        uint32_t e_start = head[u];
+                        uint32_t e_end = head[u + 1];
+                        for (uint32_t ei = e_start; ei < e_end; ++ei) {
+                            uint32_t v = edges[ei].to;
+                            uint64_t nd = df + edges[ei].weight;
+                            if (seen_f[v] != query_id || nd < dist_f[v]) {
+                                seen_f[v] = query_id;
+                                dist_f[v] = nd;
+                                pq_f.emplace(nd, v);
+                                if (seen_b[v] == query_id) {
+                                    uint64_t cand = nd + dist_b[v];
+                                    if (cand < mu) mu = cand;
+                                }
+                            }
+                        }
+                    } else {
+                        auto [db, u] = pq_b.top();
+                        pq_b.pop();
+                        if (db > dist_b[u]) continue;
 
-                        if (seen[v] != query_id || nd < dist[v]) {
-                            seen[v] = query_id;
-                            dist[v] = nd;
-                            pq.emplace(nd, v);
+                        uint32_t e_start = rev_head[u];
+                        uint32_t e_end = rev_head[u + 1];
+                        for (uint32_t ei = e_start; ei < e_end; ++ei) {
+                            uint32_t v = rev_edges[ei].to;
+                            uint64_t nd = db + rev_edges[ei].weight;
+                            if (seen_b[v] != query_id || nd < dist_b[v]) {
+                                seen_b[v] = query_id;
+                                dist_b[v] = nd;
+                                pq_b.emplace(nd, v);
+                                if (seen_f[v] == query_id) {
+                                    uint64_t cand = nd + dist_f[v];
+                                    if (cand < mu) mu = cand;
+                                }
+                            }
                         }
                     }
                 }
 
-                // Clear heap if exited early
-                while (!pq.empty()) pq.pop();
-                answers[qi] = ans;
+                answers[qi] = (mu != UINT64_MAX) ? static_cast<int64_t>(mu) : -1;
+                while (!pq_f.empty()) pq_f.pop();
+                while (!pq_b.empty()) pq_b.pop();
             }
         });
     }
@@ -217,24 +255,17 @@ int main(int argc, char* argv[]) {
         w.join();
     }
 
-    // 4. Write formatted output
+    // 4. Output distances.txt
     int out_fd = open(out_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (out_fd >= 0) {
         std::string buffer;
-        buffer.reserve(64 * 1024);
-        for (int64_t ans : answers) {
-            buffer.append(std::to_string(ans));
+        buffer.reserve(32 * 1024);
+        for (int64_t d : answers) {
+            buffer.append(std::to_string(d));
             buffer.push_back('\n');
-            if (buffer.size() >= 32 * 1024) {
-                ssize_t written = write(out_fd, buffer.data(), buffer.size());
-                (void)written;
-                buffer.clear();
-            }
         }
-        if (!buffer.empty()) {
-            ssize_t written = write(out_fd, buffer.data(), buffer.size());
-            (void)written;
-        }
+        ssize_t written = write(out_fd, buffer.data(), buffer.size());
+        (void)written;
         close(out_fd);
     }
 
