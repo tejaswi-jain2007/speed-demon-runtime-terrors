@@ -285,8 +285,8 @@ fn main() {
     drop(q_mmap);
 
     let num_queries = queries.len();
-    // 5 workers: 5 * 3.48MB dist16 + 47.5MB graph = 65MB peak RSS (strictly <= 70MB)
-    let num_workers = 5.min(num_queries).max(1);
+    // 6 workers: 6 * 3.48MB dist16 + 47.5MB graph = 68MB peak RSS (strictly <= 70MB)
+    let num_workers = 6.min(num_queries).max(1);
 
     let head_arc = Arc::new(head);
     let edges_arc = Arc::new(edges);
@@ -344,8 +344,8 @@ fn main() {
                     if d >= best_t {
                         break;
                     }
-                    let cur_u_stored = unsafe { *dist16.get_unchecked(u as usize) as u32 };
-                    if cur_u_stored == 0 || d > cur_u_stored - 1 {
+                    let cur_u_stored = unsafe { *dist16.get_unchecked(u as usize) };
+                    if (d + 1) as u16 > cur_u_stored {
                         continue;
                     }
                     if u == t {
@@ -370,12 +370,13 @@ fn main() {
                             continue;
                         }
 
-                        let cur_stored = unsafe { *dist16.get_unchecked(e.to as usize) as u32 };
-                        if cur_stored == 0 || nd < cur_stored - 1 {
+                        let cur_stored = unsafe { *dist16.get_unchecked(e.to as usize) };
+                        let new_stored = (nd + 1) as u16;
+                        if cur_stored == 0 || new_stored < cur_stored {
                             if cur_stored == 0 {
                                 touched.push(e.to);
                             }
-                            unsafe { *dist16.get_unchecked_mut(e.to as usize) = (nd + 1) as u16; }
+                            unsafe { *dist16.get_unchecked_mut(e.to as usize) = new_stored; }
                             pq.push(nd, e.to);
                         }
                     }

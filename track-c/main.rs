@@ -18,6 +18,17 @@ extern "C" {
     fn madvise(addr: *mut u8, length: usize, advice: i32) -> i32;
 }
 
+#[inline(always)]
+unsafe fn madvise_dontneed(ptr: *const u8, len: usize) {
+    let p = ptr as usize;
+    let aligned_start = (p + 4095) & !4095;
+    let end = p + len;
+    let aligned_end = end & !4095;
+    if aligned_end > aligned_start {
+        madvise(aligned_start as *mut u8, aligned_end - aligned_start, 4);
+    }
+}
+
 struct FastMmap {
     ptr: *const u8,
     len: usize,
@@ -158,13 +169,10 @@ fn parse_csv_chunk(
 
     while p < chunk_end {
         if p - last_evict >= 256 * 1024 {
-            let evict_len = ((p - last_evict) / 4096) * 4096;
-            if evict_len > 0 {
-                unsafe {
-                    madvise(rec_data.as_ptr().add(last_evict) as *mut u8, evict_len, 4);
-                }
-                last_evict += evict_len;
+            unsafe {
+                madvise_dontneed(rec_data.as_ptr().add(last_evict), p - last_evict);
             }
+            last_evict = p;
         }
 
         if p + 3 <= chunk_end && rec_data[p] == 0xEF && rec_data[p + 1] == 0xBB && rec_data[p + 2] == 0xBF {
@@ -323,7 +331,7 @@ fn parse_csv_chunk(
 
     if chunk_end > last_evict {
         unsafe {
-            madvise(rec_data.as_ptr().add(last_evict) as *mut u8, chunk_end - last_evict, 4);
+            madvise_dontneed(rec_data.as_ptr().add(last_evict), chunk_end - last_evict);
         }
     }
 }

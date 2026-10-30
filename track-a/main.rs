@@ -18,6 +18,17 @@ extern "C" {
     fn madvise(addr: *mut u8, length: usize, advice: i32) -> i32;
 }
 
+#[inline(always)]
+unsafe fn madvise_dontneed(ptr: *const u8, len: usize) {
+    let p = ptr as usize;
+    let aligned_start = (p + 4095) & !4095;
+    let end = p + len;
+    let aligned_end = end & !4095;
+    if aligned_end > aligned_start {
+        madvise(aligned_start as *mut u8, aligned_end - aligned_start, 4);
+    }
+}
+
 struct FastMmap {
     ptr: *const u8,
     len: usize,
@@ -276,13 +287,10 @@ fn main() {
             let mut last_evict = start;
             while p < end {
                 if p - last_evict >= 256 * 1024 {
-                    let evict_len = ((p - last_evict) / 4096) * 4096;
-                    if evict_len > 0 {
-                        unsafe {
-                            madvise(d.as_ptr().add(last_evict) as *mut u8, evict_len, 4);
-                        }
-                        last_evict += evict_len;
+                    unsafe {
+                        madvise_dontneed(d.as_ptr().add(last_evict), p - last_evict);
                     }
+                    last_evict = p;
                 }
 
                 if p + 28 > end { break; }
@@ -328,7 +336,7 @@ fn main() {
 
             if end > last_evict {
                 unsafe {
-                    madvise(d.as_ptr().add(last_evict) as *mut u8, end - last_evict, 4);
+                    madvise_dontneed(d.as_ptr().add(last_evict), end - last_evict);
                 }
             }
 
