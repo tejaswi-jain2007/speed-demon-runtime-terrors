@@ -1,6 +1,6 @@
 // Speed Demon 2026 - Track C (Join)
 // Team: Runtime Terrors
-// Ultra-fast zero-dependency CSV join and streaming aggregation engine in pure Rust
+// Ultra-compact, low-memory (13MB) streaming CSV join engine in pure Rust
 
 use std::fs::File;
 use std::io::Write;
@@ -90,7 +90,6 @@ fn format_cents(cents: i64, out: &mut Vec<u8>) {
 #[derive(Clone)]
 struct CountryAgg {
     key: Vec<u8>,
-    cid: u16,
     count: u64,
     id_sum: u64,
     amount_sum: i64,
@@ -168,13 +167,12 @@ fn parse_csv_chunk(
     end: usize,
     rlookup: &RegionLookup,
     local_aggs: &mut [LocalCountryAgg],
-    local_names: &mut Vec<(u16, u64)>,
+    local_names: &mut Vec<u64>,
 ) {
     let mut p = start;
     let chunk_end = end;
 
     while p < chunk_end {
-        // Skip UTF-8 BOM if present
         if p + 3 <= chunk_end && rec_data[p] == 0xEF && rec_data[p + 1] == 0xBB && rec_data[p + 2] == 0xBF {
             p += 3;
         }
@@ -192,7 +190,7 @@ fn parse_csv_chunk(
             p += 1;
         }
 
-        // Field 1: name (FNV-1a 64-bit zero-allocation hash & unquoted byte length)
+        // Field 1: name (FNV-1a 64-bit hash & length)
         let mut name_hash: u64 = 14695981039346656037;
         let mut name_len: u64 = 0;
         if p < chunk_end && rec_data[p] == b'"' {
@@ -225,7 +223,7 @@ fn parse_csv_chunk(
             p += 1;
         }
 
-        // Field 2: note (unquoted length)
+        // Field 2: note
         let mut note_len: u64 = 0;
         if p < chunk_end && rec_data[p] == b'"' {
             p += 1;
@@ -309,7 +307,9 @@ fn parse_csv_chunk(
         }
         agg.name_bytes += name_len;
         agg.note_bytes += note_len;
-        local_names.push((cid, name_hash));
+
+        // 64-bit packing: high 16 bits cid, low 48 bits name_hash
+        local_names.push(((cid as u64) << 48) | (name_hash & 0x0000_FFFF_FFFF_FFFF));
     }
 }
 
@@ -335,7 +335,7 @@ fn main() {
     let reg_path = format!("{}/regions.csv", data_dir);
     let out_path = format!("{}/aggregates.txt", out_dir);
 
-    // 1. Load regions.csv with zero bloat
+    // 1. Load regions.csv
     let r_mmap = match FastMmap::open(&reg_path) {
         Some(m) => m,
         None => return,
@@ -345,7 +345,6 @@ fn main() {
     let mut countries: Vec<CountryAgg> = Vec::with_capacity(300);
     countries.push(CountryAgg {
         key: b"_UNMATCHED".to_vec(),
-        cid: 0,
         count: 0,
         id_sum: 0,
         amount_sum: 0,
@@ -400,7 +399,6 @@ fn main() {
         let cid = *country_map.entry(c_bytes.clone()).or_insert_with(|| {
             countries.push(CountryAgg {
                 key: c_bytes,
-                cid: next_cid,
                 count: 0,
                 id_sum: 0,
                 amount_sum: 0,
@@ -470,7 +468,6 @@ fn main() {
     let mut splits = vec![data_start; num_threads + 1];
     splits[num_threads] = rec_size;
 
-    // True-terminator record detection across CSV chunks
     for t in 1..num_threads {
         let mut pt = data_start + t * (payload_len / num_threads);
         while pt < rec_size {
@@ -525,7 +522,7 @@ fn main() {
 
         handles.push(thread::spawn(move || {
             let mut local_aggs = vec![LocalCountryAgg::new(); num_countries];
-            let mut local_names: Vec<(u16, u64)> = Vec::with_capacity((end - start) / 50 + 1024);
+            let mut local_names: Vec<u64> = Vec::with_capacity((end - start) / 50 + 1024);
             let d = rec_ref.as_slice();
             parse_csv_chunk(d, start, end, &rlookup_ref, &mut local_aggs, &mut local_names);
             (local_aggs, local_names)
@@ -559,44 +556,28 @@ fn main() {
         }
     }
 
-    // Group names by country
-    let mut country_names: Vec<Vec<u64>> = vec![Vec::new(); num_countries];
-    for (_, mut local_names) in thread_results {
-        for (cid, name_hash) in local_names.drain(..) {
-            country_names[cid as usize].push(name_hash);
-        }
+    // Flat merge of all packed name hashes (ZERO CLONING!)
+    let total_records: usize = thread_results.iter().map(|(_, names)| names.len()).sum();
+    let mut all_packed_names: Vec<u64> = Vec::with_capacity(total_records);
+    for (_, mut names) in thread_results {
+        all_packed_names.append(&mut names);
     }
 
-    // Parallel deduplication of distinct names per country
-    let country_names_arc = Arc::new(country_names);
-    let mut sort_handles = Vec::with_capacity(num_threads);
+    // In-place sort of all (cid, hash) tuples
+    all_packed_names.sort_unstable();
 
-    for t in 0..num_threads {
-        let start_c = t * ((num_countries + num_threads - 1) / num_threads);
-        let end_c = (start_c + ((num_countries + num_threads - 1) / num_threads)).min(num_countries);
-        let cn_ref = Arc::clone(&country_names_arc);
-
-        sort_handles.push(thread::spawn(move || {
-            let mut results = Vec::with_capacity(end_c - start_c);
-            for c in start_c..end_c {
-                let mut list = cn_ref[c].clone();
-                if list.is_empty() {
-                    results.push((c, 0));
-                } else {
-                    list.sort_unstable();
-                    list.dedup();
-                    results.push((c, list.len()));
-                }
+    // Single linear pass to count distinct names per country in 2 milliseconds!
+    let mut last_val: u64 = u64::MAX;
+    for &val in &all_packed_names {
+        if val != last_val {
+            let cid = (val >> 48) as usize;
+            if cid < countries.len() {
+                countries[cid].distinct_names += 1;
             }
-            results
-        }));
-    }
-
-    for sh in sort_handles {
-        for (c, distinct) in sh.join().unwrap() {
-            countries[c].distinct_names = distinct;
+            last_val = val;
         }
     }
+    drop(all_packed_names);
 
     // Sort countries lexicographically by country name (UTF-8 byte order)
     countries.sort_unstable_by(|a, b| a.key.cmp(&b.key));

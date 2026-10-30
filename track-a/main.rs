@@ -2,7 +2,6 @@
 // Team: Runtime Terrors
 // Ultra-high-performance zero-dependency log aggregation engine in Rust
 
-use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
@@ -219,6 +218,14 @@ struct OutputGroup {
     error_ppm: u64,
 }
 
+struct MergedGroup {
+    hour: [u8; 13],
+    endpoint: Vec<u8>,
+    count: u64,
+    errors: u64,
+    latencies: Vec<u32>,
+}
+
 fn main() {
     let mut data_dir = String::from("/data");
     let mut out_dir = String::from("/out");
@@ -279,89 +286,98 @@ fn main() {
         }));
     }
 
-    // Merge into canonical BTreeMap sorted by (hour, endpoint)
-    let mut merged: BTreeMap<([u8; 13], Vec<u8>), (u64, u64, Vec<u32>)> = BTreeMap::new();
+    // Merge into flat vector without heap node overhead
+    let mut merged: Vec<MergedGroup> = Vec::with_capacity(1024);
+
     for handle in handles {
         let mut parser = handle.join().unwrap();
         for hid in 0..parser.hours.len() {
+            let h = parser.hours[hid];
             for eid in 0..parser.endpoints.len() {
                 let grp = &mut parser.table[hid][eid];
                 if grp.count > 0 {
-                    let entry = merged.entry((parser.hours[hid], parser.endpoints[eid].clone()))
-                        .or_insert_with(|| (0, 0, Vec::new()));
-                    entry.0 += grp.count as u64;
-                    entry.1 += grp.errors as u64;
-                    if entry.2.is_empty() {
-                        entry.2 = std::mem::take(&mut grp.latencies);
-                    } else {
-                        entry.2.append(&mut grp.latencies);
+                    let ep = &parser.endpoints[eid];
+                    let mut found = false;
+                    for mg in &mut merged {
+                        if mg.hour == h && &mg.endpoint == ep {
+                            mg.count += grp.count as u64;
+                            mg.errors += grp.errors as u64;
+                            mg.latencies.append(&mut grp.latencies);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        merged.push(MergedGroup {
+                            hour: h,
+                            endpoint: ep.clone(),
+                            count: grp.count as u64,
+                            errors: grp.errors as u64,
+                            latencies: std::mem::take(&mut grp.latencies),
+                        });
                     }
                 }
             }
         }
     }
+    drop(mmap);
 
-    // Parallel O(N) Quickselect percentiles using select_nth_unstable
-    struct TaskItem {
-        hour: [u8; 13],
-        endpoint: Vec<u8>,
-        count: u64,
-        errors: u64,
-        latencies: Vec<u32>,
-    }
+    // Sort groups canonically by (hour, endpoint)
+    merged.sort_unstable_by(|a, b| {
+        a.hour.cmp(&b.hour).then_with(|| a.endpoint.cmp(&b.endpoint))
+    });
 
-    let items: Vec<TaskItem> = merged.into_iter().map(|((hour, endpoint), (count, errors, latencies))| {
-        TaskItem { hour, endpoint, count, errors, latencies }
-    }).collect();
-
-    let total_groups = items.len();
+    let total_groups = merged.len();
     let sort_threads = num_threads.min(total_groups).max(1);
     let per_worker = (total_groups + sort_threads - 1) / sort_threads;
 
-    let items_arc = Arc::new(items);
     let mut sort_handles = Vec::with_capacity(sort_threads);
 
-    for t in 0..sort_threads {
-        let start_idx = t * per_worker;
-        let end_idx = (start_idx + per_worker).min(total_groups);
-        let items_ref = Arc::clone(&items_arc);
+    // Split merged into chunks by moving (ZERO CLONING!)
+    let mut chunks: Vec<Vec<MergedGroup>> = Vec::with_capacity(sort_threads);
+    let mut remainder = merged;
+    while !remainder.is_empty() {
+        let take_len = per_worker.min(remainder.len());
+        let tail = remainder.split_off(take_len);
+        chunks.push(remainder);
+        remainder = tail;
+    }
 
+    for chunk in chunks {
         sort_handles.push(thread::spawn(move || {
-            let mut local_results = Vec::with_capacity(end_idx - start_idx);
-            for i in start_idx..end_idx {
-                let item = &items_ref[i];
+            let mut results = Vec::with_capacity(chunk.len());
+            for mut item in chunk {
                 let count = item.count;
                 if count == 0 {
                     continue;
                 }
-                let mut lats = item.latencies.clone();
                 let n = count as usize;
                 let r50 = (50 * n + 99) / 100 - 1;
                 let r95 = (95 * n + 99) / 100 - 1;
                 let r99 = (99 * n + 99) / 100 - 1;
 
-                lats.select_nth_unstable(r50);
-                let p50 = lats[r50];
+                item.latencies.select_nth_unstable(r50);
+                let p50 = item.latencies[r50];
 
                 let p95 = if r95 > r50 {
-                    lats[r50 + 1..].select_nth_unstable(r95 - r50 - 1);
-                    lats[r95]
+                    item.latencies[r50 + 1..].select_nth_unstable(r95 - r50 - 1);
+                    item.latencies[r95]
                 } else {
                     p50
                 };
 
                 let p99 = if r99 > r95 {
-                    lats[r95 + 1..].select_nth_unstable(r99 - r95 - 1);
-                    lats[r99]
+                    item.latencies[r95 + 1..].select_nth_unstable(r99 - r95 - 1);
+                    item.latencies[r99]
                 } else {
                     p95
                 };
 
                 let error_ppm = (item.errors * 1_000_000) / count;
 
-                local_results.push(OutputGroup {
+                results.push(OutputGroup {
                     hour: item.hour,
-                    endpoint: item.endpoint.clone(),
+                    endpoint: item.endpoint,
                     count,
                     errors: item.errors,
                     p50,
@@ -370,7 +386,7 @@ fn main() {
                     error_ppm,
                 });
             }
-            local_results
+            results
         }));
     }
 
