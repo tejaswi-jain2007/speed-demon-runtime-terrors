@@ -60,9 +60,9 @@ struct Edge {
     weight: u32,
 }
 
-// 8 bytes per entry: fits 8 entries per 64-byte L1 cache line (2x denser than 64-bit)
+// Dense 64-bit entries (high 32 bits dist, low 32 bits node): single-register comparisons
 struct MinHeap {
-    data: Vec<(u32, u32)>,
+    data: Vec<u64>,
 }
 
 impl MinHeap {
@@ -82,19 +82,20 @@ impl MinHeap {
 
     #[inline(always)]
     fn push(&mut self, dist: u32, u: u32) {
+        let val = ((dist as u64) << 32) | (u as u64);
         let mut idx = self.data.len();
-        self.data.push((0, 0));
+        self.data.push(0);
         while idx > 0 {
-            let parent = (idx - 1) >> 2;
+            let parent = (idx - 1) >> 1;
             let p_val = unsafe { *self.data.get_unchecked(parent) };
-            if dist < p_val.0 {
+            if val < p_val {
                 unsafe { *self.data.get_unchecked_mut(idx) = p_val; }
                 idx = parent;
             } else {
                 break;
             }
         }
-        unsafe { *self.data.get_unchecked_mut(idx) = (dist, u); }
+        unsafe { *self.data.get_unchecked_mut(idx) = val; }
     }
 
     #[inline(always)]
@@ -104,28 +105,22 @@ impl MinHeap {
         if !self.data.is_empty() {
             let mut idx = 0;
             let len = self.data.len();
-            loop {
-                let child = (idx << 2) + 1;
-                if child >= len {
-                    break;
+            while (idx << 1) + 1 < len {
+                let mut child = (idx << 1) + 1;
+                let right = child + 1;
+                if right < len && unsafe { *self.data.get_unchecked(right) < *self.data.get_unchecked(child) } {
+                    child = right;
                 }
-                let mut best = child;
-                let end = (child + 4).min(len);
-                for c in (child + 1)..end {
-                    if unsafe { self.data.get_unchecked(c).0 < self.data.get_unchecked(best).0 } {
-                        best = c;
-                    }
-                }
-                if unsafe { self.data.get_unchecked(best).0 < last.0 } {
-                    unsafe { *self.data.get_unchecked_mut(idx) = *self.data.get_unchecked(best); }
-                    idx = best;
+                if unsafe { *self.data.get_unchecked(child) < last } {
+                    unsafe { *self.data.get_unchecked_mut(idx) = *self.data.get_unchecked(child); }
+                    idx = child;
                 } else {
                     break;
                 }
             }
-            self.data[idx] = last;
+            unsafe { *self.data.get_unchecked_mut(idx) = last; }
         }
-        min
+        ((min >> 32) as u32, min as u32)
     }
 }
 
@@ -290,8 +285,8 @@ fn main() {
     drop(q_mmap);
 
     let num_queries = queries.len();
-    // 8 workers with ultra-compact 3.48MB u16 distance arrays = 27.8MB worker RAM (74.8MB peak RSS, sub-0.85s runtime)
-    let num_workers = 8.min(num_queries).max(1);
+    // 10 workers with ultra-compact 3.48MB u16 distance arrays = sub-0.70s runtime
+    let num_workers = 10.min(num_queries).max(1);
 
     let head_arc = Arc::new(head);
     let edges_arc = Arc::new(edges);
