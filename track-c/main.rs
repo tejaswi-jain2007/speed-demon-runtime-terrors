@@ -153,7 +153,7 @@ fn parse_csv_chunk(
 ) {
     let mut p = start;
     let chunk_end = end;
-    let mut filter = vec![0u64; 16384];
+    let mut filter = vec![0u64; 65536];
 
     while p < chunk_end {
         if p + 3 <= chunk_end && rec_data[p] == 0xEF && rec_data[p + 1] == 0xBB && rec_data[p + 2] == 0xBF {
@@ -293,7 +293,7 @@ fn parse_csv_chunk(
 
         // 64-bit packing: high 16 bits cid, low 48 bits name_hash
         let packed = ((cid as u64) << 48) | (name_hash & 0x0000_FFFF_FFFF_FFFF);
-        let slot = (name_hash as usize) & 0x3FFF;
+        let slot = (name_hash as usize) & 0xFFFF;
         if filter[slot] != packed {
             filter[slot] = packed;
             local_names.push(packed);
@@ -425,7 +425,7 @@ fn main() {
     }
     let data_start = hdr_p;
 
-    let num_threads = 10.min(thread::available_parallelism().map(|n| n.get()).unwrap_or(10)).max(1);
+    let num_threads = 12.min(thread::available_parallelism().map(|n| n.get()).unwrap_or(12)).max(1);
     let payload_len = rec_size - data_start;
     let mut splits = vec![data_start; num_threads + 1];
     splits[num_threads] = rec_size;

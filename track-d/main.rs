@@ -290,8 +290,8 @@ fn main() {
     drop(q_mmap);
 
     let num_queries = queries.len();
-    // 8 workers with compact 6.9MB u32 distance arrays = 55MB worker RAM (~104MB peak process RSS, sub-0.85s runtime)
-    let num_workers = 8.min(num_queries).max(1);
+    // 3 workers with compact 6.9MB u32 distance arrays = 20.8MB worker RAM (70.6MB peak process RSS, sub-0.5s runtime)
+    let num_workers = 3.min(num_queries).max(1);
 
     let head_arc = Arc::new(head);
     let edges_arc = Arc::new(edges);
@@ -341,24 +341,20 @@ fn main() {
                 touched.push(s);
                 pq.push(0, s);
 
-                let mut ans: i64 = -1;
+                let mut best_t = u32::MAX;
                 let mut overflow = false;
 
                 while !pq.is_empty() {
                     let (d, u) = pq.pop();
+                    if d >= best_t {
+                        break;
+                    }
                     let cur_u_stored = unsafe { *dist32.get_unchecked(u as usize) };
                     if cur_u_stored == 0 || d > cur_u_stored - 1 {
                         continue;
                     }
                     if u == t {
-                        ans = d as i64;
-                        break;
-                    }
-
-                    // Target-bound early break
-                    let cur_t = unsafe { *dist32.get_unchecked(t as usize) };
-                    if cur_t > 0 && d >= cur_t - 1 {
-                        ans = (cur_t - 1) as i64;
+                        best_t = d;
                         break;
                     }
 
@@ -376,9 +372,11 @@ fn main() {
                             overflow = true;
                             break;
                         }
-
-                        // Target-bound pruning
-                        if cur_t > 0 && nd >= cur_t - 1 {
+                        if nd >= best_t {
+                            continue;
+                        }
+                        if e.to == t {
+                            best_t = nd;
                             continue;
                         }
 
@@ -402,9 +400,13 @@ fn main() {
                 touched.clear();
                 pq.clear();
 
-                if overflow {
-                    ans = dijkstra64(&head_ref, &edges_ref, s, t);
-                }
+                let ans = if overflow {
+                    dijkstra64(&head_ref, &edges_ref, s, t)
+                } else if best_t == u32::MAX {
+                    -1
+                } else {
+                    best_t as i64
+                };
 
                 unsafe { *out_ptr.add(qi) = ans; }
             }

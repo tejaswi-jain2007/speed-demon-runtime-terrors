@@ -132,9 +132,15 @@ fn build_hour_strings() -> Vec<[u8; 20]> {
 #[inline(always)]
 fn hash_bytes(b: &[u8]) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
-    for &byte in b {
-        h ^= byte as u64;
-        h = h.wrapping_mul(0x100000001b3);
+    let mut i = 0;
+    while i + 8 <= b.len() {
+        let chunk = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        h = (h ^ chunk).wrapping_mul(0x100000001b3);
+        i += 8;
+    }
+    while i < b.len() {
+        h = (h ^ (b[i] as u64)).wrapping_mul(0x100000001b3);
+        i += 1;
     }
     if h == 0 { 1 } else { h }
 }
@@ -224,7 +230,7 @@ fn main() {
 
     let data = mmap.as_slice();
     let file_size = data.len();
-    let num_threads = 12.min(thread::available_parallelism().map(|n| n.get()).unwrap_or(12)).max(1);
+    let num_threads = 10.min(thread::available_parallelism().map(|n| n.get()).unwrap_or(10)).max(1);
 
     let mut splits = vec![0usize; num_threads + 1];
     splits[num_threads] = file_size;
@@ -437,6 +443,9 @@ fn main() {
                     *arena.add(write_idx as usize) = lat;
                 }
             }
+            unsafe {
+                madvise(d.as_ptr().add(start) as *mut u8, end - start, 4);
+            }
         }));
     }
 
@@ -486,7 +495,7 @@ fn main() {
 
                 let (p50, p95, p99) = if count == 1 {
                     (lat_slice[0], lat_slice[0], lat_slice[0])
-                } else if count <= 5 {
+                } else if count <= 64 {
                     lat_slice.sort_unstable();
                     let r50 = (50 * count + 99) / 100 - 1;
                     let r95 = (95 * count + 99) / 100 - 1;
