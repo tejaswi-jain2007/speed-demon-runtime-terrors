@@ -487,20 +487,26 @@ fn main() {
             let mut local_names: Vec<u64> = Vec::with_capacity(16384);
             let d = rec_ref.as_slice();
             parse_csv_chunk(d, start, end, &rlookup_ref, &mut local_aggs, &mut local_names);
+            local_names.sort_unstable();
             (local_aggs, local_names)
         }));
     }
 
     let mut thread_results = Vec::with_capacity(num_threads);
+    let mut sorted_chunks = Vec::with_capacity(num_threads);
     for h in handles {
-        thread_results.push(h.join().unwrap());
+        let (aggs, names) = h.join().unwrap();
+        thread_results.push(aggs);
+        if !names.is_empty() {
+            sorted_chunks.push(names);
+        }
     }
     drop(rec_mmap);
 
     // Merge basic metrics
     for c in 0..num_countries {
         let dest = &mut countries[c];
-        for (local_aggs, _) in &thread_results {
+        for local_aggs in &thread_results {
             let src = &local_aggs[c];
             if src.count > 0 {
                 dest.count += src.count;
@@ -517,23 +523,7 @@ fn main() {
             }
         }
     }
-
-    // Parallel in-place sort of chunks across 12 threads
-    let mut sort_handles = Vec::with_capacity(num_threads);
-    for (_, mut names) in thread_results {
-        sort_handles.push(thread::spawn(move || {
-            names.sort_unstable();
-            names
-        }));
-    }
-
-    let mut sorted_chunks = Vec::with_capacity(num_threads);
-    for sh in sort_handles {
-        let chunk = sh.join().unwrap();
-        if !chunk.is_empty() {
-            sorted_chunks.push(chunk);
-        }
-    }
+    drop(thread_results);
 
     // 12-way K-way streaming merge: counts distinct names in 3 milliseconds without allocating!
     let mut cursors = vec![0usize; sorted_chunks.len()];
