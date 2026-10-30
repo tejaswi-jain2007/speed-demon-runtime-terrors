@@ -8,22 +8,23 @@
 ---
 
 ## Championship Submission Overview
-We are competing for the **Overall Speed Demon Championship** across multiple tracks with ultra-fast, zero-dependency C++20 engines designed specifically for the Hetzner Falkenstein hardware (Intel Core i5-13500 pinned to 6 P-cores / 12 hardware threads).
+We are competing for the **Overall Speed Demon Championship** across all four tracks with ultra-fast, zero-dependency Rust engines designed specifically for the Hetzner Falkenstein hardware (Intel Core i5-13500 pinned to 6 P-cores / 12 hardware threads).
 
-| Track | Task | Language | Architecture Highlights | Expected Speedup |
-|---|---|---|---|---|
-| **Track A (Ingest)** | 3.1M log line hourly stats & percentiles | C++20 | Zero-alloc `mmap` parser, 12-thread chunking, in-place parallel sorting | **~25x faster** (1.2s vs 32.0s) |
-| **Track B (Index)** | 50,000 boolean & phrase queries over 250MB corpus | C++20 | Sorted inverted index, SIMD/linear set algebra, 12-thread query runner | **~30x faster** (1.8s vs 56.3s) |
-| **Track D (Traverse)** | 5M edge graph, 2,000 shortest-path queries | C++20 | Compact CSR graph, $O(1)$ generation-tagged Dijkstra state, 12 threads | **~180x faster** (0.35s vs 72.7s) |
+| Track | Task | Language | Architecture Highlights |
+|---|---|---|---|
+| **Track A (Ingest)** | 3.1M log line hourly stats & percentiles | Rust | Zero-alloc `mmap` parser, 12-thread parallel chunking, in-place pdqsort percentiles |
+| **Track B (Index)** | 50,000 boolean & phrase queries over corpus | Rust | Vocabulary-filtered index, sorted posting lists, two-pointer linear set operations |
+| **Track C (Join)** | Multi-table CSV join & distinct aggregation | Rust | Zero-alloc streaming CSV state machine, flat region lookup, 64-bit FNV distinct hashes |
+| **Track D (Traverse)** | 5M edge graph, 2,000 shortest-path queries | Rust | Compact forward-only CSR (~44MB), generation-stamped $O(1)$ reset, 12-thread parallel Dijkstra |
 
 ---
 
 ## Design Principles
 1. **Zero External Dependencies ($D = 1$):**
-   - Zero penalties on the D axis ($D_{ref} / D = 1.0$).
-   - Built exclusively with standard C++20 and POSIX system primitives (`mmap`, `stat`).
+   - Built exclusively with standard Rust (`dependency_count = 0`).
+   - Compliant with offline build requirements (`--network=none`).
 2. **Mechanical Sympathy:**
    - Pre-allocated flat buffers for zero dynamic heap allocations in hot loops.
-   - Cache-conscious data structures (CSR arrays, linear postings).
-3. **Hardware Utilization:**
-   - Tailored precisely to 12 hardware threads across 6 physical P-cores with no lock contention.
+   - Cache-conscious data structures (compact CSR arrays, linear postings).
+3. **Hardware Saturation:**
+   - Scaled to 12 hardware threads across 6 physical P-cores with lock-free independent workers.
