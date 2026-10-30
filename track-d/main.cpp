@@ -150,7 +150,7 @@ int main(int argc, char* argv[]) {
     size_t num_queries = queries.size();
     std::vector<int64_t> answers(num_queries, -1);
 
-    // 3. Parallel Bidirectional Dijkstra across 6 physical P-cores
+    // 3. Parallel Bidirectional Dijkstra pinned to 6 P-cores
     unsigned int num_threads = 6;
     if (num_queries < num_threads) num_threads = static_cast<unsigned int>(num_queries);
     if (num_threads == 0) num_threads = 1;
@@ -165,11 +165,11 @@ int main(int argc, char* argv[]) {
         workers.emplace_back([&, start_q, end_q]() {
             std::vector<uint32_t> seen_f(n, 0);
             std::vector<uint32_t> seen_b(n, 0);
-            std::vector<uint32_t> dist_f(n, 0);
-            std::vector<uint32_t> dist_b(n, 0);
+            std::vector<uint64_t> dist_f(n, 0);
+            std::vector<uint64_t> dist_b(n, 0);
             uint32_t query_id = 0;
 
-            using HeapNode = std::pair<uint32_t, uint32_t>; // (dist, node)
+            using HeapNode = std::pair<uint64_t, uint32_t>; // (dist, node)
             std::priority_queue<HeapNode, std::vector<HeapNode>, std::greater<HeapNode>> pq_f;
             std::priority_queue<HeapNode, std::vector<HeapNode>, std::greater<HeapNode>> pq_b;
 
@@ -191,10 +191,10 @@ int main(int argc, char* argv[]) {
                 dist_b[t] = 0;
                 pq_b.emplace(0, t);
 
-                uint32_t mu = UINT32_MAX;
+                uint64_t mu = UINT64_MAX;
 
                 while (!pq_f.empty() && !pq_b.empty()) {
-                    if (static_cast<uint64_t>(pq_f.top().first) + static_cast<uint64_t>(pq_b.top().first) >= mu) {
+                    if (pq_f.top().first + pq_b.top().first >= mu) {
                         break;
                     }
 
@@ -207,13 +207,13 @@ int main(int argc, char* argv[]) {
                         uint32_t e_end = head[u + 1];
                         for (uint32_t ei = e_start; ei < e_end; ++ei) {
                             uint32_t v = edges[ei].to;
-                            uint32_t nd = df + edges[ei].weight;
+                            uint64_t nd = df + edges[ei].weight;
                             if (seen_f[v] != query_id || nd < dist_f[v]) {
                                 seen_f[v] = query_id;
                                 dist_f[v] = nd;
                                 pq_f.emplace(nd, v);
                                 if (seen_b[v] == query_id) {
-                                    uint32_t cand = nd + dist_b[v];
+                                    uint64_t cand = nd + dist_b[v];
                                     if (cand < mu) mu = cand;
                                 }
                             }
@@ -227,13 +227,13 @@ int main(int argc, char* argv[]) {
                         uint32_t e_end = rev_head[u + 1];
                         for (uint32_t ei = e_start; ei < e_end; ++ei) {
                             uint32_t v = rev_edges[ei].to;
-                            uint32_t nd = db + rev_edges[ei].weight;
+                            uint64_t nd = db + rev_edges[ei].weight;
                             if (seen_b[v] != query_id || nd < dist_b[v]) {
                                 seen_b[v] = query_id;
                                 dist_b[v] = nd;
                                 pq_b.emplace(nd, v);
                                 if (seen_f[v] == query_id) {
-                                    uint32_t cand = nd + dist_f[v];
+                                    uint64_t cand = nd + dist_f[v];
                                     if (cand < mu) mu = cand;
                                 }
                             }
@@ -241,7 +241,7 @@ int main(int argc, char* argv[]) {
                     }
                 }
 
-                answers[qi] = (mu != UINT32_MAX) ? static_cast<int64_t>(mu) : -1;
+                answers[qi] = (mu != UINT64_MAX) ? static_cast<int64_t>(mu) : -1;
                 while (!pq_f.empty()) pq_f.pop();
                 while (!pq_b.empty()) pq_b.pop();
             }
