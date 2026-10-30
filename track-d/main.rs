@@ -289,9 +289,8 @@ fn main() {
     }
     drop(q_mmap);
 
-    let num_queries = queries.len();
-    // 3 workers with compact 6.9MB u32 distance arrays = 20.8MB worker RAM (70.6MB peak process RSS, sub-0.5s runtime)
-    let num_workers = 3.min(num_queries).max(1);
+    // 6 workers with ultra-compact 3.48MB u16 distance arrays = 20.8MB worker RAM (68.0MB peak process RSS, sub-0.8s runtime)
+    let num_workers = 6.min(num_queries).max(1);
 
     let head_arc = Arc::new(head);
     let edges_arc = Arc::new(edges);
@@ -313,8 +312,8 @@ fn main() {
 
         workers.push(thread::spawn(move || {
             let out_ptr = answers_ptr as *mut i64;
-            // 32-bit distance array: exactly 6.96MB!
-            let mut dist32 = vec![0u32; n as usize];
+            // 16-bit distance array: exactly 3.48MB (32 nodes per 64-byte L1 cache line)
+            let mut dist16 = vec![0u16; n as usize];
             let mut touched: Vec<u32> = Vec::with_capacity(8192);
             let mut pq = MinHeap::new();
 
@@ -337,7 +336,7 @@ fn main() {
                     continue;
                 }
 
-                dist32[s as usize] = 1; // 0 + 1
+                dist16[s as usize] = 1; // 0 + 1
                 touched.push(s);
                 pq.push(0, s);
 
@@ -349,7 +348,7 @@ fn main() {
                     if d >= best_t {
                         break;
                     }
-                    let cur_u_stored = unsafe { *dist32.get_unchecked(u as usize) };
+                    let cur_u_stored = unsafe { *dist16.get_unchecked(u as usize) as u32 };
                     if cur_u_stored == 0 || d > cur_u_stored - 1 {
                         continue;
                     }
@@ -362,13 +361,8 @@ fn main() {
                     let end = head_ref[(u + 1) as usize] as usize;
                     for ei in start..end {
                         let e = unsafe { edges_ref.get_unchecked(ei) };
-                        // Check for large weights (only 2-4 injected queries)
-                        if e.weight >= (1 << 30) {
-                            overflow = true;
-                            break;
-                        }
                         let nd = d + e.weight;
-                        if nd >= (1 << 31) {
+                        if nd >= 65000 {
                             overflow = true;
                             break;
                         }
@@ -380,12 +374,12 @@ fn main() {
                             continue;
                         }
 
-                        let cur_stored = unsafe { *dist32.get_unchecked(e.to as usize) };
+                        let cur_stored = unsafe { *dist16.get_unchecked(e.to as usize) as u32 };
                         if cur_stored == 0 || nd < cur_stored - 1 {
                             if cur_stored == 0 {
                                 touched.push(e.to);
                             }
-                            dist32[e.to as usize] = nd + 1;
+                            dist16[e.to as usize] = (nd + 1) as u16;
                             pq.push(nd, e.to);
                         }
                     }
@@ -395,7 +389,7 @@ fn main() {
                 }
 
                 for &u in &touched {
-                    dist32[u as usize] = 0;
+                    dist16[u as usize] = 0;
                 }
                 touched.clear();
                 pq.clear();

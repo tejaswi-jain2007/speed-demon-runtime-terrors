@@ -134,7 +134,7 @@ fn hash_bytes(b: &[u8]) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
     let mut i = 0;
     while i + 8 <= b.len() {
-        let chunk = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        let chunk = unsafe { std::ptr::read_unaligned(b.as_ptr().add(i) as *const u64) };
         h = (h ^ chunk).wrapping_mul(0x100000001b3);
         i += 8;
     }

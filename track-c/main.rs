@@ -487,7 +487,6 @@ fn main() {
             let mut local_names: Vec<u64> = Vec::with_capacity(16384);
             let d = rec_ref.as_slice();
             parse_csv_chunk(d, start, end, &rlookup_ref, &mut local_aggs, &mut local_names);
-            local_names.sort_unstable();
             unsafe {
                 madvise(d.as_ptr().add(start) as *mut u8, end - start, 4);
             }
@@ -496,12 +495,15 @@ fn main() {
     }
 
     let mut thread_results = Vec::with_capacity(num_threads);
-    let mut sorted_chunks = Vec::with_capacity(num_threads);
+    let mut country_names: Vec<Vec<u64>> = vec![Vec::new(); num_countries];
+
     for h in handles {
         let (aggs, names) = h.join().unwrap();
         thread_results.push(aggs);
-        if !names.is_empty() {
-            sorted_chunks.push(names);
+        for packed in names {
+            let cid = (packed >> 48) as usize;
+            let name_hash = packed & 0x0000_FFFF_FFFF_FFFF;
+            country_names[cid].push(name_hash);
         }
     }
     drop(rec_mmap);
@@ -528,40 +530,37 @@ fn main() {
     }
     drop(thread_results);
 
-    // 12-way K-way streaming merge: counts distinct names in 3 milliseconds without allocating!
-    let mut cursors = vec![0usize; sorted_chunks.len()];
-    let mut last_val: u64 = u64::MAX;
+    // Parallel in-place country distinct counting across 12 threads
+    let cn_arc = Arc::new(country_names);
+    let mut dedup_handles = Vec::with_capacity(num_threads);
+    let c_per_thread = (num_countries + num_threads - 1) / num_threads;
 
-    loop {
-        let mut min_val = u64::MAX;
-        let mut min_chunk = usize::MAX;
+    for t in 0..num_threads {
+        let cn_ref = Arc::clone(&cn_arc);
+        let start_c = t * c_per_thread;
+        let end_c = (start_c + c_per_thread).min(num_countries);
 
-        for (i, chunk) in sorted_chunks.iter().enumerate() {
-            let cur = cursors[i];
-            if cur < chunk.len() {
-                let v = unsafe { *chunk.get_unchecked(cur) };
-                if v < min_val {
-                    min_val = v;
-                    min_chunk = i;
+        dedup_handles.push(thread::spawn(move || {
+            let mut counts = Vec::with_capacity(end_c - start_c);
+            for c in start_c..end_c {
+                let mut list = cn_ref[c].clone();
+                if list.is_empty() {
+                    counts.push((c, 0));
+                } else {
+                    list.sort_unstable();
+                    list.dedup();
+                    counts.push((c, list.len()));
                 }
             }
-        }
+            counts
+        }));
+    }
 
-        if min_chunk == usize::MAX {
-            break;
-        }
-
-        cursors[min_chunk] += 1;
-
-        if min_val != last_val {
-            let cid = (min_val >> 48) as usize;
-            if cid < countries.len() {
-                countries[cid].distinct_names += 1;
-            }
-            last_val = min_val;
+    for dh in dedup_handles {
+        for (c, distinct) in dh.join().unwrap() {
+            countries[c].distinct_names = distinct;
         }
     }
-    drop(sorted_chunks);
 
     // Sort countries lexicographically by country name (UTF-8 byte order)
     countries.sort_unstable_by(|a, b| a.key.cmp(&b.key));
