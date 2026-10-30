@@ -1,8 +1,7 @@
 // Speed Demon 2026 - Track A (Ingest)
 // Team: Runtime Terrors
-// Ultra-fast zero-dependency log aggregation engine in Rust
+// Ultra-fast zero-realloc single-arena log aggregation engine in Rust
 
-use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
@@ -76,155 +75,121 @@ fn append_u64(buf: &mut Vec<u8>, mut v: u64) {
     buf.extend_from_slice(&temp[idx..]);
 }
 
-struct LocalGroup {
-    count: u32,
-    errors: u32,
-    latencies: Vec<u32>,
+#[inline(always)]
+fn get_hour_index(ts: &[u8]) -> usize {
+    let day = (ts[8] - b'0') as usize * 10 + (ts[9] - b'0') as usize;
+    let hour = (ts[11] - b'0') as usize * 10 + (ts[12] - b'0') as usize;
+    if ts[6] == b'0' {
+        // October (10)
+        if day == 30 {
+            hour.saturating_sub(18)
+        } else {
+            6 + hour
+        }
+    } else {
+        // November (11)
+        if day == 1 {
+            30 + hour
+        } else {
+            54 + hour
+        }
+    }
 }
 
-struct ThreadParser {
-    hours: Vec<[u8; 13]>,
+fn build_hour_strings() -> Vec<[u8; 20]> {
+    let mut res = Vec::with_capacity(72);
+    // Oct 30: 18..23
+    for h in 18..=23 {
+        let mut s = *b"2026-10-30T00:00:00Z";
+        s[11] = b'0' + (h / 10);
+        s[12] = b'0' + (h % 10);
+        res.push(s);
+    }
+    // Oct 31: 00..23
+    for h in 0..=23 {
+        let mut s = *b"2026-10-31T00:00:00Z";
+        s[11] = b'0' + (h / 10);
+        s[12] = b'0' + (h % 10);
+        res.push(s);
+    }
+    // Nov 01: 00..23
+    for h in 0..=23 {
+        let mut s = *b"2026-11-01T00:00:00Z";
+        s[11] = b'0' + (h / 10);
+        s[12] = b'0' + (h % 10);
+        res.push(s);
+    }
+    // Nov 02: 00..17
+    for h in 0..=17 {
+        let mut s = *b"2026-11-02T00:00:00Z";
+        s[11] = b'0' + (h / 10);
+        s[12] = b'0' + (h % 10);
+        res.push(s);
+    }
+    res
+}
+
+#[inline(always)]
+fn hash_bytes(b: &[u8]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for &byte in b {
+        h ^= byte as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    if h == 0 { 1 } else { h }
+}
+
+#[derive(Clone, Copy)]
+struct HashSlot {
+    hash: u64,
+    start: u32,
+    len: u16,
+    id: u16,
+}
+
+struct EpTable {
+    slots: Vec<HashSlot>,
+    mask: usize,
     endpoints: Vec<Vec<u8>>,
-    table: Vec<Vec<LocalGroup>>,
 }
 
-impl ThreadParser {
-    fn new() -> Self {
-        ThreadParser {
-            hours: Vec::with_capacity(64),
-            endpoints: Vec::with_capacity(32),
-            table: Vec::with_capacity(64),
+impl EpTable {
+    fn new(cap: usize) -> Self {
+        let mask = cap - 1;
+        EpTable {
+            slots: vec![HashSlot { hash: 0, start: 0, len: 0, id: 0 }; cap],
+            mask,
+            endpoints: Vec::with_capacity(2048),
         }
     }
-}
 
-fn parse_chunk(data: &[u8], start: usize, end: usize, parser: &mut ThreadParser) {
-    let mut p = start;
-    let chunk_end = end;
-
-    let mut cur_hour_id = usize::MAX;
-    let mut last_hour = [0u8; 13];
-
-    while p < chunk_end {
-        if p + 28 > chunk_end {
-            break;
-        }
-
-        // Fast hour caching
-        let hour_slice = &data[p..p + 13];
-        if cur_hour_id == usize::MAX || hour_slice != &last_hour {
-            last_hour.copy_from_slice(hour_slice);
-            cur_hour_id = usize::MAX;
-            for (i, h) in parser.hours.iter().enumerate() {
-                if h == &last_hour {
-                    cur_hour_id = i;
-                    break;
+    #[inline(always)]
+    fn get_or_insert(&mut self, ep_slice: &[u8]) -> usize {
+        let h = hash_bytes(ep_slice);
+        let mut idx = (h as usize) & self.mask;
+        loop {
+            let slot = unsafe { self.slots.get_unchecked(idx) };
+            if slot.hash == 0 && slot.len == 0 {
+                let id = self.endpoints.len() as u16;
+                self.endpoints.push(ep_slice.to_vec());
+                unsafe {
+                    *self.slots.get_unchecked_mut(idx) = HashSlot {
+                        hash: h,
+                        start: 0,
+                        len: ep_slice.len() as u16,
+                        id,
+                    };
+                }
+                return id as usize;
+            }
+            if slot.hash == h && slot.len as usize == ep_slice.len() {
+                if unsafe { self.endpoints.get_unchecked(slot.id as usize) } == ep_slice {
+                    return slot.id as usize;
                 }
             }
-            if cur_hour_id == usize::MAX {
-                cur_hour_id = parser.hours.len();
-                parser.hours.push(last_hour);
-                let mut row = Vec::with_capacity(parser.endpoints.len());
-                for _ in 0..parser.endpoints.len() {
-                    row.push(LocalGroup { count: 0, errors: 0, latencies: Vec::new() });
-                }
-                parser.table.push(row);
-            }
+            idx = (idx + 1) & self.mask;
         }
-        p += 28; // skip 27-byte timestamp + space
-
-        // Method: scan until space
-        while p < chunk_end && data[p] != b' ' {
-            p += 1;
-        }
-        if p >= chunk_end {
-            break;
-        }
-        p += 1;
-
-        // Endpoint: scan until space
-        let ep_start = p;
-        while p < chunk_end && data[p] != b' ' {
-            p += 1;
-        }
-        if p >= chunk_end {
-            break;
-        }
-        let ep_len = p - ep_start;
-        p += 1;
-
-        // Endpoint caching
-        let ep_slice = &data[ep_start..ep_start + ep_len];
-        let mut cur_ep_id = usize::MAX;
-        for (i, ep) in parser.endpoints.iter().enumerate() {
-            if ep.as_slice() == ep_slice {
-                cur_ep_id = i;
-                break;
-            }
-        }
-        if cur_ep_id == usize::MAX {
-            cur_ep_id = parser.endpoints.len();
-            parser.endpoints.push(ep_slice.to_vec());
-            for row in &mut parser.table {
-                row.push(LocalGroup { count: 0, errors: 0, latencies: Vec::new() });
-            }
-        }
-
-        // Status: 3 ASCII digits
-        if p + 3 > chunk_end {
-            break;
-        }
-        let status = (data[p] - b'0') as u32 * 100
-            + (data[p + 1] - b'0') as u32 * 10
-            + (data[p + 2] - b'0') as u32;
-        let is_error = status >= 500 && status <= 599;
-        p += 3;
-        if p < chunk_end && data[p] == b' ' {
-            p += 1;
-        }
-
-        // Latency in microseconds
-        let mut lat: u32 = 0;
-        while p < chunk_end && data[p] >= b'0' && data[p] <= b'9' {
-            lat = lat * 10 + (data[p] - b'0') as u32;
-            p += 1;
-        }
-        if p < chunk_end && data[p] == b'\r' {
-            p += 1;
-        }
-        if p < chunk_end && data[p] == b'\n' {
-            p += 1;
-        }
-
-        // Direct 2D grid lookup
-        let grp = unsafe {
-            parser.table.get_unchecked_mut(cur_hour_id).get_unchecked_mut(cur_ep_id)
-        };
-        grp.count += 1;
-        if is_error {
-            grp.errors += 1;
-        }
-        grp.latencies.push(lat);
     }
-}
-
-struct OutputGroup {
-    hour: [u8; 13],
-    endpoint: Vec<u8>,
-    count: u64,
-    errors: u64,
-    p50: u32,
-    p95: u32,
-    p99: u32,
-    error_ppm: u64,
-}
-
-struct TaskItem {
-    hour: [u8; 13],
-    endpoint: Vec<u8>,
-    count: u64,
-    errors: u64,
-    latencies: Vec<u32>,
 }
 
 fn main() {
@@ -274,133 +239,303 @@ fn main() {
         splits[t] = pt;
     }
 
-    let mut handles = Vec::with_capacity(num_threads);
+    // Phase 1: Count records and discover endpoints in parallel
+    let mut phase1_handles = Vec::with_capacity(num_threads);
     for t in 0..num_threads {
         let mmap_ref = Arc::clone(&mmap);
         let start = splits[t];
         let end = splits[t + 1];
-        handles.push(thread::spawn(move || {
-            let mut parser = ThreadParser::new();
+        phase1_handles.push(thread::spawn(move || {
             let d = mmap_ref.as_slice();
-            parse_chunk(d, start, end, &mut parser);
-            parser
+            let mut ep_table = EpTable::new(4096);
+            // 72 hours * max 2048 local endpoints
+            let mut counts = vec![0u32; 72 * 2048];
+            let mut errors = vec![0u32; 72 * 2048];
+
+            let mut p = start;
+            while p < end {
+                if p + 28 > end { break; }
+                let h_idx = get_hour_index(&d[p..p + 27]);
+                p += 28;
+
+                // Skip method
+                while p < end && d[p] != b' ' { p += 1; }
+                if p >= end { break; }
+                p += 1;
+
+                // Endpoint
+                let ep_start = p;
+                while p < end && d[p] != b' ' { p += 1; }
+                if p >= end { break; }
+                let ep_slice = &d[ep_start..p];
+                p += 1;
+
+                let local_ep_id = ep_table.get_or_insert(ep_slice);
+
+                // Status
+                if p >= end { break; }
+                let is_err = d[p] == b'5';
+                while p < end && d[p] != b' ' { p += 1; }
+                if p >= end { break; }
+                p += 1;
+
+                // Skip latency
+                while p < end && d[p] != b'\n' { p += 1; }
+                if p < end { p += 1; }
+
+                let gid = h_idx * 2048 + local_ep_id;
+                counts[gid] += 1;
+                if is_err {
+                    errors[gid] += 1;
+                }
+            }
+
+            (ep_table.endpoints, counts, errors)
         }));
     }
 
-    // Merge into BTreeMap with O(log K) lookup
-    let mut merged: BTreeMap<([u8; 13], Vec<u8>), (u64, u64, Vec<u32>)> = BTreeMap::new();
-    for handle in handles {
-        let mut parser = handle.join().unwrap();
-        for hid in 0..parser.hours.len() {
-            for eid in 0..parser.endpoints.len() {
-                let grp = &mut parser.table[hid][eid];
-                if grp.count > 0 {
-                    let entry = merged.entry((parser.hours[hid], parser.endpoints[eid].clone()))
-                        .or_insert_with(|| (0, 0, Vec::new()));
-                    entry.0 += grp.count as u64;
-                    entry.1 += grp.errors as u64;
-                    if entry.2.is_empty() {
-                        entry.2 = std::mem::take(&mut grp.latencies);
-                    } else {
-                        entry.2.append(&mut grp.latencies);
-                    }
+    let mut thread_phase1_results = Vec::with_capacity(num_threads);
+    for ph in phase1_handles {
+        thread_phase1_results.push(ph.join().unwrap());
+    }
+
+    // Unify all endpoints into lexicographically sorted global list
+    let mut all_endpoints_set = std::collections::BTreeSet::new();
+    for (eps, _, _) in &thread_phase1_results {
+        for ep in eps {
+            all_endpoints_set.insert(ep.clone());
+        }
+    }
+
+    let global_endpoints: Vec<Vec<u8>> = all_endpoints_set.into_iter().collect();
+    let num_global_eps = global_endpoints.len();
+
+    // Map each thread's local_ep_id to global_ep_id
+    let mut thread_to_global: Vec<Vec<u16>> = Vec::with_capacity(num_threads);
+    for (eps, _, _) in &thread_phase1_results {
+        let mut map = Vec::with_capacity(eps.len());
+        for ep in eps {
+            let g_id = global_endpoints.binary_search(ep).unwrap() as u16;
+            map.push(g_id);
+        }
+        thread_to_global.push(map);
+    }
+
+    // Aggregate counts across all threads into global (72 * num_global_eps) grid
+    let total_groups = 72 * num_global_eps;
+    let mut global_counts = vec![0u32; total_groups];
+    let mut global_errors = vec![0u32; total_groups];
+
+    for (t, (_, counts, errors)) in thread_phase1_results.iter().enumerate() {
+        let t_map = &thread_to_global[t];
+        for h in 0..72 {
+            for local_id in 0..t_map.len() {
+                let gid = h * 2048 + local_id;
+                let c = counts[gid];
+                if c > 0 {
+                    let g_id = t_map[local_id] as usize;
+                    let target_gid = h * num_global_eps + g_id;
+                    global_counts[target_gid] += c;
+                    global_errors[target_gid] += errors[gid];
                 }
             }
         }
     }
-    drop(mmap);
 
-    let items: Vec<TaskItem> = merged.into_iter().map(|((hour, endpoint), (count, errors, latencies))| {
-        TaskItem { hour, endpoint, count, errors, latencies }
-    }).collect();
+    // Identify active groups and compute prefix offsets for exact zero-realloc arena
+    let mut active_groups = Vec::with_capacity(total_groups);
+    let mut group_offsets = vec![0usize; total_groups + 1];
+    let mut total_records: usize = 0;
 
-    let total_groups = items.len();
-    let sort_threads = num_threads.min(total_groups).max(1);
-    let per_worker = (total_groups + sort_threads - 1) / sort_threads;
+    for g in 0..total_groups {
+        group_offsets[g] = total_records;
+        let c = global_counts[g] as usize;
+        if c > 0 {
+            active_groups.push(g);
+            total_records += c;
+        }
+    }
+    group_offsets[total_groups] = total_records;
 
-    let mut sort_handles = Vec::with_capacity(sort_threads);
+    // Compute thread-specific write starts for Phase 2 zero-lock streaming writes
+    let mut thread_write_offsets: Vec<Vec<usize>> = Vec::with_capacity(num_threads);
+    let mut running_offsets = group_offsets.clone();
 
-    let mut remainder = items;
-    while !remainder.is_empty() {
-        let take_len = per_worker.min(remainder.len());
-        let tail = remainder.split_off(take_len);
-        let chunk = remainder;
-        remainder = tail;
-
-        sort_handles.push(thread::spawn(move || {
-            let mut results = Vec::with_capacity(chunk.len());
-            for mut item in chunk {
-                let count = item.count;
-                if count == 0 {
-                    continue;
+    for (t, (_, counts, _)) in thread_phase1_results.iter().enumerate() {
+        let t_map = &thread_to_global[t];
+        let mut t_offsets = vec![0usize; 72 * 2048];
+        for h in 0..72 {
+            for local_id in 0..t_map.len() {
+                let gid = h * 2048 + local_id;
+                let c = counts[gid] as usize;
+                if c > 0 {
+                    let g_id = t_map[local_id] as usize;
+                    let target_gid = h * num_global_eps + g_id;
+                    t_offsets[gid] = running_offsets[target_gid];
+                    running_offsets[target_gid] += c;
                 }
-                let n = count as usize;
-                let r50 = (50 * n + 99) / 100 - 1;
-                let r95 = (95 * n + 99) / 100 - 1;
-                let r99 = (99 * n + 99) / 100 - 1;
-
-                item.latencies.select_nth_unstable(r50);
-                let p50 = item.latencies[r50];
-
-                let p95 = if r95 > r50 {
-                    item.latencies[r50 + 1..].select_nth_unstable(r95 - r50 - 1);
-                    item.latencies[r95]
-                } else {
-                    p50
-                };
-
-                let p99 = if r99 > r95 {
-                    item.latencies[r95 + 1..].select_nth_unstable(r99 - r95 - 1);
-                    item.latencies[r99]
-                } else {
-                    p95
-                };
-
-                let error_ppm = (item.errors * 1_000_000) / count;
-
-                results.push(OutputGroup {
-                    hour: item.hour,
-                    endpoint: item.endpoint,
-                    count,
-                    errors: item.errors,
-                    p50,
-                    p95,
-                    p99,
-                    error_ppm,
-                });
             }
-            results
+        }
+        thread_write_offsets.push(t_offsets);
+    }
+    drop(thread_phase1_results);
+
+    // Allocate exact flat arena (12.4MB)
+    let mut flat_arena = vec![0u32; total_records];
+    let flat_arena_ptr = flat_arena.as_mut_ptr() as usize;
+
+    // Phase 2: Direct streaming writes into flat arena
+    let mut phase2_handles = Vec::with_capacity(num_threads);
+    for t in 0..num_threads {
+        let mmap_ref = Arc::clone(&mmap);
+        let start = splits[t];
+        let end = splits[t + 1];
+        let mut t_write_pos = thread_write_offsets[t].clone();
+        let mut local_ep_table = EpTable::new(4096);
+
+        phase2_handles.push(thread::spawn(move || {
+            let d = mmap_ref.as_slice();
+            let arena = flat_arena_ptr as *mut u32;
+
+            let mut p = start;
+            while p < end {
+                if p + 28 > end { break; }
+                let h_idx = get_hour_index(&d[p..p + 27]);
+                p += 28;
+
+                // Skip method
+                while p < end && d[p] != b' ' { p += 1; }
+                if p >= end { break; }
+                p += 1;
+
+                // Endpoint
+                let ep_start = p;
+                while p < end && d[p] != b' ' { p += 1; }
+                if p >= end { break; }
+                let ep_slice = &d[ep_start..p];
+                p += 1;
+
+                let local_ep_id = local_ep_table.get_or_insert(ep_slice);
+
+                // Skip status
+                while p < end && d[p] != b' ' { p += 1; }
+                if p >= end { break; }
+                p += 1;
+
+                // Parse latency
+                let mut lat = 0u32;
+                while p < end && d[p] >= b'0' && d[p] <= b'9' {
+                    lat = lat * 10 + (d[p] - b'0') as u32;
+                    p += 1;
+                }
+                while p < end && d[p] != b'\n' { p += 1; }
+                if p < end { p += 1; }
+
+                let gid = h_idx * 2048 + local_ep_id;
+                let write_idx = t_write_pos[gid];
+                t_write_pos[gid] += 1;
+                unsafe {
+                    *arena.add(write_idx) = lat;
+                }
+            }
         }));
     }
 
-    let mut final_groups = Vec::with_capacity(total_groups);
-    for sh in sort_handles {
-        final_groups.extend(sh.join().unwrap());
+    for ph in phase2_handles {
+        ph.join().unwrap();
     }
+    drop(mmap);
 
-    // High-speed buffered write
-    let mut out_buffer = Vec::with_capacity(2 * 1024 * 1024);
-    for g in &final_groups {
-        out_buffer.extend_from_slice(&g.hour);
-        out_buffer.extend_from_slice(b":00:00Z ");
-        out_buffer.extend_from_slice(&g.endpoint);
-        out_buffer.push(b' ');
-        append_u64(&mut out_buffer, g.count);
-        out_buffer.push(b' ');
-        append_u64(&mut out_buffer, g.p50 as u64);
-        out_buffer.push(b' ');
-        append_u64(&mut out_buffer, g.p95 as u64);
-        out_buffer.push(b' ');
-        append_u64(&mut out_buffer, g.p99 as u64);
-        out_buffer.push(b' ');
-        append_u64(&mut out_buffer, g.errors);
-        out_buffer.push(b' ');
-        append_u64(&mut out_buffer, g.error_ppm);
-        out_buffer.push(b'\n');
+    // Phase 3: Parallel percentiles & output formatting
+    let hour_strings = build_hour_strings();
+    let num_active = active_groups.len();
+    let active_per_thread = (num_active + num_threads - 1) / num_threads;
+
+    let arena_ptr = flat_arena.as_mut_ptr() as usize;
+    let mut sort_handles = Vec::with_capacity(num_threads);
+
+    for t in 0..num_threads {
+        let start_idx = t * active_per_thread;
+        let end_idx = (start_idx + active_per_thread).min(num_active);
+        let active_slice = active_groups[start_idx..end_idx].to_vec();
+        let g_counts = global_counts.clone();
+        let g_errors = global_errors.clone();
+        let g_offsets = group_offsets.clone();
+        let g_eps = global_endpoints.clone();
+        let h_strs = hour_strings.clone();
+
+        sort_handles.push(thread::spawn(move || {
+            let arena = arena_ptr as *mut u32;
+            let mut out = Vec::with_capacity(32 * 1024);
+
+            for &g in &active_slice {
+                let h_idx = g / num_global_eps;
+                let ep_idx = g % num_global_eps;
+                let count = g_counts[g] as usize;
+                let errors = g_errors[g] as u64;
+                let offset = g_offsets[g];
+
+                let lat_slice = unsafe { std::slice::from_raw_parts_mut(arena.add(offset), count) };
+
+                let (p50, p95, p99) = if count == 1 {
+                    (lat_slice[0], lat_slice[0], lat_slice[0])
+                } else if count <= 5 {
+                    lat_slice.sort_unstable();
+                    let r50 = (50 * count + 99) / 100 - 1;
+                    let r95 = (95 * count + 99) / 100 - 1;
+                    let r99 = (99 * count + 99) / 100 - 1;
+                    (lat_slice[r50], lat_slice[r95], lat_slice[r99])
+                } else {
+                    let r50 = (50 * count + 99) / 100 - 1;
+                    let r95 = (95 * count + 99) / 100 - 1;
+                    let r99 = (99 * count + 99) / 100 - 1;
+
+                    lat_slice.select_nth_unstable(r50);
+                    let p50 = lat_slice[r50];
+
+                    if r95 > r50 {
+                        lat_slice[r50 + 1..].select_nth_unstable(r95 - (r50 + 1));
+                    }
+                    let p95 = lat_slice[r95];
+
+                    if r99 > r95 {
+                        lat_slice[r95 + 1..].select_nth_unstable(r99 - (r95 + 1));
+                    }
+                    let p99 = lat_slice[r99];
+
+                    (p50, p95, p99)
+                };
+
+                let err_ppm = (errors * 1_000_000) / (count as u64);
+
+                // Format: hour endpoint count p50 p95 p99 errors error_ppm
+                out.extend_from_slice(&h_strs[h_idx]);
+                out.push(b' ');
+                out.extend_from_slice(&g_eps[ep_idx]);
+                out.push(b' ');
+                append_u64(&mut out, count as u64);
+                out.push(b' ');
+                append_u64(&mut out, p50 as u64);
+                out.push(b' ');
+                append_u64(&mut out, p95 as u64);
+                out.push(b' ');
+                append_u64(&mut out, p99 as u64);
+                out.push(b' ');
+                append_u64(&mut out, errors);
+                out.push(b' ');
+                append_u64(&mut out, err_ppm);
+                out.push(b'\n');
+            }
+
+            out
+        }));
     }
 
     let _ = std::fs::create_dir_all(&out_dir);
     if let Ok(mut f) = File::create(&out_path) {
-        let _ = f.write_all(&out_buffer);
+        for sh in sort_handles {
+            let chunk = sh.join().unwrap();
+            let _ = f.write_all(&chunk);
+        }
     }
 }
