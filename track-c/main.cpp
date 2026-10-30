@@ -11,19 +11,19 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 struct CountryAgg {
     std::string key;
+    uint16_t cid = 0;
     uint64_t count = 0;
     uint64_t id_sum = 0;
     int64_t amount_sum = 0;
     int64_t amount_min = 0;
     int64_t amount_max = 0;
-    std::unordered_set<std::string> names;
     uint64_t name_bytes = 0;
     uint64_t note_bytes = 0;
+    size_t distinct_names = 0;
 };
 
 static inline void format_cents(int64_t cents, std::string& out) {
@@ -37,6 +37,9 @@ static inline void format_cents(int64_t cents, std::string& out) {
     out.push_back(static_cast<char>('0' + (rem / 10)));
     out.push_back(static_cast<char>('0' + (rem % 10)));
 }
+
+// BSS page-demand allocated zero table
+static uint16_t region_to_country[10000000];
 
 int main(int argc, char* argv[]) {
     std::string data_dir = "/data";
@@ -74,14 +77,11 @@ int main(int argc, char* argv[]) {
     // Index 0 represents _UNMATCHED
     CountryAgg unmatched_agg;
     unmatched_agg.key = "_UNMATCHED";
+    unmatched_agg.cid = 0;
     countries.push_back(std::move(unmatched_agg));
 
     std::unordered_map<std::string, uint16_t> country_map;
     country_map.reserve(300);
-
-    // Flat direct lookup table for region_id < 10,000,000 (spec guarantees < 10M)
-    // 0 points to _UNMATCHED
-    std::vector<uint16_t> region_to_country(10000000, 0);
 
     const char* rp = r_data;
     const char* rend = r_data + r_size;
@@ -118,6 +118,7 @@ int main(int argc, char* argv[]) {
             cid = static_cast<uint16_t>(countries.size());
             CountryAgg agg;
             agg.key = country_code;
+            agg.cid = cid;
             countries.push_back(std::move(agg));
             country_map[country_code] = cid;
         } else {
@@ -131,6 +132,13 @@ int main(int argc, char* argv[]) {
 
     munmap(const_cast<char*>(r_data), r_size);
     close(r_fd);
+
+    // Per-country name hash collection: zero string allocations!
+    size_t num_countries = countries.size();
+    std::vector<std::vector<uint64_t>> country_name_hashes(num_countries);
+    for (size_t i = 0; i < num_countries; ++i) {
+        country_name_hashes[i].reserve(16384);
+    }
 
     // 2. Load records.csv
     std::string records_path = data_dir + "/records.csv";
@@ -163,9 +171,6 @@ int main(int argc, char* argv[]) {
     while (p < end && *p != '\n') ++p;
     if (p < end && *p == '\n') ++p;
 
-    std::string unescaped_name;
-    unescaped_name.reserve(256);
-
     while (p < end) {
         // Check for mid-file BOM at start of record
         if (p + 3 <= end && static_cast<uint8_t>(p[0]) == 0xEF &&
@@ -182,33 +187,37 @@ int main(int argc, char* argv[]) {
         }
         if (p < end && *p == ',') ++p;
 
-        // Field 1: name
-        unescaped_name.clear();
+        // Field 1: name (FNV-1a 64-bit zero-allocation hash & exact length)
+        uint64_t name_hash = 14695981039346656037ULL;
+        uint64_t name_len = 0;
         if (p < end && *p == '"') {
             ++p; // skip opening quote
             while (p < end) {
                 if (*p == '"') {
                     if (p + 1 < end && *(p + 1) == '"') {
-                        unescaped_name.push_back('"');
+                        name_hash = (name_hash ^ static_cast<uint8_t>('"')) * 1099511628211ULL;
+                        name_len += 1;
                         p += 2;
                     } else {
                         ++p; // closing quote
                         break;
                     }
                 } else {
-                    unescaped_name.push_back(*p);
+                    name_hash = (name_hash ^ static_cast<uint8_t>(*p)) * 1099511628211ULL;
+                    name_len += 1;
                     ++p;
                 }
             }
         } else {
             while (p < end && *p != ',') {
-                unescaped_name.push_back(*p);
+                name_hash = (name_hash ^ static_cast<uint8_t>(*p)) * 1099511628211ULL;
+                name_len += 1;
                 ++p;
             }
         }
         if (p < end && *p == ',') ++p;
 
-        // Field 2: note
+        // Field 2: note (length in unescaped bytes only)
         uint64_t note_bytes = 0;
         if (p < end && *p == '"') {
             ++p; // skip opening quote
@@ -286,22 +295,27 @@ int main(int argc, char* argv[]) {
         agg.count += 1;
         agg.id_sum += record_id;
         agg.amount_sum += cents;
-        agg.name_bytes += unescaped_name.size();
+        agg.name_bytes += name_len;
         agg.note_bytes += note_bytes;
-        agg.names.insert(unescaped_name);
+        country_name_hashes[cid].push_back(name_hash);
     }
 
     munmap(const_cast<char*>(rec_data), rec_size);
     close(rec_fd);
 
-    // 3. Sort active countries by key ascending
+    // 3. Count distinct names via fast in-place vector sort & unique
     std::vector<CountryAgg*> active_countries;
     for (auto& c : countries) {
         if (c.count > 0) {
+            auto& v = country_name_hashes[c.cid];
+            std::sort(v.begin(), v.end());
+            v.erase(std::unique(v.begin(), v.end()), v.end());
+            c.distinct_names = v.size();
             active_countries.push_back(&c);
         }
     }
 
+    // Sort active countries by key ascending
     std::sort(active_countries.begin(), active_countries.end(), [](const CountryAgg* a, const CountryAgg* b) {
         return a->key < b->key;
     });
@@ -326,7 +340,7 @@ int main(int argc, char* argv[]) {
             buffer.push_back(' ');
             format_cents(c->amount_max, buffer);
             buffer.push_back(' ');
-            buffer.append(std::to_string(c->names.size()));
+            buffer.append(std::to_string(c->distinct_names));
             buffer.push_back(' ');
             buffer.append(std::to_string(c->name_bytes));
             buffer.push_back(' ');
