@@ -12,7 +12,6 @@
 #include <thread>
 #include <vector>
 
-// Direct integer-to-ASCII formatter for maximum I/O throughput
 static inline void append_u32(std::string& s, uint32_t v) {
     char buf[12];
     char* p = buf + sizeof(buf);
@@ -47,21 +46,15 @@ struct LocalGroup {
     std::vector<uint32_t> latencies;
 };
 
-struct EndpointInfo {
-    const char* ptr;
-    size_t len;
-};
-
 struct ThreadParser {
     std::vector<std::string> hours;
-    std::vector<EndpointInfo> endpoints;
-    // Map: (hour_id * 64 + ep_id) -> LocalGroup
-    std::vector<LocalGroup> groups;
+    std::vector<std::string> endpoints;
+    std::vector<std::vector<LocalGroup>> table;
 
     ThreadParser() {
-        hours.reserve(128);
-        endpoints.reserve(64);
-        groups.resize(128 * 64);
+        hours.reserve(64);
+        endpoints.reserve(32);
+        table.reserve(64);
     }
 };
 
@@ -78,16 +71,22 @@ void parse_chunk(const char* data, size_t start, size_t end, ThreadParser& parse
         const char* ts_start = p;
         p += 28; // past 27 bytes timestamp + space
 
-        // Hour caching: hours stay identical for thousands of lines
+        // Hour caching: hours stay identical for tens of thousands of lines
         if (cur_hour_id == UINT32_MAX || memcmp(ts_start, last_hour, 13) != 0) {
             memcpy(last_hour, ts_start, 13);
-            std::string hr_str(ts_start, 13);
-            auto it = std::find(parser.hours.begin(), parser.hours.end(), hr_str);
-            if (it != parser.hours.end()) {
-                cur_hour_id = static_cast<uint32_t>(std::distance(parser.hours.begin(), it));
-            } else {
+            std::string_view hr_sv(ts_start, 13);
+            cur_hour_id = UINT32_MAX;
+            for (size_t i = 0; i < parser.hours.size(); ++i) {
+                if (parser.hours[i] == hr_sv) {
+                    cur_hour_id = static_cast<uint32_t>(i);
+                    break;
+                }
+            }
+            if (cur_hour_id == UINT32_MAX) {
                 cur_hour_id = static_cast<uint32_t>(parser.hours.size());
-                parser.hours.push_back(std::move(hr_str));
+                parser.hours.emplace_back(hr_sv);
+                parser.table.emplace_back();
+                parser.table.back().resize(parser.endpoints.size());
             }
         }
 
@@ -103,22 +102,27 @@ void parse_chunk(const char* data, size_t start, size_t end, ThreadParser& parse
         size_t ep_len = p - ep_start;
         ++p;
 
-        // Endpoint caching (at most ~20 endpoints in the entire corpus)
+        // Endpoint caching (~20 endpoints total in corpus)
+        std::string_view ep_sv(ep_start, ep_len);
         uint32_t cur_ep_id = UINT32_MAX;
         for (size_t i = 0; i < parser.endpoints.size(); ++i) {
-            if (parser.endpoints[i].len == ep_len && memcmp(parser.endpoints[i].ptr, ep_start, ep_len) == 0) {
+            if (parser.endpoints[i] == ep_sv) {
                 cur_ep_id = static_cast<uint32_t>(i);
                 break;
             }
         }
         if (cur_ep_id == UINT32_MAX) {
             cur_ep_id = static_cast<uint32_t>(parser.endpoints.size());
-            parser.endpoints.push_back({ep_start, ep_len});
+            parser.endpoints.emplace_back(ep_sv);
+            for (auto& row : parser.table) {
+                row.resize(parser.endpoints.size());
+            }
         }
 
-        // Status code: 3 ASCII digits
+        // Status: 3 ASCII digits
         if (p + 3 > chunk_end) break;
-        bool is_error = (p[0] == '5');
+        int status = (p[0] - '0') * 100 + (p[1] - '0') * 10 + (p[2] - '0');
+        bool is_error = (status >= 500 && status <= 599);
         p += 3;
         if (p < chunk_end && *p == ' ') ++p;
 
@@ -131,16 +135,8 @@ void parse_chunk(const char* data, size_t start, size_t end, ThreadParser& parse
         if (p < chunk_end && *p == '\r') ++p;
         if (p < chunk_end && *p == '\n') ++p;
 
-        // Direct flat array indexing: Zero hash map, zero collision, L1 cache hit!
-        size_t group_idx = static_cast<size_t>(cur_hour_id) * 64 + cur_ep_id;
-        if (group_idx >= parser.groups.size()) {
-            parser.groups.resize((cur_hour_id + 1) * 64);
-        }
-
-        LocalGroup& grp = parser.groups[group_idx];
-        if (grp.count == 0) {
-            grp.latencies.reserve(8192);
-        }
+        // Direct 2D grid access: zero hashing, zero collision, instant L1 hit!
+        LocalGroup& grp = parser.table[cur_hour_id][cur_ep_id];
         grp.count++;
         if (is_error) grp.errors++;
         grp.latencies.push_back(lat);
@@ -224,32 +220,40 @@ int main(int argc, char* argv[]) {
         w.join();
     }
 
-    // Merge into map sorted by (hour, endpoint)
+    munmap(const_cast<char*>(data), file_size);
+    close(fd);
+
+    // Merge into canonical map sorted by (hour, endpoint)
     std::map<std::pair<std::string, std::string>, OutputGroup> merged;
 
     for (unsigned int t = 0; t < num_threads; ++t) {
-        const auto& p = parsers[t];
+        auto& p = parsers[t];
         for (size_t hid = 0; hid < p.hours.size(); ++hid) {
             for (size_t eid = 0; eid < p.endpoints.size(); ++eid) {
-                size_t gidx = hid * 64 + eid;
-                if (gidx < p.groups.size() && p.groups[gidx].count > 0) {
-                    const auto& grp = p.groups[gidx];
-                    std::string ep_str(p.endpoints[eid].ptr, p.endpoints[eid].len);
-                    auto& mg = merged[{p.hours[hid], ep_str}];
-                    if (mg.count == 0) {
-                        mg.hour = p.hours[hid];
-                        mg.endpoint = std::move(ep_str);
-                        mg.latencies.reserve(grp.count * num_threads);
+                if (hid < p.table.size() && eid < p.table[hid].size()) {
+                    auto& grp = p.table[hid][eid];
+                    if (grp.count > 0) {
+                        auto& mg = merged[{p.hours[hid], p.endpoints[eid]}];
+                        if (mg.count == 0) {
+                            mg.hour = p.hours[hid];
+                            mg.endpoint = p.endpoints[eid];
+                            mg.count = grp.count;
+                            mg.errors = grp.errors;
+                            mg.latencies = std::move(grp.latencies);
+                        } else {
+                            mg.count += grp.count;
+                            mg.errors += grp.errors;
+                            mg.latencies.insert(mg.latencies.end(), grp.latencies.begin(), grp.latencies.end());
+                            grp.latencies.clear();
+                            grp.latencies.shrink_to_fit();
+                        }
                     }
-                    mg.count += grp.count;
-                    mg.errors += grp.errors;
-                    mg.latencies.insert(mg.latencies.end(), grp.latencies.begin(), grp.latencies.end());
                 }
             }
         }
     }
 
-    // Parallel percentile computation
+    // Parallel O(N) Quickselect percentiles using std::nth_element
     std::vector<OutputGroup*> group_ptrs;
     group_ptrs.reserve(merged.size());
     for (auto& [pair, mg] : merged) {
@@ -268,15 +272,34 @@ int main(int argc, char* argv[]) {
         sort_workers.emplace_back([&group_ptrs, start_idx, end_idx]() {
             for (size_t i = start_idx; i < end_idx; ++i) {
                 OutputGroup* mg = group_ptrs[i];
-                std::sort(mg->latencies.begin(), mg->latencies.end());
                 uint64_t n = mg->count;
-                uint64_t r50 = (50ULL * n + 99) / 100;
-                uint64_t r95 = (95ULL * n + 99) / 100;
-                uint64_t r99 = (99ULL * n + 99) / 100;
-                mg->p50 = mg->latencies[r50 - 1];
-                mg->p95 = mg->latencies[r95 - 1];
-                mg->p99 = mg->latencies[r99 - 1];
-                mg->error_ppm = (static_cast<uint64_t>(mg->errors) * 1000000ULL) / n;
+                if (n == 0) continue;
+                uint64_t r50 = (50ULL * n + 99) / 100 - 1;
+                uint64_t r95 = (95ULL * n + 99) / 100 - 1;
+                uint64_t r99 = (99ULL * n + 99) / 100 - 1;
+
+                std::nth_element(mg->latencies.begin(), mg->latencies.begin() + r50, mg->latencies.end());
+                mg->p50 = mg->latencies[r50];
+
+                if (r95 > r50) {
+                    std::nth_element(mg->latencies.begin() + r50 + 1, mg->latencies.begin() + r95, mg->latencies.end());
+                    mg->p95 = mg->latencies[r95];
+                } else {
+                    mg->p95 = mg->p50;
+                }
+
+                if (r99 > r95) {
+                    std::nth_element(mg->latencies.begin() + r95 + 1, mg->latencies.begin() + r99, mg->latencies.end());
+                    mg->p99 = mg->latencies[r99];
+                } else {
+                    mg->p99 = mg->p95;
+                }
+
+                mg->error_ppm = (mg->errors * 1000000ULL) / n;
+
+                // Deallocate latencies immediately to minimize peak memory RSS
+                mg->latencies.clear();
+                mg->latencies.shrink_to_fit();
             }
         });
     }
@@ -308,6 +331,12 @@ int main(int argc, char* argv[]) {
             buffer.push_back(' ');
             append_u64(buffer, mg->error_ppm);
             buffer.push_back('\n');
+
+            if (buffer.size() >= 1024 * 1024) {
+                ssize_t written = write(out_fd, buffer.data(), buffer.size());
+                (void)written;
+                buffer.clear();
+            }
         }
 
         if (!buffer.empty()) {
@@ -317,7 +346,5 @@ int main(int argc, char* argv[]) {
         close(out_fd);
     }
 
-    munmap(const_cast<char*>(data), file_size);
-    close(fd);
     return 0;
 }
