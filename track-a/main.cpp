@@ -131,23 +131,14 @@ int main(int argc, char* argv[]) {
     if (hw > 0 && hw < num_threads) num_threads = hw;
     if (file_size < 1000000) num_threads = 1; // small data runs on 1 thread
 
-    std::vector<size_t> chunk_starts(num_threads);
-    std::vector<size_t> chunk_ends(num_threads);
-
-    for (unsigned int t = 0; t < num_threads; ++t) {
-        size_t s = t * (file_size / num_threads);
-        size_t e = (t == num_threads - 1) ? file_size : (t + 1) * (file_size / num_threads);
-
-        if (t > 0) {
-            while (s < file_size && data[s] != '\n') ++s;
-            if (s < file_size) ++s;
-        }
-        if (t < num_threads - 1) {
-            while (e < file_size && data[e] != '\n') ++e;
-            if (e < file_size) ++e;
-        }
-        chunk_starts[t] = s;
-        chunk_ends[t] = e;
+    std::vector<size_t> splits(num_threads + 1);
+    splits[0] = 0;
+    splits[num_threads] = file_size;
+    for (unsigned int t = 1; t < num_threads; ++t) {
+        size_t pt = t * (file_size / num_threads);
+        while (pt < file_size && data[pt] != '\n') ++pt;
+        if (pt < file_size) ++pt;
+        splits[t] = pt;
     }
 
     std::vector<std::unordered_map<std::string, LocalGroup>> local_maps(num_threads);
@@ -155,7 +146,7 @@ int main(int argc, char* argv[]) {
     workers.reserve(num_threads);
 
     for (unsigned int t = 0; t < num_threads; ++t) {
-        workers.emplace_back(parse_chunk, data, chunk_starts[t], chunk_ends[t], std::ref(local_maps[t]));
+        workers.emplace_back(parse_chunk, data, splits[t], splits[t + 1], std::ref(local_maps[t]));
     }
 
     for (auto& w : workers) {

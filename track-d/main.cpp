@@ -25,11 +25,12 @@ struct Query {
 // Fast unsigned integer parsing
 static inline const char* parse_u32(const char* p, const char* end, uint32_t& val) {
     while (p < end && (*p == ' ' || *p == '\n' || *p == '\r')) ++p;
-    val = 0;
+    uint64_t v = 0;
     while (p < end && *p >= '0' && *p <= '9') {
-        val = val * 10 + (*p - '0');
+        v = v * 10 + (*p - '0');
         ++p;
     }
+    val = static_cast<uint32_t>(v);
     return p;
 }
 
