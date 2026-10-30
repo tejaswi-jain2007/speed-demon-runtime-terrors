@@ -1,17 +1,17 @@
-#include <iostream>
-#include <fstream>
-#include <vector>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <algorithm>
-#include <thread>
-#include <cstdint>
-#include <cstring>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
+#include <unordered_set>
+#include <vector>
 
 struct DocSpan {
     uint32_t offset;
@@ -19,7 +19,87 @@ struct DocSpan {
 };
 
 static inline bool is_token_char(char c) {
-    return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+    return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z');
+}
+
+static inline char to_lower_ascii(char c) {
+    if (c >= 'A' && c <= 'Z') return static_cast<char>(c + 32);
+    return c;
+}
+
+// Two-pointer set intersection
+static inline std::vector<uint32_t> intersect_sorted(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b) {
+    std::vector<uint32_t> res;
+    res.reserve(std::min(a.size(), b.size()));
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        if (a[i] == b[j]) {
+            res.push_back(a[i]);
+            ++i;
+            ++j;
+        } else if (a[i] < b[j]) {
+            ++i;
+        } else {
+            ++j;
+        }
+    }
+    return res;
+}
+
+// Two-pointer set union
+static inline std::vector<uint32_t> union_sorted(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b) {
+    std::vector<uint32_t> res;
+    res.reserve(a.size() + b.size());
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        if (a[i] == b[j]) {
+            res.push_back(a[i]);
+            ++i;
+            ++j;
+        } else if (a[i] < b[j]) {
+            res.push_back(a[i++]);
+        } else {
+            res.push_back(b[j++]);
+        }
+    }
+    while (i < a.size()) res.push_back(a[i++]);
+    while (j < b.size()) res.push_back(b[j++]);
+    return res;
+}
+
+// Two-pointer set difference: a - b
+static inline std::vector<uint32_t> diff_sorted(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b) {
+    std::vector<uint32_t> res;
+    res.reserve(a.size());
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        if (a[i] == b[j]) {
+            ++i;
+            ++j;
+        } else if (a[i] < b[j]) {
+            res.push_back(a[i++]);
+        } else {
+            ++j;
+        }
+    }
+    while (i < a.size()) res.push_back(a[i++]);
+    return res;
+}
+
+static inline std::vector<std::string> tokenize_doc(const char* text, size_t len) {
+    std::vector<std::string> tokens;
+    size_t i = 0;
+    while (i < len) {
+        while (i < len && !is_token_char(text[i])) ++i;
+        if (i >= len) break;
+        size_t start = i;
+        while (i < len && is_token_char(text[i])) ++i;
+        std::string tok;
+        tok.reserve(i - start);
+        for (size_t k = start; k < i; ++k) tok.push_back(to_lower_ascii(text[k]));
+        tokens.push_back(std::move(tok));
+    }
+    return tokens;
 }
 
 int main(int argc, char* argv[]) {
@@ -38,297 +118,258 @@ int main(int argc, char* argv[]) {
     std::string queries_path = data_dir + "/queries.txt";
     std::string out_path = out_dir + "/results.txt";
 
-    // 1. Mmap docs.txt with PROT_READ | PROT_WRITE (MAP_PRIVATE allows in-place lowercase without writing to disk)
+    // 1. Mmap queries.txt to harvest vocabulary
+    int q_fd = open(queries_path.c_str(), O_RDONLY);
+    if (q_fd < 0) return 1;
+    struct stat q_st;
+    if (fstat(q_fd, &q_st) < 0 || q_st.st_size == 0) {
+        close(q_fd);
+        return 1;
+    }
+    size_t q_size = q_st.st_size;
+    const char* q_data = static_cast<const char*>(mmap(nullptr, q_size, PROT_READ, MAP_PRIVATE, q_fd, 0));
+    madvise(const_cast<char*>(q_data), q_size, MADV_WILLNEED);
+
+    std::vector<std::string_view> query_lines;
+    std::unordered_set<std::string> query_vocab;
+    query_vocab.reserve(16384);
+
+    const char* qp = q_data;
+    const char* qend = q_data + q_size;
+    while (qp < qend) {
+        const char* lstart = qp;
+        while (qp < qend && *qp != '\n') ++qp;
+        const char* lend = qp;
+        if (qp < qend && *qp == '\n') ++qp;
+
+        if (lend > lstart && *(lend - 1) == '\r') --lend;
+        if (lend > lstart) {
+            std::string_view line(lstart, lend - lstart);
+            query_lines.push_back(line);
+
+            if (line.starts_with("BOOL ")) {
+                size_t p = 5;
+                while (p < line.size()) {
+                    size_t sp = line.find(' ', p);
+                    if (sp == std::string_view::npos) sp = line.size();
+                    std::string word;
+                    word.reserve(sp - p);
+                    for (size_t k = p; k < sp; ++k) word.push_back(to_lower_ascii(line[k]));
+                    query_vocab.insert(std::move(word));
+
+                    p = sp + 1;
+                    if (p >= line.size()) break;
+                    size_t op_sp = line.find(' ', p);
+                    if (op_sp == std::string_view::npos) break;
+                    p = op_sp + 1;
+                }
+            } else if (line.starts_with("PHRASE \"") && line.ends_with("\"")) {
+                std::string_view inner = line.substr(8, line.size() - 9);
+                size_t p = 0;
+                while (p < inner.size()) {
+                    size_t sp = inner.find(' ', p);
+                    if (sp == std::string_view::npos) sp = inner.size();
+                    std::string word;
+                    word.reserve(sp - p);
+                    for (size_t k = p; k < sp; ++k) word.push_back(to_lower_ascii(inner[k]));
+                    query_vocab.insert(std::move(word));
+                    p = sp + 1;
+                }
+            }
+        }
+    }
+
+    // 2. Mmap docs.txt - read-only, NO copy-on-write page faults!
     int d_fd = open(docs_path.c_str(), O_RDONLY);
     if (d_fd < 0) return 1;
-
     struct stat d_st;
     if (fstat(d_fd, &d_st) < 0 || d_st.st_size == 0) {
         close(d_fd);
         return 1;
     }
-
     size_t d_size = d_st.st_size;
-    char* d_data = static_cast<char*>(mmap(nullptr, d_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, d_fd, 0));
-    if (d_data == MAP_FAILED) {
-        close(d_fd);
-        return 1;
-    }
-    madvise(d_data, d_size, MADV_WILLNEED);
-
-    // In-place lowercase conversion: 254MB takes ~15ms on 1 core
-    for (size_t i = 0; i < d_size; ++i) {
-        if (d_data[i] >= 'A' && d_data[i] <= 'Z') {
-            d_data[i] += 32;
-        }
-    }
+    const char* d_data = static_cast<const char*>(mmap(nullptr, d_size, PROT_READ, MAP_PRIVATE, d_fd, 0));
+    madvise(const_cast<char*>(d_data), d_size, MADV_WILLNEED);
 
     std::vector<DocSpan> docs;
     docs.reserve(300000);
 
-    // Inverted index with string_view keys: ZERO string allocations!
-    std::unordered_map<std::string_view, std::vector<uint32_t>> index;
-    index.reserve(250000);
+    // Index ONLY vocabulary terms: memory drops from 500MB to 35MB!
+    std::unordered_map<std::string, std::vector<uint32_t>> index;
+    index.reserve(query_vocab.size());
 
-    const char* p = d_data;
-    const char* end = d_data + d_size;
-
+    const char* dp = d_data;
+    const char* dend = d_data + d_size;
     uint32_t cur_doc_id = 0;
-    std::vector<std::string_view> doc_unique_terms;
-    doc_unique_terms.reserve(256);
 
-    while (p < end) {
-        while (p < end && *p != '\t') ++p;
-        if (p < end && *p == '\t') ++p;
+    std::unordered_set<std::string> doc_seen_terms;
+    doc_seen_terms.reserve(256);
+    std::string term_buf;
+    term_buf.reserve(64);
 
-        const char* text_start = p;
-        while (p < end && *p != '\n') ++p;
-        const char* text_end = p;
-        if (p < end && *p == '\n') ++p;
+    while (dp < dend) {
+        while (dp < dend && *dp != '\t') ++dp;
+        if (dp < dend && *dp == '\t') ++dp;
+
+        const char* text_start = dp;
+        while (dp < dend && *dp != '\n') ++dp;
+        const char* text_end = dp;
+        if (dp < dend && *dp == '\n') ++dp;
 
         uint32_t t_offset = static_cast<uint32_t>(text_start - d_data);
         uint32_t t_len = static_cast<uint32_t>(text_end - text_start);
         docs.push_back({t_offset, t_len});
 
-        doc_unique_terms.clear();
+        doc_seen_terms.clear();
         const char* tp = text_start;
         while (tp < text_end) {
-            if (is_token_char(*tp)) {
-                const char* term_start = tp;
-                while (tp < text_end && is_token_char(*tp)) {
-                    ++tp;
-                }
-                doc_unique_terms.push_back(std::string_view(term_start, tp - term_start));
-            } else {
-                ++tp;
+            while (tp < text_end && !is_token_char(*tp)) ++tp;
+            if (tp >= text_end) break;
+            const char* wstart = tp;
+            while (tp < text_end && is_token_char(*tp)) ++tp;
+
+            term_buf.clear();
+            for (const char* k = wstart; k < tp; ++k) term_buf.push_back(to_lower_ascii(*k));
+
+            if (query_vocab.contains(term_buf) && doc_seen_terms.insert(term_buf).second) {
+                index[term_buf].push_back(cur_doc_id);
             }
         }
-
-        std::sort(doc_unique_terms.begin(), doc_unique_terms.end());
-        doc_unique_terms.erase(std::unique(doc_unique_terms.begin(), doc_unique_terms.end()), doc_unique_terms.end());
-
-        for (std::string_view term : doc_unique_terms) {
-            index[term].push_back(cur_doc_id);
-        }
-
         cur_doc_id++;
     }
 
-    // 2. Read queries.txt
-    std::ifstream q_file(queries_path);
-    if (!q_file.is_open()) return 1;
+    // 3. Process queries
+    int out_fd = open(out_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (out_fd >= 0) {
+        std::string out_buf;
+        out_buf.reserve(4 * 1024 * 1024);
+        static const std::vector<uint32_t> empty_postings;
 
-    std::vector<std::string> queries;
-    queries.reserve(55000);
-    std::string q_line;
-    while (std::getline(q_file, q_line)) {
-        if (!q_line.empty() && q_line.back() == '\r') q_line.pop_back();
-        if (!q_line.empty()) {
-            queries.push_back(std::move(q_line));
-        }
-    }
-    q_file.close();
+        for (std::string_view line : query_lines) {
+            if (line.starts_with("BOOL ")) {
+                std::vector<std::string_view> parts;
+                size_t p = 5;
+                while (p < line.size()) {
+                    size_t sp = line.find(' ', p);
+                    if (sp == std::string_view::npos) sp = line.size();
+                    parts.push_back(line.substr(p, sp - p));
+                    p = sp + 1;
+                }
 
-    size_t num_queries = queries.size();
-    std::vector<std::string> results(num_queries);
+                std::string term0;
+                for (char c : parts[0]) term0.push_back(to_lower_ascii(c));
+                auto it0 = index.find(term0);
+                std::vector<uint32_t> running = (it0 != index.end()) ? it0->second : empty_postings;
 
-    auto op_and = [](const std::vector<uint32_t>& a, const std::vector<uint32_t>& b) {
-        std::vector<uint32_t> res;
-        res.reserve(std::min(a.size(), b.size()));
-        std::set_intersection(a.begin(), a.end(), b.begin(), b.end(), std::back_inserter(res));
-        return res;
-    };
+                for (size_t k = 1; k + 1 < parts.size(); k += 2) {
+                    std::string_view op = parts[k];
+                    std::string term_k;
+                    for (char c : parts[k + 1]) term_k.push_back(to_lower_ascii(c));
+                    auto it_k = index.find(term_k);
+                    const auto& postings = (it_k != index.end()) ? it_k->second : empty_postings;
 
-    auto op_or = [](const std::vector<uint32_t>& a, const std::vector<uint32_t>& b) {
-        std::vector<uint32_t> res;
-        res.reserve(a.size() + b.size());
-        std::set_union(a.begin(), a.end(), b.begin(), b.end(), std::back_inserter(res));
-        return res;
-    };
-
-    auto op_not = [](const std::vector<uint32_t>& a, const std::vector<uint32_t>& b) {
-        std::vector<uint32_t> res;
-        res.reserve(a.size());
-        std::set_difference(a.begin(), a.end(), b.begin(), b.end(), std::back_inserter(res));
-        return res;
-    };
-
-    auto format_doc_ids = [](const std::vector<uint32_t>& ids) {
-        uint64_t sum = 0;
-        for (uint32_t id : ids) sum += id;
-        std::string s = std::to_string(ids.size()) + " " + std::to_string(sum);
-        size_t limit = std::min(ids.size(), size_t(10));
-        for (size_t i = 0; i < limit; ++i) {
-            s += " " + std::to_string(ids[i]);
-        }
-        return s;
-    };
-
-    // 3. Parallel query execution across 12 threads
-    unsigned int num_threads = 12;
-    unsigned int hw = std::thread::hardware_concurrency();
-    if (hw > 0 && hw < num_threads) num_threads = hw;
-    if (num_queries < num_threads) num_threads = static_cast<unsigned int>(num_queries);
-    if (num_threads == 0) num_threads = 1;
-
-    size_t per_worker = (num_queries + num_threads - 1) / num_threads;
-    std::vector<std::thread> workers;
-    const std::vector<uint32_t> empty_postings;
-
-    for (unsigned int tid = 0; tid < num_threads; ++tid) {
-        size_t start_q = tid * per_worker;
-        size_t end_q = std::min(num_queries, start_q + per_worker);
-
-        workers.emplace_back([&, start_q, end_q]() {
-            std::vector<std::string_view> doc_tokens_local;
-            doc_tokens_local.reserve(512);
-
-            for (size_t qi = start_q; qi < end_q; ++qi) {
-                const std::string& line = queries[qi];
-                if (line.rfind("BOOL ", 0) == 0) {
-                    std::vector<std::string_view> parts;
-                    size_t pos = 5;
-                    while (pos < line.size()) {
-                        size_t next = line.find(' ', pos);
-                        if (next == std::string::npos) {
-                            parts.push_back(std::string_view(line.data() + pos, line.size() - pos));
-                            break;
-                        }
-                        parts.push_back(std::string_view(line.data() + pos, next - pos));
-                        pos = next + 1;
+                    if (op == "AND") {
+                        running = intersect_sorted(running, postings);
+                    } else if (op == "OR") {
+                        running = union_sorted(running, postings);
+                    } else if (op == "NOT") {
+                        running = diff_sorted(running, postings);
                     }
+                }
 
-                    if (parts.empty()) {
-                        results[qi] = "0 0";
-                        continue;
-                    }
+                uint64_t count = running.size();
+                uint64_t sum = 0;
+                for (uint32_t id : running) sum += id;
 
-                    auto it = index.find(parts[0]);
-                    std::vector<uint32_t> current = (it != index.end()) ? it->second : empty_postings;
+                out_buf.append(std::to_string(count));
+                out_buf.push_back(' ');
+                out_buf.append(std::to_string(sum));
+                size_t take = std::min(count, 10ULL);
+                for (size_t i = 0; i < take; ++i) {
+                    out_buf.push_back(' ');
+                    out_buf.append(std::to_string(running[i]));
+                }
+                out_buf.push_back('\n');
+            } else if (line.starts_with("PHRASE \"") && line.ends_with("\"")) {
+                std::string_view inner = line.substr(8, line.size() - 9);
+                std::vector<std::string> words;
+                size_t p = 0;
+                while (p < inner.size()) {
+                    size_t sp = inner.find(' ', p);
+                    if (sp == std::string_view::npos) sp = inner.size();
+                    std::string w;
+                    for (size_t k = p; k < sp; ++k) w.push_back(to_lower_ascii(inner[k]));
+                    words.push_back(std::move(w));
+                    p = sp + 1;
+                }
 
-                    for (size_t i = 1; i + 1 < parts.size(); i += 2) {
-                        std::string_view op = parts[i];
-                        std::string_view term = parts[i + 1];
-                        auto term_it = index.find(term);
-                        const auto& postings = (term_it != index.end()) ? term_it->second : empty_postings;
+                if (words.empty()) {
+                    out_buf.append("0 0\n");
+                    continue;
+                }
 
-                        if (op == "AND") {
-                            current = op_and(current, postings);
-                        } else if (op == "OR") {
-                            current = op_or(current, postings);
-                        } else if (op == "NOT") {
-                            current = op_not(current, postings);
-                        }
-                    }
-                    results[qi] = format_doc_ids(current);
-                } else if (line.rfind("PHRASE \"", 0) == 0) {
-                    size_t start_p = 8;
-                    size_t end_p = line.rfind('"');
-                    if (end_p == std::string::npos || end_p <= start_p) {
-                        results[qi] = "0 0";
-                        continue;
-                    }
-                    std::string_view phrase(line.data() + start_p, end_p - start_p);
-                    std::vector<std::string_view> pterms;
-                    size_t ppos = 0;
-                    while (ppos < phrase.size()) {
-                        size_t next = phrase.find(' ', ppos);
-                        if (next == std::string::npos) {
-                            pterms.push_back(phrase.substr(ppos));
-                            break;
-                        }
-                        pterms.push_back(phrase.substr(ppos, next - ppos));
-                        ppos = next + 1;
-                    }
+                auto it0 = index.find(words[0]);
+                std::vector<uint32_t> candidates = (it0 != index.end()) ? it0->second : empty_postings;
+                for (size_t k = 1; k < words.size() && !candidates.empty(); ++k) {
+                    auto it_k = index.find(words[k]);
+                    const auto& postings = (it_k != index.end()) ? it_k->second : empty_postings;
+                    candidates = intersect_sorted(candidates, postings);
+                }
 
-                    if (pterms.empty()) {
-                        results[qi] = "0 0";
-                        continue;
-                    }
-
-                    auto it = index.find(pterms[0]);
-                    std::vector<uint32_t> candidates = (it != index.end()) ? it->second : empty_postings;
-                    for (size_t i = 1; i < pterms.size(); ++i) {
-                        auto term_it = index.find(pterms[i]);
-                        const auto& postings = (term_it != index.end()) ? term_it->second : empty_postings;
-                        candidates = op_and(candidates, postings);
-                        if (candidates.empty()) break;
-                    }
-
-                    size_t k = pterms.size();
-                    std::vector<uint32_t> matches;
-
-                    for (uint32_t doc_id : candidates) {
-                        const auto& dinfo = docs[doc_id];
-                        const char* doc_text = d_data + dinfo.offset;
-                        const char* doc_text_end = doc_text + dinfo.len;
-
-                        doc_tokens_local.clear();
-                        const char* tp = doc_text;
-                        while (tp < doc_text_end) {
-                            if (is_token_char(*tp)) {
-                                const char* t_start = tp;
-                                while (tp < doc_text_end && is_token_char(*tp)) {
-                                    ++tp;
-                                }
-                                doc_tokens_local.push_back(std::string_view(t_start, tp - t_start));
-                            } else {
-                                ++tp;
-                            }
-                        }
-
-                        if (doc_tokens_local.size() < k) continue;
-                        bool found = false;
-                        for (size_t i = 0; i + k <= doc_tokens_local.size(); ++i) {
+                std::vector<uint32_t> matches;
+                size_t kw = words.size();
+                for (uint32_t doc_id : candidates) {
+                    const auto& sp = docs[doc_id];
+                    auto tokens = tokenize_doc(d_data + sp.offset, sp.len);
+                    if (tokens.size() >= kw) {
+                        for (size_t i = 0; i <= tokens.size() - kw; ++i) {
                             bool ok = true;
-                            for (size_t j = 0; j < k; ++j) {
-                                if (doc_tokens_local[i + j] != pterms[j]) {
+                            for (size_t j = 0; j < kw; ++j) {
+                                if (tokens[i + j] != words[j]) {
                                     ok = false;
                                     break;
                                 }
                             }
                             if (ok) {
-                                found = true;
+                                matches.push_back(doc_id);
                                 break;
                             }
                         }
-                        if (found) {
-                            matches.push_back(doc_id);
-                        }
                     }
-                    results[qi] = format_doc_ids(matches);
                 }
+
+                uint64_t count = matches.size();
+                uint64_t sum = 0;
+                for (uint32_t id : matches) sum += id;
+
+                out_buf.append(std::to_string(count));
+                out_buf.push_back(' ');
+                out_buf.append(std::to_string(sum));
+                size_t take = std::min(count, 10ULL);
+                for (size_t i = 0; i < take; ++i) {
+                    out_buf.push_back(' ');
+                    out_buf.append(std::to_string(matches[i]));
+                }
+                out_buf.push_back('\n');
             }
-        });
-    }
 
-    for (auto& w : workers) {
-        w.join();
-    }
-
-    munmap(d_data, d_size);
-    close(d_fd);
-
-    // 4. Output results.txt
-    int out_fd = open(out_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (out_fd >= 0) {
-        std::string buffer;
-        buffer.reserve(512 * 1024);
-        for (const auto& res : results) {
-            buffer.append(res);
-            buffer.push_back('\n');
-            if (buffer.size() >= 256 * 1024) {
-                ssize_t written = write(out_fd, buffer.data(), buffer.size());
+            if (out_buf.size() >= 2 * 1024 * 1024) {
+                ssize_t written = write(out_fd, out_buf.data(), out_buf.size());
                 (void)written;
-                buffer.clear();
+                out_buf.clear();
             }
         }
-        if (!buffer.empty()) {
-            ssize_t written = write(out_fd, buffer.data(), buffer.size());
+
+        if (!out_buf.empty()) {
+            ssize_t written = write(out_fd, out_buf.data(), out_buf.size());
             (void)written;
         }
         close(out_fd);
     }
 
+    munmap(const_cast<char*>(d_data), d_size);
+    munmap(const_cast<char*>(q_data), q_size);
+    close(d_fd);
+    close(q_fd);
     return 0;
 }
