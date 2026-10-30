@@ -10,7 +10,7 @@ use std::thread;
 
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
-const MADV_WILLNEED: i32 = 3;
+const MADV_SEQUENTIAL: i32 = 2;
 
 extern "C" {
     fn mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
@@ -40,7 +40,7 @@ impl FastMmap {
             return None;
         }
         unsafe {
-            madvise(ptr, len, MADV_WILLNEED);
+            madvise(ptr, len, MADV_SEQUENTIAL);
         }
         Some(FastMmap { ptr, len, _file: file })
     }
@@ -248,9 +248,8 @@ fn main() {
         phase1_handles.push(thread::spawn(move || {
             let d = mmap_ref.as_slice();
             let mut ep_table = EpTable::new(4096);
-            // 72 hours * max 2048 local endpoints
-            let mut counts = vec![0u32; 72 * 2048];
-            let mut errors = vec![0u32; 72 * 2048];
+            // Pack count (high 16 bits) and errors (low 16 bits) into single u32 (halves Phase 1 RAM)
+            let mut packed_counts = vec![0u32; 72 * 2048];
 
             let mut p = start;
             while p < end {
@@ -284,13 +283,10 @@ fn main() {
                 if p < end { p += 1; }
 
                 let gid = h_idx * 2048 + local_ep_id;
-                counts[gid] += 1;
-                if is_err {
-                    errors[gid] += 1;
-                }
+                packed_counts[gid] += 0x10000 + (is_err as u32);
             }
 
-            (ep_table.endpoints, counts, errors)
+            (ep_table.endpoints, packed_counts)
         }));
     }
 
@@ -301,7 +297,7 @@ fn main() {
 
     // Unify all endpoints into lexicographically sorted global list
     let mut all_endpoints_set = std::collections::BTreeSet::new();
-    for (eps, _, _) in &thread_phase1_results {
+    for (eps, _) in &thread_phase1_results {
         for ep in eps {
             all_endpoints_set.insert(ep.clone());
         }
@@ -312,7 +308,7 @@ fn main() {
 
     // Map each thread's local_ep_id to global_ep_id
     let mut thread_to_global: Vec<Vec<u16>> = Vec::with_capacity(num_threads);
-    for (eps, _, _) in &thread_phase1_results {
+    for (eps, _) in &thread_phase1_results {
         let mut map = Vec::with_capacity(eps.len());
         for ep in eps {
             let g_id = global_endpoints.binary_search(ep).unwrap() as u16;
@@ -326,17 +322,18 @@ fn main() {
     let mut global_counts = vec![0u32; total_groups];
     let mut global_errors = vec![0u32; total_groups];
 
-    for (t, (_, counts, errors)) in thread_phase1_results.iter().enumerate() {
+    for (t, (_, packed)) in thread_phase1_results.iter().enumerate() {
         let t_map = &thread_to_global[t];
         for h in 0..72 {
             for local_id in 0..t_map.len() {
                 let gid = h * 2048 + local_id;
-                let c = counts[gid];
+                let c_err = packed[gid];
+                let c = (c_err >> 16) as u32;
                 if c > 0 {
                     let g_id = t_map[local_id] as usize;
                     let target_gid = h * num_global_eps + g_id;
                     global_counts[target_gid] += c;
-                    global_errors[target_gid] += errors[gid];
+                    global_errors[target_gid] += c_err & 0xFFFF;
                 }
             }
         }
@@ -357,21 +354,21 @@ fn main() {
     }
     group_offsets[total_groups] = total_records;
 
-    // Compute thread-specific write starts for Phase 2 zero-lock streaming writes
-    let mut thread_write_offsets: Vec<Vec<usize>> = Vec::with_capacity(num_threads);
+    // Compute thread-specific write starts (as u32, moved with zero cloning)
+    let mut thread_write_offsets: Vec<Vec<u32>> = Vec::with_capacity(num_threads);
     let mut running_offsets = group_offsets.clone();
 
-    for (t, (_, counts, _)) in thread_phase1_results.iter().enumerate() {
+    for (t, (_, packed)) in thread_phase1_results.iter().enumerate() {
         let t_map = &thread_to_global[t];
-        let mut t_offsets = vec![0usize; 72 * 2048];
+        let mut t_offsets = vec![0u32; 72 * 2048];
         for h in 0..72 {
             for local_id in 0..t_map.len() {
                 let gid = h * 2048 + local_id;
-                let c = counts[gid] as usize;
+                let c = (packed[gid] >> 16) as usize;
                 if c > 0 {
                     let g_id = t_map[local_id] as usize;
                     let target_gid = h * num_global_eps + g_id;
-                    t_offsets[gid] = running_offsets[target_gid];
+                    t_offsets[gid] = running_offsets[target_gid] as u32;
                     running_offsets[target_gid] += c;
                 }
             }
@@ -379,6 +376,7 @@ fn main() {
         thread_write_offsets.push(t_offsets);
     }
     drop(thread_phase1_results);
+    drop(running_offsets);
 
     // Allocate exact flat arena (12.4MB)
     let mut flat_arena = vec![0u32; total_records];
@@ -386,11 +384,12 @@ fn main() {
 
     // Phase 2: Direct streaming writes into flat arena
     let mut phase2_handles = Vec::with_capacity(num_threads);
+    let mut thread_write_iter = thread_write_offsets.into_iter();
     for t in 0..num_threads {
         let mmap_ref = Arc::clone(&mmap);
         let start = splits[t];
         let end = splits[t + 1];
-        let mut t_write_pos = thread_write_offsets[t].clone();
+        let mut t_write_pos = thread_write_iter.next().unwrap();
         let mut local_ep_table = EpTable::new(4096);
 
         phase2_handles.push(thread::spawn(move || {

@@ -1,9 +1,7 @@
 // Speed Demon 2026 - Track D (Traverse)
 // Team: Runtime Terrors
-// Multi-threaded 0.12s Forward Dijkstra solver in pure Rust (75MB peak RSS)
+// Ultra-fast 4-ary MinHeap Dijkstra solver in pure Rust (low-memory zero-fault distance array)
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
@@ -12,7 +10,7 @@ use std::thread;
 
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
-const MADV_WILLNEED: i32 = 3;
+const MADV_SEQUENTIAL: i32 = 2;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -37,7 +35,7 @@ impl FastMmap {
         let fd = file.as_raw_fd();
         let ptr = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0) };
         if ptr == std::ptr::null_mut() || ptr as isize == -1 { return None; }
-        unsafe { madvise(ptr, len, MADV_WILLNEED); }
+        unsafe { madvise(ptr, len, MADV_SEQUENTIAL); }
         Some(FastMmap { ptr, len, _file: file })
     }
 
@@ -57,6 +55,69 @@ impl Drop for FastMmap {
 struct Edge {
     to: u32,
     weight: u32,
+}
+
+struct MinHeap {
+    data: Vec<(u64, u32)>,
+}
+
+impl MinHeap {
+    fn new() -> Self {
+        MinHeap { data: Vec::with_capacity(8192) }
+    }
+
+    #[inline(always)]
+    fn clear(&mut self) {
+        self.data.clear();
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    #[inline(always)]
+    fn push(&mut self, dist: u64, u: u32) {
+        let mut idx = self.data.len();
+        self.data.push((dist, u));
+        while idx > 0 {
+            let parent = (idx - 1) >> 2;
+            if unsafe { self.data.get_unchecked(idx).0 < self.data.get_unchecked(parent).0 } {
+                self.data.swap(idx, parent);
+                idx = parent;
+            } else {
+                break;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn pop(&mut self) -> (u64, u32) {
+        let min = self.data[0];
+        let last = self.data.pop().unwrap();
+        if !self.data.is_empty() {
+            self.data[0] = last;
+            let mut idx = 0;
+            let len = self.data.len();
+            loop {
+                let mut best = idx;
+                let child = (idx << 2) + 1;
+                let end = (child + 4).min(len);
+                for c in child..end {
+                    if unsafe { self.data.get_unchecked(c).0 < self.data.get_unchecked(best).0 } {
+                        best = c;
+                    }
+                }
+                if best != idx {
+                    self.data.swap(idx, best);
+                    idx = best;
+                } else {
+                    break;
+                }
+            }
+        }
+        min
+    }
 }
 
 #[inline(always)]
@@ -108,9 +169,10 @@ fn main() {
     gp = parse_u32(g_data, gp, g_size, &mut m);
     let edges_start = gp;
 
-    let mut degree = vec![0u32; n as usize];
     let num_words = ((n as usize) + 63) / 64;
     let mut has_in_edges = vec![0u64; num_words];
+    // In-place CSR building: head uses size n + 2, eliminating degree and cur_pos vectors (saves 14MB)
+    let mut head = vec![0u32; (n + 2) as usize];
 
     let mut p = edges_start;
     for _ in 0..m {
@@ -120,18 +182,15 @@ fn main() {
         p = parse_u32(g_data, p, g_size, &mut u);
         p = parse_u32(g_data, p, g_size, &mut v);
         p = parse_u32(g_data, p, g_size, &mut w);
-        degree[u as usize] += 1;
+        head[(u + 1) as usize] += 1;
         has_in_edges[(v as usize) >> 6] |= 1u64 << ((v as usize) & 63);
     }
 
-    let mut head = vec![0u32; (n + 1) as usize];
-    for j in 0..n as usize {
-        head[j + 1] = head[j] + degree[j];
+    for j in 0..=n as usize {
+        head[j + 1] += head[j];
     }
 
     let mut edges = vec![Edge { to: 0, weight: 0 }; m as usize];
-    let mut cur_pos = head.clone();
-    drop(degree);
 
     p = edges_start;
     for _ in 0..m {
@@ -141,12 +200,18 @@ fn main() {
         p = parse_u32(g_data, p, g_size, &mut u);
         p = parse_u32(g_data, p, g_size, &mut v);
         p = parse_u32(g_data, p, g_size, &mut w);
-        let idx = cur_pos[u as usize] as usize;
-        cur_pos[u as usize] += 1;
-        edges[idx] = Edge { to: v, weight: w };
+        let idx = head[u as usize];
+        head[u as usize] += 1;
+        edges[idx as usize] = Edge { to: v, weight: w };
     }
-    drop(cur_pos);
     drop(g_mmap);
+
+    // Restore head offsets
+    for j in (0..n as usize).rev() {
+        head[j + 1] = head[j];
+    }
+    head[0] = 0;
+    head.truncate((n + 1) as usize);
 
     // 2. Read queries.txt
     let q_mmap = match FastMmap::open(&queries_path) {
@@ -169,7 +234,6 @@ fn main() {
     drop(q_mmap);
 
     let num_queries = queries.len();
-    // 4 workers deliver 0.12s execution time on 6 P-cores with only 75MB peak RSS
     let num_workers = 4.min(num_queries).max(1);
     let per_worker = (num_queries + num_workers - 1) / num_workers;
 
@@ -191,9 +255,11 @@ fn main() {
         workers.push(thread::spawn(move || {
             if start_q >= end_q { return Vec::new(); }
 
-            let mut dist = vec![u64::MAX; n as usize];
+            // Zero-initialized distance vector: OS COW zero-pages prevent physical RSS fault
+            // Stored as dist + 1 (so 0 means unvisited)
+            let mut dist = vec![0u64; n as usize];
             let mut touched: Vec<u32> = Vec::with_capacity(8192);
-            let mut pq: BinaryHeap<Reverse<(u64, u32)>> = BinaryHeap::with_capacity(8192);
+            let mut pq = MinHeap::new();
             let mut local_answers = Vec::with_capacity(end_q - start_q);
 
             for qi in start_q..end_q {
@@ -210,14 +276,16 @@ fn main() {
                     continue;
                 }
 
-                dist[s as usize] = 0;
+                dist[s as usize] = 1; // 0 + 1
                 touched.push(s);
-                pq.push(Reverse((0, s)));
+                pq.push(0, s);
 
                 let mut ans: i64 = -1;
 
-                while let Some(Reverse((d, u))) = pq.pop() {
-                    if d > dist[u as usize] {
+                while !pq.is_empty() {
+                    let (d, u) = pq.pop();
+                    let cur_u_stored = unsafe { *dist.get_unchecked(u as usize) };
+                    if cur_u_stored == 0 || d > cur_u_stored - 1 {
                         continue;
                     }
                     if u == t {
@@ -230,13 +298,13 @@ fn main() {
                     for ei in start..end {
                         let e = unsafe { edges_ref.get_unchecked(ei) };
                         let nd = d + e.weight as u64;
-                        let cur_d = unsafe { *dist.get_unchecked(e.to as usize) };
-                        if nd < cur_d {
-                            if cur_d == u64::MAX {
+                        let cur_stored = unsafe { *dist.get_unchecked(e.to as usize) };
+                        if cur_stored == 0 || nd < cur_stored - 1 {
+                            if cur_stored == 0 {
                                 touched.push(e.to);
                             }
-                            dist[e.to as usize] = nd;
-                            pq.push(Reverse((nd, e.to)));
+                            dist[e.to as usize] = nd + 1;
+                            pq.push(nd, e.to);
                         }
                     }
                 }
@@ -244,7 +312,7 @@ fn main() {
                 local_answers.push(ans);
 
                 for &u in &touched {
-                    dist[u as usize] = u64::MAX;
+                    dist[u as usize] = 0;
                 }
                 touched.clear();
                 pq.clear();

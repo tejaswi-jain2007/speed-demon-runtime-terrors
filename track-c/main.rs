@@ -10,7 +10,7 @@ use std::thread;
 
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
-const MADV_WILLNEED: i32 = 3;
+const MADV_SEQUENTIAL: i32 = 2;
 
 extern "C" {
     fn mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
@@ -40,7 +40,7 @@ impl FastMmap {
             return None;
         }
         unsafe {
-            madvise(ptr, len, MADV_WILLNEED);
+            madvise(ptr, len, MADV_SEQUENTIAL);
         }
         Some(FastMmap { ptr, len, _file: file })
     }
@@ -126,9 +126,7 @@ impl LocalCountryAgg {
 }
 
 struct RegionLookup {
-    flat: Vec<u16>,
-    ht: Vec<(u32, u16)>,
-    ht_mask: u32,
+    flat: Vec<u8>,
 }
 
 unsafe impl Send for RegionLookup {}
@@ -136,25 +134,9 @@ unsafe impl Sync for RegionLookup {}
 
 impl RegionLookup {
     #[inline(always)]
-    fn get(&self, rid: u32) -> u16 {
-        if !self.flat.is_empty() {
-            if (rid as usize) < self.flat.len() {
-                unsafe { *self.flat.get_unchecked(rid as usize) }
-            } else {
-                0
-            }
-        } else if self.ht_mask > 0 {
-            let mut idx = (rid.wrapping_mul(2654435761) & self.ht_mask) as usize;
-            loop {
-                let slot = unsafe { self.ht.get_unchecked(idx) };
-                if slot.1 == 0 {
-                    return 0;
-                }
-                if slot.0 == rid {
-                    return slot.1;
-                }
-                idx = (idx + 1) & (self.ht_mask as usize);
-            }
+    fn get(&self, rid: u32) -> u8 {
+        if (rid as usize) < self.flat.len() {
+            unsafe { *self.flat.get_unchecked(rid as usize) }
         } else {
             0
         }
@@ -361,7 +343,7 @@ fn main() {
         distinct_names: 0,
     });
 
-    let mut country_map: std::collections::HashMap<Vec<u8>, u16> = std::collections::HashMap::with_capacity(300);
+    let mut country_map: std::collections::HashMap<Vec<u8>, u8> = std::collections::HashMap::with_capacity(300);
 
     let mut rp = 0;
     let rend = r_data.len();
@@ -372,12 +354,7 @@ fn main() {
         rp += 1;
     }
 
-    struct RawRegion {
-        rid: u32,
-        cid: u16,
-    }
-    let mut raw_regions: Vec<RawRegion> = Vec::with_capacity(100000);
-    let mut max_rid = 0u32;
+    let mut flat = vec![0u8; 1_000_000];
 
     while rp < rend {
         if r_data[rp] == b'\r' || r_data[rp] == b'\n' {
@@ -401,7 +378,7 @@ fn main() {
             rp += 1;
         }
 
-        let next_cid = countries.len() as u16;
+        let next_cid = countries.len() as u8;
         let cid = *country_map.entry(c_bytes.clone()).or_insert_with(|| {
             countries.push(CountryAgg {
                 key: c_bytes,
@@ -417,37 +394,16 @@ fn main() {
             next_cid
         });
 
-        if rid > max_rid {
-            max_rid = rid;
+        if (rid as usize) < flat.len() {
+            flat[rid as usize] = cid;
+        } else {
+            flat.resize((rid + 1) as usize, 0);
+            flat[rid as usize] = cid;
         }
-        raw_regions.push(RawRegion { rid, cid });
     }
     drop(r_mmap);
 
-    let rlookup = if max_rid < 1_000_000 {
-        let mut flat = vec![0u16; (max_rid + 1) as usize];
-        for rr in &raw_regions {
-            flat[rr.rid as usize] = rr.cid;
-        }
-        RegionLookup { flat, ht: Vec::new(), ht_mask: 0 }
-    } else {
-        let mut capacity = 16u32;
-        while (capacity as usize) < raw_regions.len() * 2 {
-            capacity *= 2;
-        }
-        let mask = capacity - 1;
-        let mut ht = vec![(0u32, 0u16); capacity as usize];
-        for rr in &raw_regions {
-            let mut idx = (rr.rid.wrapping_mul(2654435761) & mask) as usize;
-            while ht[idx].1 != 0 {
-                idx = (idx + 1) & (mask as usize);
-            }
-            ht[idx] = (rr.rid, rr.cid);
-        }
-        RegionLookup { flat: Vec::new(), ht, ht_mask: mask }
-    };
-    raw_regions.clear();
-    raw_regions.shrink_to_fit();
+    let rlookup = RegionLookup { flat };
 
     // 2. Load records.csv
     let rec_mmap = match FastMmap::open(&rec_path) {
@@ -528,7 +484,7 @@ fn main() {
 
         handles.push(thread::spawn(move || {
             let mut local_aggs = vec![LocalCountryAgg::new(); num_countries];
-            let mut local_names: Vec<u64> = Vec::with_capacity(32768);
+            let mut local_names: Vec<u64> = Vec::with_capacity(16384);
             let d = rec_ref.as_slice();
             parse_csv_chunk(d, start, end, &rlookup_ref, &mut local_aggs, &mut local_names);
             (local_aggs, local_names)
