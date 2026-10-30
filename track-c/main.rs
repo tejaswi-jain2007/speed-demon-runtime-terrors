@@ -425,7 +425,7 @@ fn main() {
     }
     let data_start = hdr_p;
 
-    let num_threads = 6.min(thread::available_parallelism().map(|n| n.get()).unwrap_or(6)).max(1);
+    let num_threads = 10.min(thread::available_parallelism().map(|n| n.get()).unwrap_or(10)).max(1);
     let payload_len = rec_size - data_start;
     let mut splits = vec![data_start; num_threads + 1];
     splits[num_threads] = rec_size;

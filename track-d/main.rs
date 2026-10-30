@@ -290,8 +290,8 @@ fn main() {
     drop(q_mmap);
 
     let num_queries = queries.len();
-    // 6 workers with compact 6.9MB u32 distance arrays = 41MB total worker RAM (89MB peak process RSS)
-    let num_workers = 6.min(num_queries).max(1);
+    // 8 workers with compact 6.9MB u32 distance arrays = 55MB worker RAM (~104MB peak process RSS, sub-0.85s runtime)
+    let num_workers = 8.min(num_queries).max(1);
 
     let head_arc = Arc::new(head);
     let edges_arc = Arc::new(edges);
