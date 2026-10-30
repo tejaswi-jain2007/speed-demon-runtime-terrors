@@ -22,7 +22,7 @@ impl FastMmap {
         if len == 0 { return None; }
         let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0) };
         if ptr == std::ptr::null_mut() || ptr as isize == -1 { return None; }
-        unsafe { madvise(ptr, len, 2); }
+        unsafe { madvise(ptr, len, 2); } // MADV_SEQUENTIAL
         Some(FastMmap { ptr, len })
     }
     #[inline(always)]
@@ -35,9 +35,9 @@ impl Drop for FastMmap {
 #[derive(Clone, Copy)]
 struct Edge { to: u32, weight: u32 }
 
-struct MinHeap { data: Vec<u64> }
-impl MinHeap {
-    fn new() -> Self { MinHeap { data: Vec::with_capacity(16384) } }
+struct BinaryMinHeap { data: Vec<u64> }
+impl BinaryMinHeap {
+    fn with_capacity(cap: usize) -> Self { BinaryMinHeap { data: Vec::with_capacity(cap) } }
     #[inline(always)]
     fn clear(&mut self) { self.data.clear(); }
     #[inline(always)]
@@ -48,7 +48,7 @@ impl MinHeap {
         let mut idx = self.data.len();
         self.data.push(val);
         while idx > 0 {
-            let parent = (idx - 1) >> 2;
+            let parent = (idx - 1) >> 1;
             let p_val = unsafe { *self.data.get_unchecked(parent) };
             if val < p_val {
                 unsafe {
@@ -61,20 +61,20 @@ impl MinHeap {
     }
     #[inline(always)]
     fn pop(&mut self) -> (u32, u32) {
-        let min = self.data[0];
+        let min = unsafe { *self.data.get_unchecked(0) };
         let last = self.data.pop().unwrap();
-        if !self.data.is_empty() {
-            let len = self.data.len();
-            let mut idx = 0;
+        let len = self.data.len();
+        if len > 0 {
             unsafe { *self.data.get_unchecked_mut(0) = last; }
-            while (idx << 2) + 1 < len {
-                let first_child = (idx << 2) + 1;
-                let mut min_child = first_child;
-                let mut min_val = unsafe { *self.data.get_unchecked(first_child) };
-                let end_child = (first_child + 4).min(len);
-                for c in (first_child + 1)..end_child {
-                    let cv = unsafe { *self.data.get_unchecked(c) };
-                    if cv < min_val { min_val = cv; min_child = c; }
+            let mut idx = 0;
+            while (idx << 1) + 1 < len {
+                let left = (idx << 1) + 1;
+                let right = left + 1;
+                let mut min_child = left;
+                let mut min_val = unsafe { *self.data.get_unchecked(left) };
+                if right < len {
+                    let r_val = unsafe { *self.data.get_unchecked(right) };
+                    if r_val < min_val { min_val = r_val; min_child = right; }
                 }
                 if min_val < last {
                     unsafe {
@@ -135,13 +135,13 @@ fn main() {
     let mut p = edges_start;
     for _ in 0..m {
         while unsafe { *g_data.get_unchecked(p) } <= b' ' { p += 1; }
-        let mut u = 0u32;
-        while unsafe { *g_data.get_unchecked(p) } >= b'0' { u = u * 10 + (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1; }
-        while unsafe { *g_data.get_unchecked(p) } <= b' ' { p += 1; }
-        while unsafe { *g_data.get_unchecked(p) } >= b'0' { p += 1; }
-        while unsafe { *g_data.get_unchecked(p) } <= b' ' { p += 1; }
-        while unsafe { *g_data.get_unchecked(p) } >= b'0' { p += 1; }
-        head[(u + 1) as usize] += 1;
+        let mut u = (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1;
+        while unsafe { *g_data.get_unchecked(p) } >= b'0' {
+            u = u * 10 + (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1;
+        }
+        unsafe { *head.get_unchecked_mut((u + 1) as usize) += 1; }
+        while unsafe { *g_data.get_unchecked(p) } != b'\n' { p += 1; }
+        p += 1;
     }
     for j in 0..=n as usize { head[j + 1] += head[j]; }
 
@@ -149,15 +149,28 @@ fn main() {
     p = edges_start;
     for _ in 0..m {
         while unsafe { *g_data.get_unchecked(p) } <= b' ' { p += 1; }
-        let (mut u, mut v, mut w) = (0u32, 0u32, 0u32);
-        while unsafe { *g_data.get_unchecked(p) } >= b'0' { u = u * 10 + (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1; }
-        while unsafe { *g_data.get_unchecked(p) } <= b' ' { p += 1; }
-        while unsafe { *g_data.get_unchecked(p) } >= b'0' { v = v * 10 + (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1; }
-        while unsafe { *g_data.get_unchecked(p) } <= b' ' { p += 1; }
-        while unsafe { *g_data.get_unchecked(p) } >= b'0' { w = w * 10 + (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1; }
-        let idx = head[u as usize];
-        head[u as usize] += 1;
-        edges[idx as usize] = Edge { to: v, weight: w };
+        let mut u = (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1;
+        while unsafe { *g_data.get_unchecked(p) } >= b'0' {
+            u = u * 10 + (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1;
+        }
+        p += 1;
+        let mut v = (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1;
+        while unsafe { *g_data.get_unchecked(p) } >= b'0' {
+            v = v * 10 + (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1;
+        }
+        p += 1;
+        let mut w = (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1;
+        while unsafe { *g_data.get_unchecked(p) } >= b'0' {
+            w = w * 10 + (unsafe { *g_data.get_unchecked(p) } - b'0') as u32; p += 1;
+        }
+        while unsafe { *g_data.get_unchecked(p) } != b'\n' { p += 1; }
+        p += 1;
+
+        let idx = unsafe { *head.get_unchecked(u as usize) };
+        unsafe {
+            *head.get_unchecked_mut(u as usize) += 1;
+            *edges.get_unchecked_mut(idx as usize) = Edge { to: v, weight: w };
+        }
     }
     drop(g_mmap);
     for j in (0..n as usize).rev() { head[j + 1] = head[j]; }
@@ -176,7 +189,7 @@ fn main() {
     drop(q_mmap);
 
     let num_queries = queries.len();
-    let num_workers = 6.min(num_queries).max(1);
+    let num_workers = 10.min(thread::available_parallelism().map(|n| n.get()).unwrap_or(10)).min(num_queries).max(1);
     let (head_arc, edges_arc, queries_arc, next_q_arc) =
         (Arc::new(head), Arc::new(edges), Arc::new(queries), Arc::new(AtomicUsize::new(0)));
     let mut all_answers = vec![0i64; num_queries];
@@ -190,8 +203,8 @@ fn main() {
         workers.push(builder.spawn(move || {
             let out_ptr = answers_ptr as *mut i64;
             let mut dist16 = vec![0u16; n as usize];
-            let mut touched: Vec<u32> = Vec::with_capacity(16384);
-            let mut pq = MinHeap::new();
+            let mut touched: Vec<u32> = Vec::with_capacity(4096);
+            let mut pq = BinaryMinHeap::with_capacity(4096);
             loop {
                 let qi = next_q.fetch_add(1, Ordering::Relaxed);
                 if qi >= num_queries { break; }
@@ -199,9 +212,16 @@ fn main() {
                 if s == t { unsafe { *out_ptr.add(qi) = 0; } continue; }
                 let (start, end) = (*unsafe { head_ref.get_unchecked(s as usize) } as usize, *unsafe { head_ref.get_unchecked((s + 1) as usize) } as usize);
                 if start == end { unsafe { *out_ptr.add(qi) = -1; } continue; }
+
+                let mut best_t = u32::MAX;
+                for ei in start..end {
+                    let e = unsafe { edges_ref.get_unchecked(ei) };
+                    if e.to == t && e.weight < best_t { best_t = e.weight; }
+                }
+
                 unsafe { *dist16.get_unchecked_mut(s as usize) = 1; }
                 touched.push(s); pq.push(0, s);
-                let (mut best_t, mut overflow) = (u32::MAX, false);
+                let mut overflow = false;
                 while !pq.is_empty() {
                     let (d, u) = pq.pop();
                     if d >= best_t { break; }
