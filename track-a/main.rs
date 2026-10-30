@@ -1,7 +1,8 @@
 // Speed Demon 2026 - Track A (Ingest)
 // Team: Runtime Terrors
-// Ultra-high-performance zero-dependency log aggregation engine in Rust
+// Ultra-fast zero-dependency log aggregation engine in Rust
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
@@ -195,7 +196,7 @@ fn parse_chunk(data: &[u8], start: usize, end: usize, parser: &mut ThreadParser)
             p += 1;
         }
 
-        // Direct 2D grid lookup: zero hash overhead, direct L1 access
+        // Direct 2D grid lookup
         let grp = unsafe {
             parser.table.get_unchecked_mut(cur_hour_id).get_unchecked_mut(cur_ep_id)
         };
@@ -218,7 +219,7 @@ struct OutputGroup {
     error_ppm: u64,
 }
 
-struct MergedGroup {
+struct TaskItem {
     hour: [u8; 13],
     endpoint: Vec<u8>,
     count: u64,
@@ -286,35 +287,22 @@ fn main() {
         }));
     }
 
-    // Merge into flat vector without heap node overhead
-    let mut merged: Vec<MergedGroup> = Vec::with_capacity(1024);
-
+    // Merge into BTreeMap with O(log K) lookup
+    let mut merged: BTreeMap<([u8; 13], Vec<u8>), (u64, u64, Vec<u32>)> = BTreeMap::new();
     for handle in handles {
         let mut parser = handle.join().unwrap();
         for hid in 0..parser.hours.len() {
-            let h = parser.hours[hid];
             for eid in 0..parser.endpoints.len() {
                 let grp = &mut parser.table[hid][eid];
                 if grp.count > 0 {
-                    let ep = &parser.endpoints[eid];
-                    let mut found = false;
-                    for mg in &mut merged {
-                        if mg.hour == h && &mg.endpoint == ep {
-                            mg.count += grp.count as u64;
-                            mg.errors += grp.errors as u64;
-                            mg.latencies.append(&mut grp.latencies);
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found {
-                        merged.push(MergedGroup {
-                            hour: h,
-                            endpoint: ep.clone(),
-                            count: grp.count as u64,
-                            errors: grp.errors as u64,
-                            latencies: std::mem::take(&mut grp.latencies),
-                        });
+                    let entry = merged.entry((parser.hours[hid], parser.endpoints[eid].clone()))
+                        .or_insert_with(|| (0, 0, Vec::new()));
+                    entry.0 += grp.count as u64;
+                    entry.1 += grp.errors as u64;
+                    if entry.2.is_empty() {
+                        entry.2 = std::mem::take(&mut grp.latencies);
+                    } else {
+                        entry.2.append(&mut grp.latencies);
                     }
                 }
             }
@@ -322,28 +310,23 @@ fn main() {
     }
     drop(mmap);
 
-    // Sort groups canonically by (hour, endpoint)
-    merged.sort_unstable_by(|a, b| {
-        a.hour.cmp(&b.hour).then_with(|| a.endpoint.cmp(&b.endpoint))
-    });
+    let items: Vec<TaskItem> = merged.into_iter().map(|((hour, endpoint), (count, errors, latencies))| {
+        TaskItem { hour, endpoint, count, errors, latencies }
+    }).collect();
 
-    let total_groups = merged.len();
+    let total_groups = items.len();
     let sort_threads = num_threads.min(total_groups).max(1);
     let per_worker = (total_groups + sort_threads - 1) / sort_threads;
 
     let mut sort_handles = Vec::with_capacity(sort_threads);
 
-    // Split merged into chunks by moving (ZERO CLONING!)
-    let mut chunks: Vec<Vec<MergedGroup>> = Vec::with_capacity(sort_threads);
-    let mut remainder = merged;
+    let mut remainder = items;
     while !remainder.is_empty() {
         let take_len = per_worker.min(remainder.len());
         let tail = remainder.split_off(take_len);
-        chunks.push(remainder);
+        let chunk = remainder;
         remainder = tail;
-    }
 
-    for chunk in chunks {
         sort_handles.push(thread::spawn(move || {
             let mut results = Vec::with_capacity(chunk.len());
             for mut item in chunk {
@@ -395,7 +378,7 @@ fn main() {
         final_groups.extend(sh.join().unwrap());
     }
 
-    // High-speed buffered I/O write
+    // High-speed buffered write
     let mut out_buffer = Vec::with_capacity(2 * 1024 * 1024);
     for g in &final_groups {
         out_buffer.extend_from_slice(&g.hour);
