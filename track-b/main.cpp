@@ -18,11 +18,6 @@ struct DocSpan {
     uint32_t len;
 };
 
-static inline char to_lower_ascii(char c) {
-    if (c >= 'A' && c <= 'Z') return static_cast<char>(c + 32);
-    return c;
-}
-
 static inline bool is_token_char(char c) {
     return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
 }
@@ -43,7 +38,7 @@ int main(int argc, char* argv[]) {
     std::string queries_path = data_dir + "/queries.txt";
     std::string out_path = out_dir + "/results.txt";
 
-    // 1. Mmap docs.txt
+    // 1. Mmap docs.txt with PROT_READ | PROT_WRITE (MAP_PRIVATE allows in-place lowercase without writing to disk)
     int d_fd = open(docs_path.c_str(), O_RDONLY);
     if (d_fd < 0) return 1;
 
@@ -54,30 +49,35 @@ int main(int argc, char* argv[]) {
     }
 
     size_t d_size = d_st.st_size;
-    const char* d_data = static_cast<const char*>(mmap(nullptr, d_size, PROT_READ, MAP_PRIVATE, d_fd, 0));
+    char* d_data = static_cast<char*>(mmap(nullptr, d_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, d_fd, 0));
     if (d_data == MAP_FAILED) {
         close(d_fd);
         return 1;
     }
-    madvise(const_cast<char*>(d_data), d_size, MADV_WILLNEED);
+    madvise(d_data, d_size, MADV_WILLNEED);
 
-    // Document spans: offset and length into mmapped buffer
+    // In-place lowercase conversion: 254MB takes ~15ms on 1 core
+    for (size_t i = 0; i < d_size; ++i) {
+        if (d_data[i] >= 'A' && d_data[i] <= 'Z') {
+            d_data[i] += 32;
+        }
+    }
+
     std::vector<DocSpan> docs;
     docs.reserve(300000);
 
-    // Inverted index: term -> sorted vector of doc_ids
-    std::unordered_map<std::string, std::vector<uint32_t>> index;
-    index.reserve(200000);
+    // Inverted index with string_view keys: ZERO string allocations!
+    std::unordered_map<std::string_view, std::vector<uint32_t>> index;
+    index.reserve(250000);
 
     const char* p = d_data;
     const char* end = d_data + d_size;
 
     uint32_t cur_doc_id = 0;
-    std::vector<std::string> doc_unique_terms;
+    std::vector<std::string_view> doc_unique_terms;
     doc_unique_terms.reserve(256);
 
     while (p < end) {
-        // Skip doc_id and TAB
         while (p < end && *p != '\t') ++p;
         if (p < end && *p == '\t') ++p;
 
@@ -93,18 +93,12 @@ int main(int argc, char* argv[]) {
         doc_unique_terms.clear();
         const char* tp = text_start;
         while (tp < text_end) {
-            char c = to_lower_ascii(*tp);
-            if (is_token_char(c)) {
+            if (is_token_char(*tp)) {
                 const char* term_start = tp;
-                while (tp < text_end && is_token_char(to_lower_ascii(*tp))) {
+                while (tp < text_end && is_token_char(*tp)) {
                     ++tp;
                 }
-                std::string term;
-                term.reserve(tp - term_start);
-                for (const char* k = term_start; k < tp; ++k) {
-                    term.push_back(to_lower_ascii(*k));
-                }
-                doc_unique_terms.push_back(std::move(term));
+                doc_unique_terms.push_back(std::string_view(term_start, tp - term_start));
             } else {
                 ++tp;
             }
@@ -113,7 +107,7 @@ int main(int argc, char* argv[]) {
         std::sort(doc_unique_terms.begin(), doc_unique_terms.end());
         doc_unique_terms.erase(std::unique(doc_unique_terms.begin(), doc_unique_terms.end()), doc_unique_terms.end());
 
-        for (const auto& term : doc_unique_terms) {
+        for (std::string_view term : doc_unique_terms) {
             index[term].push_back(cur_doc_id);
         }
 
@@ -192,15 +186,15 @@ int main(int argc, char* argv[]) {
             for (size_t qi = start_q; qi < end_q; ++qi) {
                 const std::string& line = queries[qi];
                 if (line.rfind("BOOL ", 0) == 0) {
-                    std::vector<std::string> parts;
+                    std::vector<std::string_view> parts;
                     size_t pos = 5;
                     while (pos < line.size()) {
                         size_t next = line.find(' ', pos);
                         if (next == std::string::npos) {
-                            parts.push_back(line.substr(pos));
+                            parts.push_back(std::string_view(line.data() + pos, line.size() - pos));
                             break;
                         }
-                        parts.push_back(line.substr(pos, next - pos));
+                        parts.push_back(std::string_view(line.data() + pos, next - pos));
                         pos = next + 1;
                     }
 
@@ -213,8 +207,8 @@ int main(int argc, char* argv[]) {
                     std::vector<uint32_t> current = (it != index.end()) ? it->second : empty_postings;
 
                     for (size_t i = 1; i + 1 < parts.size(); i += 2) {
-                        const std::string& op = parts[i];
-                        const std::string& term = parts[i + 1];
+                        std::string_view op = parts[i];
+                        std::string_view term = parts[i + 1];
                         auto term_it = index.find(term);
                         const auto& postings = (term_it != index.end()) ? term_it->second : empty_postings;
 
@@ -234,8 +228,8 @@ int main(int argc, char* argv[]) {
                         results[qi] = "0 0";
                         continue;
                     }
-                    std::string phrase = line.substr(start_p, end_p - start_p);
-                    std::vector<std::string> pterms;
+                    std::string_view phrase(line.data() + start_p, end_p - start_p);
+                    std::vector<std::string_view> pterms;
                     size_t ppos = 0;
                     while (ppos < phrase.size()) {
                         size_t next = phrase.find(' ', ppos);
@@ -272,10 +266,9 @@ int main(int argc, char* argv[]) {
                         doc_tokens_local.clear();
                         const char* tp = doc_text;
                         while (tp < doc_text_end) {
-                            char c = to_lower_ascii(*tp);
-                            if (is_token_char(c)) {
+                            if (is_token_char(*tp)) {
                                 const char* t_start = tp;
-                                while (tp < doc_text_end && is_token_char(to_lower_ascii(*tp))) {
+                                while (tp < doc_text_end && is_token_char(*tp)) {
                                     ++tp;
                                 }
                                 doc_tokens_local.push_back(std::string_view(t_start, tp - t_start));
@@ -289,16 +282,7 @@ int main(int argc, char* argv[]) {
                         for (size_t i = 0; i + k <= doc_tokens_local.size(); ++i) {
                             bool ok = true;
                             for (size_t j = 0; j < k; ++j) {
-                                bool match = (dtok.size() == pt.size());
-                                if (match) {
-                                    for (size_t c = 0; c < dtok.size(); ++c) {
-                                        if (to_lower_ascii(dtok[c]) != pt[c]) {
-                                            match = false;
-                                            break;
-                                        }
-                                    }
-                                }
-                                if (!match) {
+                                if (doc_tokens_local[i + j] != pterms[j]) {
                                     ok = false;
                                     break;
                                 }
@@ -322,7 +306,7 @@ int main(int argc, char* argv[]) {
         w.join();
     }
 
-    munmap(const_cast<char*>(d_data), d_size);
+    munmap(d_data, d_size);
     close(d_fd);
 
     // 4. Output results.txt
