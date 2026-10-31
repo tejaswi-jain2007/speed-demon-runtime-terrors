@@ -21,8 +21,8 @@ const ID_MASK: u32 = (1 << 11) - 1;
 const ERR_BIT: u32 = 1 << 11;
 const BIG: u32 = 1 << 20;
 const NTHREADS: usize = 12;
-const BLOCK_CAP: usize = 4092;
-const SLOTS: usize = 4096;
+const BLOCK_CAP: usize = (16384 - 16) / 4;
+const SLOTS: usize = 8192;
 
 #[inline(always)]
 unsafe fn load8(p: *const u8) -> u64 { (p as *const u64).read_unaligned() }
@@ -38,27 +38,32 @@ unsafe fn find(mut s: *const u8, c: u8) -> *const u8 {
 }
 
 #[inline(always)]
-unsafe fn parse_lat(mut p: *const u8, end: *const u8) -> u32 {
-    let mut v = 0u32;
-    while p < end {
-        v = v * 10 + (*p - b'0') as u32;
-        p = p.add(1);
-    }
-    v
+unsafe fn parse_digits(end: *const u8, len: u32) -> u32 {
+    let v = _mm_loadu_si128(end.sub(16) as *const __m128i);
+    let v = _mm_subs_epu8(v, _mm_set1_epi8(b'0' as i8));
+    let lane = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let v = _mm_and_si128(v, _mm_cmpgt_epi8(lane, _mm_set1_epi8((15 - len) as i8)));
+    let v = _mm_maddubs_epi16(v, _mm_set1_epi16(0x010A));
+    let v = _mm_madd_epi16(v, _mm_set1_epi32(0x00010064));
+    let v = _mm_packus_epi32(v, v);
+    let v = _mm_madd_epi16(v, _mm_set1_epi32(0x00012710));
+    let high = _mm_cvtsi128_si32(v) as u32;
+    let low = _mm_extract_epi32(v, 1) as u32;
+    high.wrapping_mul(100000000) + low
 }
 
 #[inline(always)]
-fn put_u32(b: &mut [u8], mut v: u32, p: usize) -> usize {
-    if v == 0 { b[p] = b'0'; return p + 1; }
-    let (mut cur, start) = (p, p);
-    while v > 0 { b[cur] = b'0' + (v % 10) as u8; v /= 10; cur += 1; }
-    b[start..cur].reverse();
-    cur
+fn append_u32(buf: &mut [u8], mut val: u32, mut pos: usize) -> usize {
+    if val == 0 { buf[pos] = b'0'; return pos + 1; }
+    let mut temp = [0u8; 10]; let mut len = 0;
+    while val > 0 { temp[len] = b'0' + (val % 10) as u8; val /= 10; len += 1; }
+    while len > 0 { len -= 1; buf[pos] = temp[len]; pos += 1; }
+    pos
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)]
-struct Slot { fp: u32, id: u16, len: u16, ptr: *const u8 }
+struct Slot { fp: u64, id: u16, len: u16, ptr: *const u8 }
 
 struct Table<'a> {
     slots: [Slot; SLOTS],
@@ -80,7 +85,7 @@ impl<'a> Table<'a> {
         let c = if len >= 16 { load8(s.add((len - 8) / 2)) } else { 0 };
         if len < 8 { a &= (1u64 << (8 * len)) - 1; }
         let h = _mm_crc32_u64(_mm_crc32_u64(_mm_crc32_u64(len as u64, a), c), b);
-        let fp = (h as u32) | 1;
+        let fp = h | 1;
         let mut i = (h as usize) & (SLOTS - 1);
         loop {
             let slot = self.slots.get_unchecked_mut(i);
@@ -90,10 +95,10 @@ impl<'a> Table<'a> {
                 self.names.push(std::slice::from_raw_parts(s, len));
                 return idx as u32;
             }
-            if slot.fp == fp && slot.len as usize == len
-                && std::slice::from_raw_parts(slot.ptr, len) == std::slice::from_raw_parts(s, len)
-            {
-                return slot.id as u32;
+            if slot.fp == fp && slot.len as usize == len {
+                if std::slice::from_raw_parts(slot.ptr, len) == std::slice::from_raw_parts(s, len) {
+                    return slot.id as u32;
+                }
             }
             i = (i + 1) & (SLOTS - 1);
         }
@@ -109,26 +114,28 @@ struct Worker<'a> {
     big: Vec<Vec<(u32, u32)>>,
     region: *mut u8,
     used: usize,
-    reserved: usize,
 }
 unsafe impl<'a> Send for Worker<'a> {}
 unsafe impl<'a> Sync for Worker<'a> {}
 
 impl<'a> Worker<'a> {
     fn new() -> Self {
+        let reserve = 72 * std::mem::size_of::<Block>();
+        let region = unsafe { mmap(std::ptr::null_mut(), reserve, 3, 0x22, -1, 0) };
+        if region == !0 as *mut u8 { std::process::exit(1); }
         Self {
             ep: Table::new(),
             head: [std::ptr::null_mut(); HOURS],
             big: (0..HOURS).map(|_| Vec::new()).collect(),
-            region: std::ptr::null_mut(),
+            region,
             used: 0,
-            reserved: 0,
         }
     }
 
     unsafe fn parse(&mut self, mut p: *const u8, end: *const u8) {
         if p >= end { return; }
-        let (zero, sub32) = (_mm256_setzero_si256(), _mm256_set1_epi8(32));
+        let space_vec = _mm256_set1_epi8(b' ' as i8);
+        let nl_vec = _mm256_set1_epi8(b'\n' as i8);
         let mut cur_b: [*mut Block; HOURS] = [std::ptr::null_mut(); HOURS];
 
         while p < end {
@@ -136,43 +143,30 @@ impl<'a> Worker<'a> {
             let h = day * 24 + ((*p.add(11) - b'0') * 10 + (*p.add(12) - b'0')) as usize - 18;
 
             let m = p.add(28);
-            let v0 = _mm256_loadu_si256(m as *const _);
-            let v1 = _mm256_loadu_si256(m.add(32) as *const _);
-            let m0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_subs_epu8(v0, sub32), zero)) as u32;
-            let m1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_subs_epu8(v1, sub32), zero)) as u32;
-            let mask = (m0 as u64) | ((m1 as u64) << 32);
+            let v0 = _mm256_loadu_si256(m as *const __m256i);
+            let v1 = _mm256_loadu_si256(m.add(32) as *const __m256i);
+            let sp0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, space_vec)) as u32;
+            let sp1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, space_vec)) as u32;
+            let nl0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, nl_vec)) as u32;
+            let nl1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, nl_vec)) as u32;
 
-            let p0 = mask.trailing_zeros() as usize;
-            let mask1 = mask & (mask - 1);
-            let p1 = mask1.trailing_zeros() as usize;
-            let mask2 = mask1 & (mask1 - 1);
-            let p2 = mask2.trailing_zeros() as usize;
-            let mask3 = mask2 & (mask2 - 1);
+            let sp = (sp0 as u64) | ((sp1 as u64) << 32);
+            let nl = (nl0 as u64) | ((nl1 as u64) << 32);
 
-            let (ep_ptr, ee_ptr, lat_p, eol) = if mask3 != 0 {
-                (m.add(p0 + 1), m.add(p1), m.add(p2 + 1), m.add(mask3.trailing_zeros() as usize))
-            } else {
-                let ep_p = m.add(p0 + 1);
-                let ee_p = if p1 < 64 { m.add(p1) } else { find(ep_p, b' ') };
-                let lat_start = ee_p.add(5);
-                (ep_p, ee_p, lat_start, find(lat_start, b'\n'))
-            };
+            let ep = m.add(sp.trailing_zeros() as usize + 1);
+            let sp_rem = sp & (sp - 1);
+            let ee = if sp_rem != 0 { m.add(sp_rem.trailing_zeros() as usize) } else { find(ep, b' ') };
+            let eol = if nl != 0 { m.add(nl.trailing_zeros() as usize) } else { find(ee.add(5), b'\n') };
 
-            let is_err = ((*ee_ptr.add(1) == b'5') as u32) << 11;
-            let key = self.ep.intern(ep_ptr, ee_ptr as usize - ep_ptr as usize) | is_err;
-            let lat = parse_lat(lat_p, eol);
+            let is_err = ((*ee.add(1) == b'5') as u32) << 11;
+            let key = self.ep.intern(ep, ee as usize - ep as usize) | is_err;
+            let lat = parse_digits(eol, (eol as usize - ee as usize - 5) as u32);
             p = eol.add(1);
 
             if lat >= BIG { self.big[h].push((lat, key)); continue; }
 
             let mut b = cur_b[h];
             if b.is_null() || (*b).n as usize == BLOCK_CAP {
-                if self.used + std::mem::size_of::<Block>() > self.reserved {
-                    let chunk = 16 * std::mem::size_of::<Block>();
-                    let ptr = mmap(std::ptr::null_mut(), chunk, 3, 0x22, -1, 0);
-                    if ptr == !0 as *mut u8 { std::process::exit(1); }
-                    self.region = ptr; self.used = 0; self.reserved = chunk;
-                }
                 let fresh = self.region.add(self.used) as *mut Block;
                 self.used += std::mem::size_of::<Block>();
                 (*fresh).next = self.head[h];
@@ -352,7 +346,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     let label = &lbl_r[h];
-                    let mut local_out = Vec::with_capacity(ne * 64);
+                    let mut out_text = text_r[h].lock().unwrap();
+                    out_text.reserve(ne * 64);
 
                     for e in 0..ne {
                         let (start, end) = (count[e] as usize, count[e + 1] as usize);
@@ -378,20 +373,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let err = errors[e];
                         let ppm = ((err as u64) * 1_000_000 / (n as u64)) as u32;
 
-                        line[..20].copy_from_slice(label);
-                        line[20] = b' ';
-                        let ep = nm_r[e];
-                        line[21..21 + ep.len()].copy_from_slice(ep);
-                        let mut pos = 21 + ep.len();
-                        for val in [n as u32, p50, p95, p99, err, ppm] {
-                            line[pos] = b' ';
-                            pos = put_u32(&mut line, val, pos + 1);
-                        }
-                        line[pos] = b'\n';
-                        local_out.extend_from_slice(&line[..pos + 1]);
+                        let mut pos = 0;
+                        line[..20].copy_from_slice(label); pos += 20;
+                        line[pos] = b' '; pos += 1;
+                        let ep_name = nm_r[e];
+                        line[pos..pos + ep_name.len()].copy_from_slice(ep_name); pos += ep_name.len();
+                        line[pos] = b' '; pos += 1; pos = append_u32(&mut line, n as u32, pos);
+                        line[pos] = b' '; pos += 1; pos = append_u32(&mut line, p50, pos);
+                        line[pos] = b' '; pos += 1; pos = append_u32(&mut line, p95, pos);
+                        line[pos] = b' '; pos += 1; pos = append_u32(&mut line, p99, pos);
+                        line[pos] = b' '; pos += 1; pos = append_u32(&mut line, err, pos);
+                        line[pos] = b' '; pos += 1; pos = append_u32(&mut line, ppm, pos);
+                        line[pos] = b'\n'; pos += 1;
+                        out_text.extend_from_slice(&line[..pos]);
                     }
 
-                    *text_r[h].lock().unwrap() = local_out;
                     done_r[h].store(true, Ordering::Release);
                 }
             });
