@@ -1,6 +1,6 @@
 // Speed Demon 2026 - Track D (Traverse)
 // Team: Runtime Terrors
-// High-efficiency 64-bucket Radix Heap Dijkstra solver: tzcnt bitmask, O(1) amortized, u32 flat distance array, exact 64-bit overflow handling, 81MB peak RSS
+// High-efficiency 64-bucket Radix Heap Dijkstra solver with 8-thread parallel graph ingestion
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -186,57 +186,74 @@ fn main() {
     gp = parse_u32_from_slice(g_data, gp, g_size, &mut m);
     let edges_start = gp;
 
+    let parse_threads = 8.min(thread::available_parallelism().map(|t| t.get()).unwrap_or(8)).max(1);
+    let payload_len = g_size - edges_start;
+    let mut splits = vec![edges_start; parse_threads + 1];
+    splits[parse_threads] = g_size;
+    for t in 1..parse_threads {
+        let mut pt = edges_start + t * (payload_len / parse_threads);
+        while pt < g_size && g_data[pt] != b'\n' { pt += 1; }
+        if pt < g_size { pt += 1; }
+        splits[t] = pt;
+    }
+
+    let g_mmap_arc = Arc::new(g_mmap);
+    let mut parse_handles = Vec::with_capacity(parse_threads);
+    for t in 0..parse_threads {
+        let (m_ref, start, end) = (Arc::clone(&g_mmap_arc), splits[t], splits[t + 1]);
+        parse_handles.push(thread::spawn(move || {
+            let d = m_ref.as_slice();
+            let mut local_edges = Vec::with_capacity((end - start) / 18);
+            unsafe {
+                let mut p = d.as_ptr().add(start);
+                let end_ptr = d.as_ptr().add(end);
+                while p < end_ptr {
+                    while p < end_ptr && *p <= b' ' { p = p.add(1); }
+                    if p >= end_ptr { break; }
+                    let mut u = (*p - b'0') as u32; p = p.add(1);
+                    while p < end_ptr && *p >= b'0' { u = u * 10 + (*p - b'0') as u32; p = p.add(1); }
+                    while p < end_ptr && *p <= b' ' { p = p.add(1); }
+                    if p >= end_ptr { break; }
+                    let mut v = (*p - b'0') as u32; p = p.add(1);
+                    while p < end_ptr && *p >= b'0' { v = v * 10 + (*p - b'0') as u32; p = p.add(1); }
+                    while p < end_ptr && *p <= b' ' { p = p.add(1); }
+                    if p >= end_ptr { break; }
+                    let mut w = (*p - b'0') as u32; p = p.add(1);
+                    while p < end_ptr && *p >= b'0' { w = w * 10 + (*p - b'0') as u32; p = p.add(1); }
+                    local_edges.push((u, v, w));
+                }
+            }
+            local_edges
+        }));
+    }
+
+    let mut thread_raw_edges = Vec::with_capacity(parse_threads);
+    for ph in parse_handles { thread_raw_edges.push(ph.join().unwrap()); }
+    drop(g_mmap_arc);
+
     let num_words = ((n as usize) + 63) >> 6;
     let mut has_in_edges = vec![0u64; num_words];
     let mut head = vec![0u32; (n + 2) as usize];
 
-    // Pass 1: count out-degrees and mark in-edges
-    unsafe {
-        let mut p = g_data.as_ptr().add(edges_start);
-        for _ in 0..m {
-            while *p <= b' ' { p = p.add(1); }
-            let mut u = (*p - b'0') as u32; p = p.add(1);
-            while *p >= b'0' { u = u * 10 + (*p - b'0') as u32; p = p.add(1); }
-            while *p <= b' ' { p = p.add(1); }
-            let mut v = (*p - b'0') as u32; p = p.add(1);
-            while *p >= b'0' { v = v * 10 + (*p - b'0') as u32; p = p.add(1); }
-            while *p <= b' ' { p = p.add(1); }
-            while *p >= b'0' { p = p.add(1); }
-
+    for chunk in &thread_raw_edges {
+        for &(u, v, _) in chunk {
             head[(u + 1) as usize] += 1;
-            *has_in_edges.get_unchecked_mut((v as usize) >> 6) |= 1u64 << ((v as usize) & 63);
+            *unsafe { has_in_edges.get_unchecked_mut((v as usize) >> 6) } |= 1u64 << ((v as usize) & 63);
         }
     }
 
-    // Prefix sum
     for j in 0..=n as usize {
         head[j + 1] += head[j];
     }
 
     let mut edges = vec![Edge { to: 0, weight: 0 }; m as usize];
-
-    // Pass 2: populate CSR edges
-    unsafe {
-        let mut p = g_data.as_ptr().add(edges_start);
-        for _ in 0..m {
-            while *p <= b' ' { p = p.add(1); }
-            let mut u = (*p - b'0') as u32; p = p.add(1);
-            while *p >= b'0' { u = u * 10 + (*p - b'0') as u32; p = p.add(1); }
-            while *p <= b' ' { p = p.add(1); }
-            let mut v = (*p - b'0') as u32; p = p.add(1);
-            while *p >= b'0' { v = v * 10 + (*p - b'0') as u32; p = p.add(1); }
-            while *p <= b' ' { p = p.add(1); }
-            let mut w = (*p - b'0') as u32; p = p.add(1);
-            while *p >= b'0' { w = w * 10 + (*p - b'0') as u32; p = p.add(1); }
-
+    for chunk in thread_raw_edges {
+        for (u, v, w) in chunk {
             let idx = head[u as usize] as usize;
             head[u as usize] += 1;
-            *edges.get_unchecked_mut(idx) = Edge { to: v, weight: w };
+            *unsafe { edges.get_unchecked_mut(idx) } = Edge { to: v, weight: w };
         }
     }
-
-    unsafe { discard_file_pages(g_data.as_ptr(), g_size); }
-    drop(g_mmap);
 
     for j in (0..n as usize).rev() {
         head[j + 1] = head[j];
@@ -270,7 +287,7 @@ fn main() {
         return;
     }
 
-    let num_workers = 6.min(num_queries).max(1);
+    let num_workers = 8.min(num_queries).max(1);
     let head_arc = Arc::new(head);
     let edges_arc = Arc::new(edges);
     let has_in_arc = Arc::new(has_in_edges);
