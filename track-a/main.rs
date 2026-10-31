@@ -17,12 +17,14 @@ const TABLE_SLOTS: usize = 1 << 12;
 const BLOCK_CAP: usize = (16384 - 16) / 4;
 
 #[inline(always)] unsafe fn load8(p: *const u8) -> u64 { (p as *const u64).read_unaligned() }
-#[inline(always)] unsafe fn match32(p: *const u8, c: u8) -> u32 {
-    let v = _mm256_loadu_si256(p as *const __m256i);
-    _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8))) as u32
-}
 #[inline(always)] unsafe fn find(mut s: *const u8, c: u8) -> *const u8 {
-    loop { let m = match32(s, c); if m != 0 { return s.add(m.trailing_zeros() as usize); } s = s.add(32); }
+    let target = _mm256_set1_epi8(c as i8);
+    loop {
+        let v = _mm256_loadu_si256(s as *const __m256i);
+        let m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, target)) as u32;
+        if m != 0 { return s.add(m.trailing_zeros() as usize); }
+        s = s.add(32);
+    }
 }
 #[inline(always)] unsafe fn parse_digits(end: *const u8, len: u32) -> u32 {
     let v = _mm_loadu_si128(end.sub(16) as *const __m128i);
@@ -39,13 +41,6 @@ const BLOCK_CAP: usize = (16384 - 16) / 4;
 unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
 impl<T> SendPtr<T> { #[inline(always)] fn as_ptr(&self) -> *const T { self.0 } }
-
-struct SendMutPtr<T>(*mut T);
-unsafe impl<T> Send for SendMutPtr<T> {}
-unsafe impl<T> Sync for SendMutPtr<T> {}
-impl<T> Clone for SendMutPtr<T> { fn clone(&self) -> Self { *self } }
-impl<T> Copy for SendMutPtr<T> {}
-impl<T> SendMutPtr<T> { #[inline(always)] fn as_ptr(&self) -> *mut T { self.0 } }
 
 struct EndpointTable<'a> { slots: [u32; TABLE_SLOTS], names: Vec<&'a [u8]> }
 impl<'a> EndpointTable<'a> {
@@ -98,19 +93,28 @@ impl<'a> Worker<'a> {
         self.reserved = reserve;
         self.region = mmap(std::ptr::null_mut(), reserve, 3, 0x22, -1, 0);
         if self.region == !0 as *mut u8 { std::process::exit(1); }
+        let c_sp = _mm256_set1_epi8(b' ' as i8);
+        let c_nl = _mm256_set1_epi8(b'\n' as i8);
+
         while p < end {
             let day_idx = if *p.add(6) == b'0' { (*p.add(9) - b'0') as i32 } else { (*p.add(9) - b'0' + 1) as i32 };
             let hour = ((*p.add(11) - b'0') * 10 + (*p.add(12) - b'0')) as i32;
             let h = (day_idx * 24 + hour - 18) as usize;
             let m = p.add(28);
-            let sp = (match32(m, b' ') as u64) | ((match32(m.add(32), b' ') as u64) << 32);
-            let nl = (match32(m, b'\n') as u64) | ((match32(m.add(32), b'\n') as u64) << 32);
+
+            // 1-pass AVX2 load for both space and newline
+            let v0 = _mm256_loadu_si256(m as *const __m256i);
+            let v1 = _mm256_loadu_si256(m.add(32) as *const __m256i);
+            let sp = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, c_sp)) as u64) | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, c_sp)) as u64) << 32);
+            let nl = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, c_nl)) as u64) | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, c_nl)) as u64) << 32);
+
             let ep = m.add(sp.trailing_zeros() as usize + 1);
             let ee = if nl != 0 { m.add((sp & (sp - 1)).trailing_zeros() as usize) } else { find(ep, b' ') };
             let eol = if nl != 0 { m.add(nl.trailing_zeros() as usize) } else { find(ee.add(5), b'\n') };
             let key = self.endpoints.intern(ep, ee as usize - ep as usize) | if *ee.add(1) == b'5' { ERR_BIT } else { 0 };
             let lat = parse_digits(eol, (eol as usize - ee as usize - 5) as u32);
             p = eol.add(1);
+
             if lat >= BIG { self.big[h].push((lat, key)); continue; }
             let b = &mut self.head[h];
             if (*b).is_null() || (*(*b)).n as usize == BLOCK_CAP {
@@ -180,16 +184,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut workers: Vec<Worker> = (0..NTHREADS).map(|_| Worker::new()).collect();
     let barrier = Barrier::new(NTHREADS);
-    let barrier2 = Barrier::new(NTHREADS);
     let next_hour = AtomicUsize::new(0);
     let done: Vec<_> = (0..HOURS).map(|_| AtomicBool::new(false)).collect();
     let text_boxes: Vec<_> = (0..HOURS).map(|_| Mutex::new(Vec::new())).collect();
-    let mut rank = vec![Vec::new(); NTHREADS];
-    let mut sorted_names: Vec<&[u8]> = Vec::new();
+    let (mut rank, data_send) = (vec![Vec::new(); NTHREADS], SendPtr(data));
 
-    let workers_send = SendMutPtr(workers.as_mut_ptr());
-    let rank_send = SendMutPtr(&mut rank as *mut Vec<Vec<u32>>);
-    let names_send = SendMutPtr(&mut sorted_names as *mut Vec<&[u8]>);
+    thread::scope(|s| {
+        let (cut_ref, barrier_ref, d_send) = (&cut, &barrier, data_send);
+        for (t, w) in workers.iter_mut().enumerate() {
+            s.spawn(move || unsafe {
+                let from = d_send.as_ptr().add(cut_ref[t]);
+                let to = d_send.as_ptr().add(cut_ref[t + 1]);
+                w.parse(from, to);
+                let (sf, ef) = ((from as usize + 4095) & !4095, (to as usize) & !4095);
+                if ef > sf { madvise(sf as *mut u8, ef - sf, 4); }
+                barrier_ref.wait();
+            });
+        }
+    });
+
+    let mut global = EndpointTable::new();
+    for t in 0..NTHREADS {
+        for n in &workers[t].endpoints.names {
+            rank[t].push(unsafe { global.intern(n.as_ptr(), n.len()) });
+        }
+    }
+    let mut sorted_names = global.names.clone();
+    sorted_names.sort_unstable();
+    let mut rank_of = vec![0u32; sorted_names.len()];
+    for (i, n) in sorted_names.iter().enumerate() {
+        let gid = unsafe { global.intern(n.as_ptr(), n.len()) } as usize;
+        rank_of[gid] = i as u32;
+    }
+    for r in &mut rank { for id in r { *id = rank_of[*id as usize]; } }
+    let num_endpoints = sorted_names.len();
+    unsafe { madvise(data as *mut u8, size + 4096, 4); }
 
     thread::scope(|s| {
         let (done_ref, text_ref, out_p) = (&done, &text_boxes, out_path.clone());
@@ -204,78 +233,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             out_file.flush().ok();
         });
 
-        let (cut_ref, b1_ref, b2_ref, d_send) = (&cut, &barrier, &barrier2, SendPtr(data));
         let (next_h_ref, done_ref, text_ref) = (&next_hour, &done, &text_boxes);
-        let labels_ref = &labels;
+        let (workers_ref, rank_ref, labels_ref, names_ref) = (&workers, &rank, &labels, &sorted_names);
+        let ne = num_endpoints;
 
-        for t in 0..NTHREADS {
-            s.spawn(move || unsafe {
-                let workers_ptr = workers_send.as_ptr();
-                let r_ptr = rank_send.as_ptr();
-                let n_ptr = names_send.as_ptr();
-
-                let w = &mut *workers_ptr.add(t);
-                let from = d_send.as_ptr().add(cut_ref[t]);
-                let to = d_send.as_ptr().add(cut_ref[t + 1]);
-                w.parse(from, to);
-                let (sf, ef) = ((from as usize + 4095) & !4095, (to as usize) & !4095);
-                if ef > sf { madvise(sf as *mut u8, ef - sf, 4); }
-
-                if b1_ref.wait().is_leader() {
-                    let workers_slice = std::slice::from_raw_parts(workers_ptr, NTHREADS);
-                    let rank_slice = &mut *r_ptr;
-                    let mut global = EndpointTable::new();
-                    for wt in 0..NTHREADS {
-                        for n in &workers_slice[wt].endpoints.names {
-                            rank_slice[wt].push(global.intern(n.as_ptr(), n.len()));
-                        }
-                    }
-                    let names_vec = &mut *n_ptr;
-                    *names_vec = global.names.clone();
-                    names_vec.sort_unstable();
-                    let mut rank_of = vec![0u32; names_vec.len()];
-                    for (i, n) in names_vec.iter().enumerate() {
-                        let gid = global.intern(n.as_ptr(), n.len()) as usize;
-                        rank_of[gid] = i as u32;
-                    }
-                    for r in rank_slice.iter_mut() {
-                        for id in r { *id = rank_of[*id as usize]; }
-                    }
-                    madvise(d_send.as_ptr() as *mut u8, size + 4096, 4);
-                }
-
-                b2_ref.wait();
-
-                let workers_slice = std::slice::from_raw_parts(workers_ptr, NTHREADS);
-                let rank_slice = &*r_ptr;
-                let names_slice = &*n_ptr;
-                let ne = names_slice.len();
-
-                let mut count = vec![0u32; ne + 1];
-                let mut errors = vec![0u32; ne];
-                let mut cursor = vec![0u32; ne];
-                let mut lat: Vec<u32> = Vec::with_capacity(32768);
-                let mut line = [0u8; 512];
+        for _ in 0..NTHREADS {
+            s.spawn(move || {
+                let (mut count, mut errors, mut cursor) = (vec![0u32; ne + 1], vec![0u32; ne], vec![0u32; ne]);
+                let (mut lat, mut line) = (Vec::with_capacity(32768), [0u8; 512]);
                 let mut thread_buf: Vec<u8> = Vec::with_capacity(32768);
 
                 loop {
                     let h = next_h_ref.fetch_add(1, Ordering::Relaxed);
                     if h >= HOURS { break; }
-                    count.fill(0);
-                    errors.fill(0);
+                    count.fill(0); errors.fill(0);
 
                     for wt in 0..NTHREADS {
-                        let (w_item, r) = (&workers_slice[wt], &rank_slice[wt]);
-                        let mut b = w_item.head[h];
+                        let (w, r) = (&workers_ref[wt], &rank_ref[wt]);
+                        let mut b = w.head[h];
                         while !b.is_null() {
-                            let b_ref = &*b;
-                            for i in 0..b_ref.n as usize {
-                                let (key, e) = (b_ref.rec[i], r[(b_ref.rec[i] & ID_MASK) as usize] as usize);
-                                count[e + 1] += 1; errors[e] += ((key & ERR_BIT) != 0) as u32;
+                            unsafe {
+                                let b_ref = &*b;
+                                for i in 0..b_ref.n as usize {
+                                    let (key, e) = (b_ref.rec[i], r[(b_ref.rec[i] & ID_MASK) as usize] as usize);
+                                    count[e + 1] += 1; errors[e] += ((key & ERR_BIT) != 0) as u32;
+                                }
+                                b = b_ref.next;
                             }
-                            b = b_ref.next;
                         }
-                        for &(_, key) in &w_item.big[h] {
+                        for &(_, key) in &w.big[h] {
                             let e = r[(key & ID_MASK) as usize] as usize;
                             count[e + 1] += 1; errors[e] += ((key & ERR_BIT) != 0) as u32;
                         }
@@ -285,22 +271,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let total_lat = count[ne] as usize;
                     lat.clear();
                     if lat.capacity() < total_lat { lat.reserve(total_lat - lat.capacity()); }
-                    lat.set_len(total_lat);
+                    unsafe { lat.set_len(total_lat); }
 
                     for wt in 0..NTHREADS {
-                        let (w_item, r) = (&workers_slice[wt], &rank_slice[wt]);
-                        let mut b = w_item.head[h];
+                        let (w, r) = (&workers_ref[wt], &rank_ref[wt]);
+                        let mut b = w.head[h];
                         while !b.is_null() {
-                            let b_ref = &*b;
-                            for i in 0..b_ref.n as usize {
-                                let (rec, e) = (b_ref.rec[i], r[(b_ref.rec[i] & ID_MASK) as usize] as usize);
-                                lat[cursor[e] as usize] = rec >> KEY_BITS; cursor[e] += 1;
+                            unsafe {
+                                let b_ref = &*b;
+                                for i in 0..b_ref.n as usize {
+                                    let (rec, e) = (b_ref.rec[i], r[(b_ref.rec[i] & ID_MASK) as usize] as usize);
+                                    lat[cursor[e] as usize] = rec >> KEY_BITS; cursor[e] += 1;
+                                }
+                                let next_b = b_ref.next;
+                                madvise(b as *mut u8, std::mem::size_of::<Block>(), 4);
+                                b = next_b;
                             }
-                            let next_b = b_ref.next;
-                            madvise(b as *mut u8, std::mem::size_of::<Block>(), 4);
-                            b = next_b;
                         }
-                        for &(l, key) in &w_item.big[h] {
+                        for &(l, key) in &w.big[h] {
                             let e = r[(key & ID_MASK) as usize] as usize;
                             lat[cursor[e] as usize] = l; cursor[e] += 1;
                         }
@@ -329,7 +317,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut pos = 0;
                         line[..20].copy_from_slice(label); pos += 20;
                         line[pos] = b' '; pos += 1;
-                        let ep_name = names_slice[e];
+                        let ep_name = names_ref[e];
                         line[pos..pos + ep_name.len()].copy_from_slice(ep_name); pos += ep_name.len();
                         for v in [n as u32, p50, p95, p99, err, ppm] { line[pos] = b' '; pos += 1; pos = append_u32(&mut line, v, pos); }
                         line[pos] = b'\n'; pos += 1;
@@ -345,6 +333,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
         }
     });
-
     unsafe { _exit(0); }
 }
