@@ -10,7 +10,7 @@ use std::thread;
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
-    fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
+    fn prctl(option: i32, a2: u64, a3: u64, a4: u64, a5: u64) -> i32;
     fn _exit(status: i32) -> !;
 }
 
@@ -30,13 +30,6 @@ unsafe fn find(mut s: *const u8, c: u8) -> *const u8 {
         if m != 0 { return s.add(m.trailing_zeros() as usize); }
         s = s.add(32);
     }
-}
-
-#[inline(always)]
-unsafe fn parse_lat(mut p: *const u8, end: *const u8) -> u32 {
-    let mut v = 0u32;
-    while p < end { v = v * 10 + (*p - b'0') as u32; p = p.add(1); }
-    v
 }
 
 struct EndpointTable<'a> {
@@ -61,8 +54,7 @@ impl<'a> EndpointTable<'a> {
                 *slot = idx + 1;
                 return idx;
             }
-            let n = self.names[(*slot - 1) as usize];
-            if n == slice { return *slot - 1; }
+            if self.names[(*slot - 1) as usize] == slice { return *slot - 1; }
             i += 1;
         }
     }
@@ -100,24 +92,14 @@ impl<'a> Worker<'a> {
 
         let space_vec = _mm256_set1_epi8(b' ' as i8);
         let nl_vec = _mm256_set1_epi8(b'\n' as i8);
-        let mut curr_ts4 = 0u32;
-        let mut curr_h = 0usize;
-        let mut curr_block = std::ptr::null_mut::<Block>();
+        let mut curr_block: [*mut Block; HOURS] = [std::ptr::null_mut(); HOURS];
 
         while p < end {
-            let ts4 = (p.add(9) as *const u32).read_unaligned();
-            let h = if ts4 == curr_ts4 {
-                curr_h
-            } else {
-                let day_idx = if *p.add(6) == b'0' { (*p.add(9) - b'0') as i32 } else { (*p.add(9) - b'0' + 1) as i32 };
-                let hour = ((*p.add(11) - b'0') * 10 + (*p.add(12) - b'0')) as i32;
-                curr_h = (day_idx * 24 + hour - 18) as usize;
-                curr_ts4 = ts4;
-                curr_block = self.head[curr_h];
-                curr_h
-            };
+            let day_idx = (*p.add(9) - b'0') as i32 + (*p.add(6) & 1) as i32;
+            let hour = (*p.add(11) - b'0') as i32 * 10 + (*p.add(12) - b'0') as i32;
+            let h = (day_idx * 24 + hour - 18) as usize;
 
-            let m = p.add(28);
+            let m = p.add(25);
             let v0 = _mm256_loadu_si256(m as *const __m256i);
             let v1 = _mm256_loadu_si256(m.add(32) as *const __m256i);
             let sp0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, space_vec)) as u32;
@@ -128,27 +110,48 @@ impl<'a> Worker<'a> {
             let sp = (sp0 as u64) | ((sp1 as u64) << 32);
             let nl = (nl0 as u64) | ((nl1 as u64) << 32);
 
-            let ep = m.add(sp.trailing_zeros() as usize + 1);
-            let sp2 = sp & (sp - 1);
-            let ee = if sp2 != 0 { m.add(sp2.trailing_zeros() as usize) } else { find(ep, b' ') };
-            let eol = if nl != 0 { m.add(nl.trailing_zeros() as usize) } else { find(ee.add(5), b'\n') };
+            let sp1_pos = sp.trailing_zeros() as usize;
+            let ep = m.add(sp1_pos + 1);
+            let sp_rem1 = sp & (sp - 1);
+            let sp2_pos = sp_rem1.trailing_zeros() as usize;
+            let ee = m.add(sp2_pos);
 
             let is_err = if *ee.add(1) == b'5' { ERR_BIT } else { 0 };
             let key = self.endpoints.intern(ep, ee as usize - ep as usize) | is_err;
-            let lat = parse_lat(ee.add(5), eol);
+
+            let sp_rem2 = sp_rem1 & (sp_rem1 - 1);
+            let sp3_pos = sp_rem2.trailing_zeros() as usize;
+            let lat_start = m.add(sp3_pos + 1);
+
+            let (lat, eol) = if nl != 0 && sp_rem2 != 0 {
+                let eol_ptr = m.add(nl.trailing_zeros() as usize);
+                let mut v = 0u32;
+                let mut cur = lat_start;
+                while cur < eol_ptr { v = v * 10 + (*cur - b'0') as u32; cur = cur.add(1); }
+                (v, eol_ptr)
+            } else {
+                let cur_sp3 = if sp_rem2 != 0 { lat_start } else { find(ee.add(1), b' ').add(1) };
+                let eol_ptr = find(cur_sp3, b'\n');
+                let mut v = 0u32;
+                let mut cur = cur_sp3;
+                while cur < eol_ptr { v = v * 10 + (*cur - b'0') as u32; cur = cur.add(1); }
+                (v, eol_ptr)
+            };
             p = eol.add(1);
 
             if lat >= BIG { self.big[h].push((lat, key)); continue; }
 
-            if curr_block.is_null() || (*curr_block).n as usize == BLOCK_CAP {
+            let mut b = curr_block[h];
+            if b.is_null() || (*b).n as usize == BLOCK_CAP {
                 let fresh = self.region.add(self.used) as *mut Block;
                 self.used += std::mem::size_of::<Block>();
                 (*fresh).next = self.head[h];
                 (*fresh).n = 0;
                 self.head[h] = fresh;
-                curr_block = fresh;
+                curr_block[h] = fresh;
+                b = fresh;
             }
-            let b_ref = &mut *curr_block;
+            let b_ref = &mut *b;
             b_ref.rec[b_ref.n as usize] = (lat << KEY_BITS) | key;
             b_ref.n += 1;
         }
@@ -196,8 +199,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for h in 0..HOURS {
         let day = (h + 18) / 24;
         let (m, d) = if day < 2 { (10, 30 + day) } else { (11, day - 1) };
-        let s = format!("2026-{m:02}-{d:02}T{:02}:00:00Z", (h + 18) % 24);
-        labels[h].copy_from_slice(s.as_bytes());
+        labels[h].copy_from_slice(format!("2026-{m:02}-{d:02}T{:02}:00:00Z", (h + 18) % 24).as_bytes());
     }
 
     let mut cut = vec![size; NTHREADS + 1]; cut[0] = 0;
@@ -333,9 +335,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let slice = &mut lat[start..end];
                         let (p50, p95, p99) = if n == 1 {
                             let a = slice[0]; (a, a, a)
-                        } else {
+                        } else if n <= 256 {
                             slice.sort_unstable();
                             (slice[(50 * n + 99) / 100 - 1], slice[(95 * n + 99) / 100 - 1], slice[(99 * n + 99) / 100 - 1])
+                        } else {
+                            let (r99, r95, r50) = ((99 * n + 99) / 100 - 1, (95 * n + 99) / 100 - 1, (50 * n + 99) / 100 - 1);
+                            slice.select_nth_unstable(r99);
+                            let p99 = slice[r99];
+                            let p95 = if r95 == r99 { p99 } else { slice[..r99].select_nth_unstable(r95); slice[r95] };
+                            let p50 = if r50 == r95 { p95 } else { slice[..r95].select_nth_unstable(r50); slice[r50] };
+                            (p50, p95, p99)
                         };
 
                         let err = errors[e];

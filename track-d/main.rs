@@ -260,7 +260,7 @@ fn main() {
         return;
     }
 
-    let num_workers = 12.min(num_queries).max(1);
+    let num_workers = 6.min(num_queries).max(1);
     let head_arc = Arc::new(head);
     let edges_arc = Arc::new(edges);
     let in_arc = Arc::new(has_in_edges);

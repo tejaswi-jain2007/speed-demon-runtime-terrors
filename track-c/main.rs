@@ -221,16 +221,19 @@ unsafe fn parse_csv_chunk(
 
         let packed = (((cid as u64) + 1) << 48) | (name_hash & 0x0000_FFFF_FFFF_FFFF);
         let mut slot = (name_hash as usize) & 65535;
-        loop {
+        let mut inserted = false;
+        for _ in 0..16 {
             let entry = filter.get_unchecked_mut(slot);
+            if *entry == packed { inserted = true; break; }
             if *entry == 0 {
                 *entry = packed;
                 local_names.push(packed);
+                inserted = true;
                 break;
             }
-            if *entry == packed { break; }
             slot = (slot + 1) & 65535;
         }
+        if !inserted { local_names.push(packed); }
     }
 }
 
