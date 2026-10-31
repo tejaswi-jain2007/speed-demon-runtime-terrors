@@ -102,18 +102,6 @@ impl EpTable {
             idx = (idx + 1) & self.mask;
         }
     }
-    #[inline(always)]
-    fn lookup(&self, ep: &[u8]) -> usize {
-        let h = hash_bytes(ep);
-        let mut idx = (h as usize) & self.mask;
-        loop {
-            let slot = unsafe { self.slots.get_unchecked(idx) };
-            if slot.hash == h && slot.len as usize == ep.len() && unsafe { self.endpoints.get_unchecked(slot.id as usize) } == ep {
-                return slot.id as usize;
-            }
-            idx = (idx + 1) & self.mask;
-        }
-    }
 }
 
 fn main() {
@@ -131,8 +119,8 @@ fn main() {
         None => { let _ = std::fs::create_dir_all(&out_dir); let _ = File::create(&out_path); return; }
     };
     let data = mmap.as_slice();
-    let num_threads = 12.min(thread::available_parallelism().map(|n| n.get()).unwrap_or(12)).max(1);
     let file_size = data.len();
+    let num_threads = 12.min(thread::available_parallelism().map(|n| n.get()).unwrap_or(12)).max(1);
     let mut splits = vec![0usize; num_threads + 1];
     splits[num_threads] = file_size;
     for t in 1..num_threads {
@@ -142,108 +130,18 @@ fn main() {
         splits[t] = pt;
     }
 
-    // PASS 1: Count group frequencies and record errors without storing any record tuples (0MB buffer overhead!)
+    // Single-pass parse: each thread parses into packed u64 tuples: ((h_idx << 16) | local_ep_id, lat)
     let mut parse_handles = Vec::with_capacity(num_threads);
     for t in 0..num_threads {
         let (mmap_ref, start, end) = (Arc::clone(&mmap), splits[t], splits[t + 1]);
         parse_handles.push(thread::spawn(move || {
             let d = mmap_ref.as_slice();
-            let (mut ep_table, mut counts, mut errors) = (EpTable::new(4096), vec![0u32; 72 * 2048], vec![0u32; 72 * 2048]);
-            let mut p = start;
-            while p < end {
-                if p + 28 > end { break; }
-                let h_idx = get_hour_index(&d[p..p + 27]); p += 28;
-                while p < end && d[p] != b' ' { p += 1; }
-                if p >= end { break; }
-                p += 1;
-                let ep_start = p;
-                while p < end && d[p] != b' ' { p += 1; }
-                if p >= end { break; }
-                let ep_slice = &d[ep_start..p]; p += 1;
-                let local_ep_id = ep_table.get_or_insert(ep_slice) as u32;
-                if p >= end { break; }
-                let is_err = d[p] == b'5';
-                while p < end && d[p] != b'\n' { p += 1; }
-                if p < end { p += 1; }
-                let key = (h_idx as u32) * 2048 + local_ep_id;
-                let key_u = key as usize;
-                counts[key_u] += 1;
-                if is_err { errors[key_u] += 1; }
-            }
-            (ep_table, counts, errors)
-        }));
-    }
-    let mut thread_results = Vec::with_capacity(num_threads);
-    for ph in parse_handles { thread_results.push(ph.join().unwrap()); }
-
-    let mut all_endpoints_set = std::collections::BTreeSet::new();
-    for (ep_t, _, _) in &thread_results { for ep in &ep_t.endpoints { all_endpoints_set.insert(ep.clone()); } }
-    let global_endpoints: Vec<Vec<u8>> = all_endpoints_set.into_iter().collect();
-    let num_global_eps = global_endpoints.len();
-
-    let mut thread_to_global: Vec<Vec<u16>> = Vec::with_capacity(num_threads);
-    for (ep_t, _, _) in &thread_results {
-        let mut map = Vec::with_capacity(ep_t.endpoints.len());
-        for ep in &ep_t.endpoints { map.push(global_endpoints.binary_search(ep).unwrap() as u16); }
-        thread_to_global.push(map);
-    }
-
-    let total_groups = 72 * num_global_eps;
-    let (mut global_counts, mut global_errors) = (vec![0u32; total_groups], vec![0u32; total_groups]);
-    let mut thread_group_counts: Vec<Vec<u32>> = Vec::with_capacity(num_threads);
-    for (t, (_, t_counts, t_errors)) in thread_results.iter().enumerate() {
-        let (t_map, mut target_counts) = (&thread_to_global[t], vec![0u32; total_groups]);
-        for (key, &c) in t_counts.iter().enumerate() {
-            if c > 0 {
-                let target_gid = (key / 2048) * num_global_eps + t_map[key % 2048] as usize;
-                target_counts[target_gid] += c;
-                global_counts[target_gid] += c;
-            }
-        }
-        for (key, &err) in t_errors.iter().enumerate() {
-            if err > 0 {
-                let target_gid = (key / 2048) * num_global_eps + t_map[key % 2048] as usize;
-                global_errors[target_gid] += err;
-            }
-        }
-        thread_group_counts.push(target_counts);
-    }
-
-    let (mut active_groups, mut group_offsets, mut total_records) = (Vec::with_capacity(total_groups), vec![0usize; total_groups + 1], 0usize);
-    for g in 0..total_groups {
-        group_offsets[g] = total_records;
-        let c = global_counts[g] as usize;
-        if c > 0 { active_groups.push(g); total_records += c; }
-    }
-    group_offsets[total_groups] = total_records;
-
-    let mut thread_group_starts: Vec<Vec<u32>> = Vec::with_capacity(num_threads);
-    let mut running_starts = group_offsets.clone();
-    for t in 0..num_threads {
-        let (t_counts, mut t_starts) = (&thread_group_counts[t], vec![0u32; total_groups]);
-        for g in 0..total_groups {
-            let c = t_counts[g] as usize;
-            if c > 0 { t_starts[g] = running_starts[g] as u32; running_starts[g] += c; }
-        }
-        thread_group_starts.push(t_starts);
-    }
-    drop(running_starts); drop(thread_group_counts);
-
-    // EXACT single 12.4 MB flat arena (3.1M u32) — peak memory stays strictly under 18 MB!
-    let mut flat_arena = vec![0u32; total_records];
-    let flat_arena_ptr = flat_arena.as_mut_ptr() as usize;
-
-    // PASS 2: Scatter latencies directly into flat arena slices in parallel
-    let mut scatter_handles = Vec::with_capacity(num_threads);
-    for (t, (ep_table, _, _)) in thread_results.into_iter().enumerate() {
-        let (mmap_ref, start, end) = (Arc::clone(&mmap), splits[t], splits[t + 1]);
-        let (t_map, mut t_pos) = (thread_to_global[t].clone(), thread_group_starts[t].clone());
-        scatter_handles.push(thread::spawn(move || {
-            let d = mmap_ref.as_slice();
-            let arena = flat_arena_ptr as *mut u32;
+            let mut ep_table = EpTable::new(4096);
+            let mut records: Vec<(u32, u32)> = Vec::with_capacity((end - start) / 76);
+            let mut errors = vec![0u32; 72 * 2048];
             let (mut p, mut last_evict) = (start, start);
             while p < end {
-                if p - last_evict >= 256 * 1024 {
+                if p - last_evict >= 512 * 1024 {
                     unsafe { madvise_dontneed(d.as_ptr().add(last_evict), p - last_evict); }
                     last_evict = p;
                 }
@@ -256,7 +154,9 @@ fn main() {
                 while p < end && d[p] != b' ' { p += 1; }
                 if p >= end { break; }
                 let ep_slice = &d[ep_start..p]; p += 1;
-                let local_ep_id = ep_table.lookup(ep_slice);
+                let local_ep_id = ep_table.get_or_insert(ep_slice) as u32;
+                if p >= end { break; }
+                let is_err = d[p] == b'5';
                 while p < end && d[p] != b' ' { p += 1; }
                 if p >= end { break; }
                 p += 1;
@@ -264,65 +164,100 @@ fn main() {
                 while p < end && d[p] >= b'0' && d[p] <= b'9' { lat = lat * 10 + (d[p] - b'0') as u32; p += 1; }
                 while p < end && d[p] != b'\n' { p += 1; }
                 if p < end { p += 1; }
-                let target_gid = (h_idx as usize) * num_global_eps + t_map[local_ep_id] as usize;
-                let write_idx = t_pos[target_gid];
-                t_pos[target_gid] += 1;
-                unsafe { *arena.add(write_idx as usize) = lat; }
+                let key = ((h_idx as u32) << 12) | local_ep_id;
+                records.push((key, lat));
+                if is_err { errors[((h_idx as usize) * 2048) + local_ep_id as usize] += 1; }
             }
             if end > last_evict { unsafe { madvise_dontneed(d.as_ptr().add(last_evict), end - last_evict); } }
+            (ep_table.endpoints, errors, records)
         }));
     }
-    for sh in scatter_handles { sh.join().unwrap(); }
+    let mut thread_results = Vec::with_capacity(num_threads);
+    for ph in parse_handles { thread_results.push(ph.join().unwrap()); }
     drop(mmap);
 
-    // PASS 3: In-place parallel QuickSelect across 12 threads
-    let (hour_strings, num_active) = (build_hour_strings(), active_groups.len());
-    let active_per_thread = (num_active + num_threads - 1) / num_threads;
-    let arena_ptr = flat_arena.as_mut_ptr() as usize;
-    let mut sort_handles = Vec::with_capacity(num_threads);
-    let (g_counts_arc, g_errors_arc, g_offsets_arc, g_eps_arc, h_strs_arc, active_groups_arc) =
-        (Arc::new(global_counts), Arc::new(global_errors), Arc::new(group_offsets), Arc::new(global_endpoints), Arc::new(hour_strings), Arc::new(active_groups));
+    let mut all_endpoints_set = std::collections::BTreeSet::new();
+    for (eps, _, _) in &thread_results { for ep in eps { all_endpoints_set.insert(ep.clone()); } }
+    let global_endpoints: Vec<Vec<u8>> = all_endpoints_set.into_iter().collect();
+    let num_global_eps = global_endpoints.len();
 
-    for t in 0..num_threads {
-        let (start_idx, end_idx) = (t * active_per_thread, (t * active_per_thread + active_per_thread).min(num_active));
-        let (g_counts, g_errors, g_offsets, g_eps, h_strs, active_ref) =
-            (Arc::clone(&g_counts_arc), Arc::clone(&g_errors_arc), Arc::clone(&g_offsets_arc), Arc::clone(&g_eps_arc), Arc::clone(&h_strs_arc), Arc::clone(&active_groups_arc));
-        sort_handles.push(thread::spawn(move || {
-            let arena = arena_ptr as *mut u32;
-            let mut out = Vec::with_capacity(32 * 1024);
-            for idx in start_idx..end_idx {
-                let g = active_ref[idx];
-                let (h_idx, ep_idx, count, errors, offset) = (g / num_global_eps, g % num_global_eps, g_counts[g] as usize, g_errors[g] as u64, g_offsets[g]);
-                let lat_slice = unsafe { std::slice::from_raw_parts_mut(arena.add(offset), count) };
-                let (p50, p95, p99) = if count == 1 { (lat_slice[0], lat_slice[0], lat_slice[0]) }
-                else if count <= 64 {
-                    lat_slice.sort_unstable();
-                    (lat_slice[(50 * count + 99) / 100 - 1], lat_slice[(95 * count + 99) / 100 - 1], lat_slice[(99 * count + 99) / 100 - 1])
-                } else {
-                    let (r50, r95, r99) = ((50 * count + 99) / 100 - 1, (95 * count + 99) / 100 - 1, (99 * count + 99) / 100 - 1);
-                    lat_slice.select_nth_unstable(r50);
-                    let p50 = lat_slice[r50];
-                    if r95 > r50 { lat_slice[r50 + 1..].select_nth_unstable(r95 - (r50 + 1)); }
-                    let p95 = lat_slice[r95];
-                    if r99 > r95 { lat_slice[r95 + 1..].select_nth_unstable(r99 - (r95 + 1)); }
-                    (p50, p95, lat_slice[r99])
-                };
-                let err_ppm = (errors * 1_000_000) / (count as u64);
-                out.extend_from_slice(&h_strs[h_idx]); out.push(b' ');
-                out.extend_from_slice(&g_eps[ep_idx]); out.push(b' ');
-                append_u64(&mut out, count as u64); out.push(b' ');
-                append_u64(&mut out, p50 as u64); out.push(b' ');
-                append_u64(&mut out, p95 as u64); out.push(b' ');
-                append_u64(&mut out, p99 as u64); out.push(b' ');
-                append_u64(&mut out, errors); out.push(b' ');
-                append_u64(&mut out, err_ppm); out.push(b'\n');
+    let mut thread_to_global: Vec<Vec<u16>> = Vec::with_capacity(num_threads);
+    for (eps, _, _) in &thread_results {
+        let mut map = Vec::with_capacity(eps.len());
+        for ep in eps { map.push(global_endpoints.binary_search(ep).unwrap() as u16); }
+        thread_to_global.push(map);
+    }
+
+    let total_groups = 72 * num_global_eps;
+    let mut global_errors = vec![0u32; total_groups];
+    let mut total_records = 0usize;
+    for (t, (_, t_errors, t_records)) in thread_results.iter().enumerate() {
+        total_records += t_records.len();
+        let t_map = &thread_to_global[t];
+        for (key, &err) in t_errors.iter().enumerate() {
+            if err > 0 {
+                let (h_idx, local_id) = (key / 2048, key % 2048);
+                if local_id < t_map.len() {
+                    let target_gid = h_idx * num_global_eps + t_map[local_id] as usize;
+                    global_errors[target_gid] += err;
+                }
             }
-            out
-        }));
+        }
+    }
+
+    // Flatten into single packed Vec<u64>: ((h_idx << 48) | (global_ep_id << 32) | lat)
+    // Exactly 24.8 MB for all 3.1M records!
+    let mut packed: Vec<u64> = Vec::with_capacity(total_records);
+    for (t, (_, _, t_records)) in thread_results.into_iter().enumerate() {
+        let t_map = &thread_to_global[t];
+        for (key, lat) in t_records {
+            let (h_idx, local_id) = (key >> 12, (key & 0xFFF) as usize);
+            let global_ep_id = t_map[local_id] as u64;
+            packed.push(((h_idx as u64) << 48) | (global_ep_id << 32) | (lat as u64));
+        }
+    }
+
+    // Sort all records: groups automatically by hour asc, endpoint asc, latency asc
+    packed.sort_unstable();
+    let packed_len = packed.len();
+
+    // Iterate through contiguous (hour, global_ep_id) groups and output
+    let hour_strings = build_hour_strings();
+    let mut out = Vec::with_capacity(32 * 1024);
+    let mut p_idx = 0;
+    while p_idx < packed_len {
+        let group_start = p_idx;
+        let prefix = packed[group_start] >> 32;
+        let (h_idx, global_ep_id) = ((prefix >> 16) as usize, (prefix & 0xFFFF) as usize);
+        while p_idx < packed_len && (packed[p_idx] >> 32) == prefix {
+            p_idx += 1;
+        }
+        let group_end = p_idx;
+        let count = group_end - group_start;
+
+        let r50 = (50 * count + 99) / 100 - 1;
+        let r95 = (95 * count + 99) / 100 - 1;
+        let r99 = (99 * count + 99) / 100 - 1;
+        let p50 = (packed[group_start + r50] & 0xFFFFFFFF) as u32;
+        let p95 = (packed[group_start + r95] & 0xFFFFFFFF) as u32;
+        let p99 = (packed[group_start + r99] & 0xFFFFFFFF) as u32;
+
+        let target_gid = h_idx * num_global_eps + global_ep_id;
+        let errors = global_errors[target_gid] as u64;
+        let err_ppm = (errors * 1_000_000) / (count as u64);
+
+        out.extend_from_slice(&hour_strings[h_idx]); out.push(b' ');
+        out.extend_from_slice(&global_endpoints[global_ep_id]); out.push(b' ');
+        append_u64(&mut out, count as u64); out.push(b' ');
+        append_u64(&mut out, p50 as u64); out.push(b' ');
+        append_u64(&mut out, p95 as u64); out.push(b' ');
+        append_u64(&mut out, p99 as u64); out.push(b' ');
+        append_u64(&mut out, errors); out.push(b' ');
+        append_u64(&mut out, err_ppm); out.push(b'\n');
     }
 
     let _ = std::fs::create_dir_all(&out_dir);
     if let Ok(mut f) = File::create(&out_path) {
-        for sh in sort_handles { let _ = f.write_all(&sh.join().unwrap()); }
+        let _ = f.write_all(&out);
     }
 }
