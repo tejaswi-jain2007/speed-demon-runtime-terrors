@@ -78,7 +78,7 @@ fn parse_csv_chunk(rec_data: &[u8], start: usize, end: usize, rlookup: &[u8], lo
     let mut p = start;
     let mut last_evict = start;
     while p < end {
-        if p - last_evict >= 2 * 1024 * 1024 {
+        if p - last_evict >= 256 * 1024 {
             unsafe { madvise_dontneed(rec_data.as_ptr().add(last_evict), p - last_evict); }
             last_evict = p;
         }

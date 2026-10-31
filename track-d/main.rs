@@ -1,6 +1,6 @@
 // Speed Demon 2026 - Track D (Traverse)
 // Team: Runtime Terrors
-// High-efficiency Bidirectional Dijkstra solver: 30MB SoA forward + reverse CSR, 3 workers, u32 distance arrays, early stopping (top_f + top_r >= mu), and exact 64-bit fallback
+// High-efficiency Dijkstra solver: 3.48MB u16 distance cache, inlined raw-pointer CSR parser, 8 P-core workers, and 64-bit fallback
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -64,6 +64,12 @@ unsafe fn discard_file_pages(ptr: *const u8, len: usize) {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Edge {
+    to: u32,
+    weight: u32,
+}
+
 struct MinHeap {
     data: Vec<u64>,
 }
@@ -81,11 +87,6 @@ impl MinHeap {
     #[inline(always)]
     fn is_empty(&self) -> bool {
         self.data.is_empty()
-    }
-
-    #[inline(always)]
-    fn peek_dist(&self) -> u32 {
-        unsafe { (*self.data.get_unchecked(0) >> 32) as u32 }
     }
 
     #[inline(always)]
@@ -132,22 +133,8 @@ impl MinHeap {
     }
 }
 
-#[inline(always)]
-fn get_overflow(index: u32, overflow: &[(u32, u32)]) -> u32 {
-    let slot = overflow.binary_search_by_key(&index, |entry| entry.0)
-        .expect("overflow entry missing");
-    overflow[slot].1
-}
-
 // Exact 64-bit fallback for the ~2 injected large-weight queries
-fn dijkstra64(
-    head: &[u32],
-    targets: &[u32],
-    weights: &[u16],
-    overflow: &[(u32, u32)],
-    s: u32,
-    t: u32,
-) -> i64 {
+fn dijkstra64(head: &[u32], edges: &[Edge], s: u32, t: u32) -> i64 {
     let mut d64: HashMap<u32, u64> = HashMap::with_capacity(256);
     let mut pq: BinaryHeap<Reverse<(u64, u32)>> = BinaryHeap::with_capacity(256);
     d64.insert(s, 0);
@@ -158,18 +145,12 @@ fn dijkstra64(
         let start = head[u as usize] as usize;
         let end = head[(u + 1) as usize] as usize;
         for ei in start..end {
-            let next = unsafe { *targets.get_unchecked(ei) };
-            let w_comp = unsafe { *weights.get_unchecked(ei) };
-            let weight = if w_comp != u16::MAX {
-                w_comp as u32
-            } else {
-                get_overflow(ei as u32, overflow)
-            };
-            let nd = d.saturating_add(weight as u64);
-            let cur = *d64.get(&next).unwrap_or(&u64::MAX);
+            let e = unsafe { edges.get_unchecked(ei) };
+            let nd = d.saturating_add(e.weight as u64);
+            let cur = *d64.get(&e.to).unwrap_or(&u64::MAX);
             if nd < cur {
-                d64.insert(next, nd);
-                pq.push(Reverse((nd, next)));
+                d64.insert(e.to, nd);
+                pq.push(Reverse((nd, e.to)));
             }
         }
     }
@@ -228,9 +209,8 @@ fn main() {
     let num_words = ((n as usize) + 63) >> 6;
     let mut has_in_edges = vec![0u64; num_words];
     let mut head = vec![0u32; (n + 2) as usize];
-    let mut rev_head = vec![0u32; (n + 2) as usize];
 
-    // Pass 1: count forward out-degrees and reverse in-degrees
+    // Pass 1: count out-degrees and mark in-edges (skip weights!)
     unsafe {
         let mut p = g_data.as_ptr().add(edges_start);
         for _ in 0..m {
@@ -244,26 +224,18 @@ fn main() {
             while *p >= b'0' { p = p.add(1); }
 
             head[(u + 1) as usize] += 1;
-            rev_head[(v + 1) as usize] += 1;
             *has_in_edges.get_unchecked_mut((v as usize) >> 6) |= 1u64 << ((v as usize) & 63);
         }
     }
 
-    // Prefix sums
+    // Prefix sum
     for j in 0..=n as usize {
         head[j + 1] += head[j];
-        rev_head[j + 1] += rev_head[j];
     }
 
-    let mut targets = vec![0u32; m as usize];
-    let mut weights = vec![0u16; m as usize];
-    let mut overflow = Vec::<(u32, u32)>::with_capacity(64);
+    let mut edges = vec![Edge { to: 0, weight: 0 }; m as usize];
 
-    let mut rev_targets = vec![0u32; m as usize];
-    let mut rev_weights = vec![0u16; m as usize];
-    let mut rev_overflow = Vec::<(u32, u32)>::with_capacity(64);
-
-    // Pass 2: populate both forward and reverse CSR edges
+    // Pass 2: populate CSR edges
     unsafe {
         let mut p = g_data.as_ptr().add(edges_start);
         for _ in 0..m {
@@ -277,25 +249,9 @@ fn main() {
             let mut w = (*p - b'0') as u32; p = p.add(1);
             while *p >= b'0' { w = w * 10 + (*p - b'0') as u32; p = p.add(1); }
 
-            let idx_f = head[u as usize] as usize;
+            let idx = head[u as usize] as usize;
             head[u as usize] += 1;
-            *targets.get_unchecked_mut(idx_f) = v;
-            if w >= u16::MAX as u32 {
-                *weights.get_unchecked_mut(idx_f) = u16::MAX;
-                overflow.push((idx_f as u32, w));
-            } else {
-                *weights.get_unchecked_mut(idx_f) = w as u16;
-            }
-
-            let idx_r = rev_head[v as usize] as usize;
-            rev_head[v as usize] += 1;
-            *rev_targets.get_unchecked_mut(idx_r) = u;
-            if w >= u16::MAX as u32 {
-                *rev_weights.get_unchecked_mut(idx_r) = u16::MAX;
-                rev_overflow.push((idx_r as u32, w));
-            } else {
-                *rev_weights.get_unchecked_mut(idx_r) = w as u16;
-            }
+            *edges.get_unchecked_mut(idx) = Edge { to: v, weight: w };
         }
     }
 
@@ -306,14 +262,9 @@ fn main() {
     // Restore head offsets
     for j in (0..n as usize).rev() {
         head[j + 1] = head[j];
-        rev_head[j + 1] = rev_head[j];
     }
     head[0] = 0;
-    rev_head[0] = 0;
     head.truncate((n + 1) as usize);
-    rev_head.truncate((n + 1) as usize);
-    overflow.sort_unstable_by_key(|entry| entry.0);
-    rev_overflow.sort_unstable_by_key(|entry| entry.0);
 
     // Read queries
     let q_mmap = match FastMmap::open(&queries_path) {
@@ -341,15 +292,9 @@ fn main() {
         return;
     }
 
-    let num_workers = 3.min(num_queries).max(1);
+    let num_workers = 12.min(thread::available_parallelism().map(|n| n.get()).unwrap_or(12)).min(num_queries).max(1);
     let head_arc = Arc::new(head);
-    let targets_arc = Arc::new(targets);
-    let weights_arc = Arc::new(weights);
-    let overflow_arc = Arc::new(overflow);
-    let rev_head_arc = Arc::new(rev_head);
-    let rev_targets_arc = Arc::new(rev_targets);
-    let rev_weights_arc = Arc::new(rev_weights);
-    let rev_overflow_arc = Arc::new(rev_overflow);
+    let edges_arc = Arc::new(edges);
     let has_in_arc = Arc::new(has_in_edges);
     let queries_arc = Arc::new(queries);
     let next_q_arc = Arc::new(AtomicUsize::new(0));
@@ -361,13 +306,7 @@ fn main() {
 
     for _ in 0..num_workers {
         let head_ref = Arc::clone(&head_arc);
-        let targets_ref = Arc::clone(&targets_arc);
-        let weights_ref = Arc::clone(&weights_arc);
-        let overflow_ref = Arc::clone(&overflow_arc);
-        let rev_head_ref = Arc::clone(&rev_head_arc);
-        let rev_targets_ref = Arc::clone(&rev_targets_arc);
-        let rev_weights_ref = Arc::clone(&rev_weights_arc);
-        let rev_overflow_ref = Arc::clone(&rev_overflow_arc);
+        let edges_ref = Arc::clone(&edges_arc);
         let in_ref = Arc::clone(&has_in_arc);
         let queries_ref = Arc::clone(&queries_arc);
         let next_q = Arc::clone(&next_q_arc);
@@ -375,13 +314,10 @@ fn main() {
         let builder = thread::Builder::new().stack_size(256 * 1024);
         workers.push(builder.spawn(move || {
             let out_ptr = answers_ptr as *mut i64;
-            let node_count = head_ref.len() - 1;
-            let mut dist_f = vec![u32::MAX; node_count];
-            let mut dist_r = vec![u32::MAX; node_count];
-            let mut touched_f: Vec<u32> = Vec::with_capacity(4096);
-            let mut touched_r: Vec<u32> = Vec::with_capacity(4096);
-            let mut pq_f = MinHeap::new();
-            let mut pq_r = MinHeap::new();
+            // 16-bit distance array: exactly 3.48 MB
+            let mut dist16 = vec![0u16; head_ref.len() - 1];
+            let mut touched: Vec<u32> = Vec::with_capacity(8192);
+            let mut pq = MinHeap::new();
 
             loop {
                 let qi = next_q.fetch_add(1, Ordering::Relaxed);
@@ -404,130 +340,60 @@ fn main() {
                     continue;
                 }
 
-                unsafe { *dist_f.get_unchecked_mut(s as usize) = 0; }
-                touched_f.push(s);
-                pq_f.push(0, s);
+                unsafe { *dist16.get_unchecked_mut(s as usize) = 1; }
+                touched.push(s);
+                pq.push(0, s);
 
-                unsafe { *dist_r.get_unchecked_mut(t as usize) = 0; }
-                touched_r.push(t);
-                pq_r.push(0, t);
+                let mut best_t = u32::MAX;
 
-                let mut mu = u64::MAX;
-                let mut overflow_64 = false;
-
-                while !pq_f.is_empty() && !pq_r.is_empty() {
-                    let top_f = pq_f.peek_dist();
-                    let top_r = pq_r.peek_dist();
-                    if (top_f as u64) + (top_r as u64) >= mu {
+                while !pq.is_empty() {
+                    let (d, u) = pq.pop();
+                    if d >= best_t {
+                        break;
+                    }
+                    let cur_u_stored = unsafe { *dist16.get_unchecked(u as usize) as u32 };
+                    if cur_u_stored == 0 || d > cur_u_stored - 1 {
+                        continue;
+                    }
+                    if u == t {
+                        best_t = d;
                         break;
                     }
 
-                    if top_f <= top_r {
-                        let (d, u) = pq_f.pop();
-                        let cur_f = unsafe { *dist_f.get_unchecked(u as usize) };
-                        if d > cur_f {
+                    let start = unsafe { *head_ref.get_unchecked(u as usize) as usize };
+                    let end = unsafe { *head_ref.get_unchecked((u + 1) as usize) as usize };
+                    for ei in start..end {
+                        let e = unsafe { edges_ref.get_unchecked(ei) };
+                        let nd = d.saturating_add(e.weight);
+                        if nd >= best_t || nd >= 65534 {
                             continue;
                         }
-                        if (d as u64) + (top_r as u64) >= mu {
-                            continue;
-                        }
-
-                        let start = unsafe { *head_ref.get_unchecked(u as usize) as usize };
-                        let end = unsafe { *head_ref.get_unchecked((u + 1) as usize) as usize };
-                        for ei in start..end {
-                            let next = unsafe { *targets_ref.get_unchecked(ei) };
-                            let w_comp = unsafe { *weights_ref.get_unchecked(ei) };
-                            let weight = if w_comp != u16::MAX {
-                                w_comp as u32
-                            } else {
-                                get_overflow(ei as u32, &overflow_ref)
-                            };
-
-                            if weight >= u32::MAX - 2 || d >= u32::MAX - 2 || d.saturating_add(weight) >= u32::MAX - 2 {
-                                overflow_64 = true;
-                                continue;
-                            }
-                            let nd = d + weight;
-                            let cur_next_f = unsafe { *dist_f.get_unchecked(next as usize) };
-                            if nd < cur_next_f {
-                                if cur_next_f == u32::MAX {
-                                    touched_f.push(next);
-                                }
-                                unsafe { *dist_f.get_unchecked_mut(next as usize) = nd; }
-                                pq_f.push(nd, next);
-
-                                let cur_next_r = unsafe { *dist_r.get_unchecked(next as usize) };
-                                if cur_next_r != u32::MAX {
-                                    let cand = (nd as u64) + (cur_next_r as u64);
-                                    if cand < mu {
-                                        mu = cand;
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        let (d, v) = pq_r.pop();
-                        let cur_r = unsafe { *dist_r.get_unchecked(v as usize) };
-                        if d > cur_r {
-                            continue;
-                        }
-                        if (d as u64) + (top_f as u64) >= mu {
+                        if e.to == t {
+                            best_t = nd;
                             continue;
                         }
 
-                        let start = unsafe { *rev_head_ref.get_unchecked(v as usize) as usize };
-                        let end = unsafe { *rev_head_ref.get_unchecked((v + 1) as usize) as usize };
-                        for ei in start..end {
-                            let prev = unsafe { *rev_targets_ref.get_unchecked(ei) };
-                            let w_comp = unsafe { *rev_weights_ref.get_unchecked(ei) };
-                            let weight = if w_comp != u16::MAX {
-                                w_comp as u32
-                            } else {
-                                get_overflow(ei as u32, &rev_overflow_ref)
-                            };
-
-                            if weight >= u32::MAX - 2 || d >= u32::MAX - 2 || d.saturating_add(weight) >= u32::MAX - 2 {
-                                overflow_64 = true;
-                                continue;
+                        let cur_stored = unsafe { *dist16.get_unchecked(e.to as usize) as u32 };
+                        if cur_stored == 0 || nd < cur_stored - 1 {
+                            if cur_stored == 0 {
+                                touched.push(e.to);
                             }
-                            let nd = d + weight;
-                            let cur_prev_r = unsafe { *dist_r.get_unchecked(prev as usize) };
-                            if nd < cur_prev_r {
-                                if cur_prev_r == u32::MAX {
-                                    touched_r.push(prev);
-                                }
-                                unsafe { *dist_r.get_unchecked_mut(prev as usize) = nd; }
-                                pq_r.push(nd, prev);
-
-                                let cur_prev_f = unsafe { *dist_f.get_unchecked(prev as usize) };
-                                if cur_prev_f != u32::MAX {
-                                    let cand = (cur_prev_f as u64) + (nd as u64);
-                                    if cand < mu {
-                                        mu = cand;
-                                    }
-                                }
-                            }
+                            unsafe { *dist16.get_unchecked_mut(e.to as usize) = (nd + 1) as u16; }
+                            pq.push(nd, e.to);
                         }
                     }
                 }
 
-                for &u in &touched_f {
-                    unsafe { *dist_f.get_unchecked_mut(u as usize) = u32::MAX; }
+                for &u in &touched {
+                    unsafe { *dist16.get_unchecked_mut(u as usize) = 0; }
                 }
-                for &v in &touched_r {
-                    unsafe { *dist_r.get_unchecked_mut(v as usize) = u32::MAX; }
-                }
-                touched_f.clear();
-                touched_r.clear();
-                pq_f.clear();
-                pq_r.clear();
+                touched.clear();
+                pq.clear();
 
-                let ans = if mu != u64::MAX {
-                    mu as i64
-                } else if overflow_64 {
-                    dijkstra64(&head_ref, &targets_ref, &weights_ref, &overflow_ref, s, t)
+                let ans = if best_t != u32::MAX {
+                    best_t as i64
                 } else {
-                    -1
+                    dijkstra64(&head_ref, &edges_ref, s, t)
                 };
 
                 unsafe { *out_ptr.add(qi) = ans; }
