@@ -287,7 +287,7 @@ fn main() {
     }
     drop(r_mmap);
 
-    let rec_mmap = match FastMmap::open(&rec_path, true) { Some(m) => m, None => return };
+    let rec_mmap = match FastMmap::open(&rec_path, false) { Some(m) => m, None => return };
     let rec_data = rec_mmap.as_slice();
     let rec_size = rec_data.len();
 

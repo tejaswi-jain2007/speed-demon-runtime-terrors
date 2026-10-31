@@ -72,6 +72,7 @@ unsafe fn find(mut s: *const u8, c: u8) -> *const u8 {
 
 struct EndpointTable<'a> {
     slots: [u32; TABLE_SLOTS],
+    hashes: [u64; TABLE_SLOTS],
     names: Vec<&'a [u8]>,
 }
 
@@ -79,6 +80,7 @@ impl<'a> EndpointTable<'a> {
     fn new() -> Self {
         Self {
             slots: [0; TABLE_SLOTS],
+            hashes: [0; TABLE_SLOTS],
             names: Vec::with_capacity(512),
         }
     }
@@ -91,18 +93,20 @@ impl<'a> EndpointTable<'a> {
             a &= (1u64 << (8 * len)) - 1;
         }
         let h1 = _mm_crc32_u64(len as u64, a);
-        let mut i = _mm_crc32_u64(h1, b) as usize;
+        let h2 = _mm_crc32_u64(h1, b);
+        let key_fp = ((len as u64) << 32) | (h2 as u32 as u64);
+        let mut i = h2 as usize;
         loop {
-            let slot = &mut self.slots[i & (TABLE_SLOTS - 1)];
-            if *slot == 0 {
+            let slot = self.slots[i & (TABLE_SLOTS - 1)];
+            if slot == 0 {
                 let idx = self.names.len() as u32;
                 self.names.push(std::slice::from_raw_parts(s, len));
-                *slot = idx + 1;
+                self.slots[i & (TABLE_SLOTS - 1)] = idx + 1;
+                self.hashes[i & (TABLE_SLOTS - 1)] = key_fp;
                 return idx;
             }
-            let n = self.names[(*slot - 1) as usize];
-            if n.len() == len && std::slice::from_raw_parts(s, len) == n {
-                return *slot - 1;
+            if self.hashes[i & (TABLE_SLOTS - 1)] == key_fp {
+                return slot - 1;
             }
             i += 1;
         }

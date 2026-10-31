@@ -435,7 +435,7 @@ fn main() {
         workers.push(std::thread::Builder::new().spawn(move || {
             let out_ptr = answers_ptr as *mut i64;
             // 2MB L3-resident map per worker
-            let mut map = SmallMap::new(1 << 16);
+            let mut map = SmallMap::new(1 << 17);
             let mut touched: Vec<u32> = Vec::with_capacity(4096);
             let mut pq_fwd = Heap4Fast::new();
             let mut pq_bwd = Heap4Fast::new();
