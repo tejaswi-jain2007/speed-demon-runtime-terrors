@@ -1,15 +1,11 @@
-// Speed Demon 2026 - Track D (Traverse) - Ultra High Performance
-// Team: Runtime Terrors
-// Parallel 16-thread CSR loader, 16-core zero-overhead Dijkstra pool, single-instruction distance relaxation, zero-allocation exit
-
+// Speed Demon 2026 - Track D (Traverse) - High Performance Packed Bidirectional Dijkstra
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::thread;
 
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
@@ -34,7 +30,6 @@ struct FastMmap {
     len: usize,
     _file: File,
 }
-
 unsafe impl Send for FastMmap {}
 unsafe impl Sync for FastMmap {}
 
@@ -54,7 +49,6 @@ impl FastMmap {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
-
 impl Drop for FastMmap {
     fn drop(&mut self) {
         unsafe { munmap(self.ptr as *mut u8, self.len); }
@@ -87,24 +81,16 @@ struct SyncEdges(*mut Edge);
 unsafe impl Send for SyncEdges {}
 unsafe impl Sync for SyncEdges {}
 
-struct MinHeap {
+struct Heap4 {
     data: Vec<u64>,
 }
 
-impl MinHeap {
+impl Heap4 {
     fn new() -> Self {
-        MinHeap { data: Vec::with_capacity(8192) }
+        Heap4 { data: Vec::with_capacity(8192) }
     }
-
-    #[inline(always)]
-    fn clear(&mut self) {
-        self.data.clear();
-    }
-
-    #[inline(always)]
-    fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
+    #[inline(always)] fn clear(&mut self) { self.data.clear(); }
+    #[inline(always)] fn is_empty(&self) -> bool { self.data.is_empty() }
 
     #[inline(always)]
     fn push(&mut self, dist: u32, u: u32) {
@@ -112,14 +98,12 @@ impl MinHeap {
         let mut idx = self.data.len();
         self.data.push(0);
         while idx > 0 {
-            let parent = (idx - 1) >> 1;
+            let parent = (idx - 1) >> 2;
             let p_val = unsafe { *self.data.get_unchecked(parent) };
             if val < p_val {
                 unsafe { *self.data.get_unchecked_mut(idx) = p_val; }
                 idx = parent;
-            } else {
-                break;
-            }
+            } else { break; }
         }
         unsafe { *self.data.get_unchecked_mut(idx) = val; }
     }
@@ -131,18 +115,32 @@ impl MinHeap {
         if !self.data.is_empty() {
             let mut idx = 0;
             let len = self.data.len();
-            while (idx << 1) + 1 < len {
-                let mut child = (idx << 1) + 1;
-                let right = child + 1;
-                if right < len && unsafe { *self.data.get_unchecked(right) < *self.data.get_unchecked(child) } {
-                    child = right;
+            loop {
+                let first_child = (idx << 2) + 1;
+                if first_child >= len { break; }
+                let mut best_child = first_child;
+                let mut best_val = unsafe { *self.data.get_unchecked(first_child) };
+
+                let c2 = first_child + 1;
+                if c2 < len {
+                    let v2 = unsafe { *self.data.get_unchecked(c2) };
+                    if v2 < best_val { best_val = v2; best_child = c2; }
                 }
-                if unsafe { *self.data.get_unchecked(child) < last } {
-                    unsafe { *self.data.get_unchecked_mut(idx) = *self.data.get_unchecked(child); }
-                    idx = child;
-                } else {
-                    break;
+                let c3 = first_child + 2;
+                if c3 < len {
+                    let v3 = unsafe { *self.data.get_unchecked(c3) };
+                    if v3 < best_val { best_val = v3; best_child = c3; }
                 }
+                let c4 = first_child + 3;
+                if c4 < len {
+                    let v4 = unsafe { *self.data.get_unchecked(c4) };
+                    if v4 < best_val { best_val = v4; best_child = c4; }
+                }
+
+                if best_val < last {
+                    unsafe { *self.data.get_unchecked_mut(idx) = best_val; }
+                    idx = best_child;
+                } else { break; }
             }
             unsafe { *self.data.get_unchecked_mut(idx) = last; }
         }
@@ -150,7 +148,6 @@ impl MinHeap {
     }
 }
 
-// 64-bit fallback for rare large-weight queries
 fn dijkstra64(head: &[u32], edges: &[Edge], s: u32, t: u32) -> i64 {
     let mut d64: HashMap<u32, u64> = HashMap::with_capacity(256);
     let mut pq: BinaryHeap<Reverse<(u64, u32)>> = BinaryHeap::with_capacity(256);
@@ -177,30 +174,19 @@ fn dijkstra64(head: &[u32], edges: &[Edge], s: u32, t: u32) -> i64 {
 fn main() {
     let mut data_dir = String::from("/data");
     let mut out_dir = String::from("/out");
-
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
-        if args[i] == "--data" && i + 1 < args.len() {
-            data_dir = args[i + 1].clone();
-            i += 2;
-        } else if args[i] == "--out" && i + 1 < args.len() {
-            out_dir = args[i + 1].clone();
-            i += 2;
-        } else {
-            i += 1;
-        }
+        if args[i] == "--data" && i + 1 < args.len() { data_dir = args[i + 1].clone(); i += 2; }
+        else if args[i] == "--out" && i + 1 < args.len() { out_dir = args[i + 1].clone(); i += 2; }
+        else { i += 1; }
     }
 
     let graph_path = format!("{}/graph.txt", data_dir);
     let queries_path = format!("{}/queries.txt", data_dir);
     let out_path = format!("{}/distances.txt", out_dir);
 
-    // 1. Read graph.txt in parallel
-    let g_mmap = match FastMmap::open(&graph_path) {
-        Some(m) => m,
-        None => return,
-    };
+    let g_mmap = match FastMmap::open(&graph_path) { Some(m) => m, None => return };
     let g_data = g_mmap.as_slice();
 
     let mut n = 0u32;
@@ -216,24 +202,20 @@ fn main() {
     let mut bounds = vec![edges_start; num_load_threads + 1];
     for t in 1..num_load_threads {
         let mut target = edges_start + t * chunk_size;
-        while target < g_data.len() && g_data[target - 1] != b'\n' {
-            target += 1;
-        }
+        while target < g_data.len() && g_data[target - 1] != b'\n' { target += 1; }
         bounds[t] = target;
     }
     bounds[num_load_threads] = g_data.len();
 
-    let num_words = ((n as usize) + 63) >> 6;
-    let has_in_edges = (0..num_words).map(|_| AtomicU64::new(0)).collect::<Vec<_>>();
     let head = (0..=(n + 1)).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
+    let rev_head = (0..=(n + 1)).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
 
-    // Pass 1: degree counting and incoming edge flags
-    thread::scope(|s| {
+    std::thread::scope(|s| {
         for t in 0..num_load_threads {
             let start = bounds[t];
             let end = bounds[t + 1];
-            let head_ref = &head;
-            let in_ref = &has_in_edges;
+            let h_ref = &head;
+            let rh_ref = &rev_head;
             s.spawn(move || {
                 let mut p = unsafe { g_data.as_ptr().add(start) };
                 let end_p = unsafe { g_data.as_ptr().add(end) };
@@ -248,32 +230,37 @@ fn main() {
                     while unsafe { *p } != b'\n' { p = unsafe { p.add(1) }; }
                     p = unsafe { p.add(1) };
 
-                    head_ref[(u + 1) as usize].fetch_add(1, Ordering::Relaxed);
-                    in_ref[(v as usize) >> 6].fetch_or(1u64 << ((v as usize) & 63), Ordering::Relaxed);
+                    h_ref[(u + 1) as usize].fetch_add(1, Ordering::Relaxed);
+                    rh_ref[(v + 1) as usize].fetch_add(1, Ordering::Relaxed);
                 }
             });
         }
     });
 
-    // Prefix sum in-place
-    let mut current_offset = 0u32;
+    let mut cur_fwd = 0u32;
+    let mut cur_rev = 0u32;
     for i in 0..=n as usize {
-        let deg = head[i + 1].load(Ordering::Relaxed);
-        head[i].store(current_offset, Ordering::Relaxed);
-        current_offset += deg;
+        let deg_f = head[i + 1].load(Ordering::Relaxed);
+        let deg_r = rev_head[i + 1].load(Ordering::Relaxed);
+        head[i].store(cur_fwd, Ordering::Relaxed);
+        rev_head[i].store(cur_rev, Ordering::Relaxed);
+        cur_fwd += deg_f;
+        cur_rev += deg_r;
     }
-    head[(n + 1) as usize].store(current_offset, Ordering::Relaxed);
+    head[(n + 1) as usize].store(cur_fwd, Ordering::Relaxed);
+    rev_head[(n + 1) as usize].store(cur_rev, Ordering::Relaxed);
 
     let mut edges = vec![Edge { to: 0, weight: 0 }; m as usize];
-    let edges_ptr = SyncEdges(edges.as_mut_ptr());
+    let mut rev_edges = vec![Edge { to: 0, weight: 0 }; m as usize];
+    let ep = SyncEdges(edges.as_mut_ptr());
+    let rep = SyncEdges(rev_edges.as_mut_ptr());
 
-    // Pass 2: populate CSR edges concurrently
-    thread::scope(|s| {
+    std::thread::scope(|s| {
         for t in 0..num_load_threads {
             let start = bounds[t];
             let end = bounds[t + 1];
-            let head_ref = &head;
-            let ep = edges_ptr;
+            let h_ref = &head;
+            let rh_ref = &rev_head;
             s.spawn(move || {
                 let mut p = unsafe { g_data.as_ptr().add(start) };
                 let end_p = unsafe { g_data.as_ptr().add(end) };
@@ -288,44 +275,40 @@ fn main() {
                     while unsafe { *p } <= b' ' { p = unsafe { p.add(1) }; }
                     let mut w = unsafe { (*p - b'0') as u32 }; p = unsafe { p.add(1) };
                     while unsafe { *p } >= b'0' { w = w * 10 + unsafe { (*p - b'0') as u32 }; p = unsafe { p.add(1) }; }
-                    while unsafe { *p } != b'\n' && p < end_p { p = unsafe { p.add(1) }; }
+                    while unsafe { *p } != b'\n' { p = unsafe { p.add(1) }; }
                     p = unsafe { p.add(1) };
 
-                    let slot = head_ref[u as usize].fetch_add(1, Ordering::Relaxed) as usize;
-                    unsafe { *ep.0.add(slot) = Edge { to: v, weight: w }; }
+                    let slot = h_ref[u as usize].fetch_add(1, Ordering::Relaxed) as usize;
+                    let rslot = rh_ref[v as usize].fetch_add(1, Ordering::Relaxed) as usize;
+                    unsafe {
+                        *ep.0.add(slot) = Edge { to: v, weight: w };
+                        *rep.0.add(rslot) = Edge { to: u, weight: w };
+                    }
                 }
             });
         }
     });
 
-    unsafe { discard_file_pages(g_data.as_ptr(), g_data.len()); }
-    drop(g_mmap);
-
-    // Restore head offsets
     let mut final_head = vec![0u32; (n + 2) as usize];
-    final_head[0] = 0;
+    let mut final_rev_head = vec![0u32; (n + 2) as usize];
+    final_head[0] = 0; final_rev_head[0] = 0;
     for j in 0..n as usize {
         final_head[j + 1] = head[j].load(Ordering::Relaxed);
+        final_rev_head[j + 1] = rev_head[j].load(Ordering::Relaxed);
     }
-    final_head[(n + 1) as usize] = current_offset;
-    drop(head);
+    final_head[(n + 1) as usize] = cur_fwd;
+    final_rev_head[(n + 1) as usize] = cur_rev;
+    unsafe { discard_file_pages(g_data.as_ptr(), g_data.len()); }
+    drop(head); drop(rev_head); drop(g_mmap);
 
-    let in_bits = has_in_edges.into_iter().map(|a| a.load(Ordering::Relaxed)).collect::<Vec<_>>();
-
-    // 2. Read queries
-    let q_mmap = match FastMmap::open(&queries_path) {
-        Some(m) => m,
-        None => return,
-    };
+    let q_mmap = match FastMmap::open(&queries_path) { Some(m) => m, None => return };
     let q_data = q_mmap.as_slice();
-    let q_size = q_data.len();
-    let mut queries = Vec::with_capacity(2048);
+    let mut queries = Vec::new();
     let mut qp = 0;
-    while qp < q_size {
-        let mut s = 0u32;
-        let mut t = 0u32;
+    while qp < q_data.len() {
+        let mut s = 0u32; let mut t = 0u32;
         qp = parse_u32(q_data, qp, &mut s);
-        if qp >= q_size { break; }
+        if qp >= q_data.len() { break; }
         qp = parse_u32(q_data, qp, &mut t);
         queries.push((s, t));
     }
@@ -338,31 +321,33 @@ fn main() {
         return;
     }
 
-    let num_workers = 16.min(num_queries).max(1);
+    let num_workers = 6.min(num_queries).max(1);
     let head_arc = Arc::new(final_head);
+    let rhead_arc = Arc::new(final_rev_head);
     let edges_arc = Arc::new(edges);
-    let in_arc = Arc::new(in_bits);
+    let redges_arc = Arc::new(rev_edges);
     let queries_arc = Arc::new(queries);
     let next_q_arc = Arc::new(AtomicUsize::new(0));
 
     let mut all_answers = vec![0i64; num_queries];
     let answers_ptr = all_answers.as_mut_ptr() as usize;
-
     let mut workers = Vec::with_capacity(num_workers);
 
     for _ in 0..num_workers {
         let head_ref = Arc::clone(&head_arc);
+        let rhead_ref = Arc::clone(&rhead_arc);
         let edges_ref = Arc::clone(&edges_arc);
-        let in_ref = Arc::clone(&in_arc);
+        let redges_ref = Arc::clone(&redges_arc);
         let queries_ref = Arc::clone(&queries_arc);
         let next_q = Arc::clone(&next_q_arc);
 
-        let builder = thread::Builder::new().stack_size(256 * 1024);
+        let builder = std::thread::Builder::new().stack_size(256 * 1024);
         workers.push(builder.spawn(move || {
             let out_ptr = answers_ptr as *mut i64;
-            let mut dist16 = vec![u16::MAX; head_ref.len() - 1];
+            let mut dist = vec![!0u32; head_ref.len() - 1];
             let mut touched: Vec<u32> = Vec::with_capacity(8192);
-            let mut pq = MinHeap::new();
+            let mut pq_fwd = Heap4::new();
+            let mut pq_bwd = Heap4::new();
 
             loop {
                 let qi = next_q.fetch_add(1, Ordering::Relaxed);
@@ -374,68 +359,98 @@ fn main() {
                     continue;
                 }
 
-                let t_has_in = (unsafe { *in_ref.get_unchecked((t as usize) >> 6) } & (1u64 << ((t as usize) & 63))) != 0;
-                let s_begin = unsafe { *head_ref.get_unchecked(s as usize) };
-                let s_end = unsafe { *head_ref.get_unchecked((s + 1) as usize) };
-                if !t_has_in || s_begin == s_end {
+                let s_out = unsafe { *head_ref.get_unchecked(s as usize) < *head_ref.get_unchecked((s + 1) as usize) };
+                let t_in = unsafe { *rhead_ref.get_unchecked(t as usize) < *rhead_ref.get_unchecked((t + 1) as usize) };
+                if !s_out || !t_in {
                     unsafe { *out_ptr.add(qi) = -1; }
                     continue;
                 }
 
-                unsafe { *dist16.get_unchecked_mut(s as usize) = 0; }
+                dist[s as usize] = 0x0000_FFFF;
                 touched.push(s);
-                pq.push(0, s);
+                pq_fwd.push(0, s);
 
-                let mut best_t = u32::MAX;
-                let mut had_large_edge = false;
+                dist[t as usize] = (dist[t as usize] & 0xFFFF_0000) | 0x0000;
+                if dist[t as usize] == 0xFFFF_0000 { touched.push(t); }
+                pq_bwd.push(0, t);
 
-                while !pq.is_empty() {
-                    let (d, u) = pq.pop();
-                    if d >= best_t { break; }
-                    let cur_u_stored = unsafe { *dist16.get_unchecked(u as usize) as u32 };
-                    if d > cur_u_stored { continue; }
-                    if u == t {
-                        best_t = d;
-                        break;
-                    }
+                let mut best = u32::MAX;
+                let mut had_large = false;
 
-                    let start = unsafe { *head_ref.get_unchecked(u as usize) as usize };
-                    let end = unsafe { *head_ref.get_unchecked((u + 1) as usize) as usize };
-                    for ei in start..end {
-                        let e = unsafe { edges_ref.get_unchecked(ei) };
-                        if e.weight >= 65534 {
-                            had_large_edge = true;
-                            continue;
+                while !pq_fwd.is_empty() && !pq_bwd.is_empty() {
+                    let top_f = (unsafe { *pq_fwd.data.get_unchecked(0) } >> 32) as u32;
+                    let top_b = (unsafe { *pq_bwd.data.get_unchecked(0) } >> 32) as u32;
+                    if top_f.saturating_add(top_b) >= best { break; }
+
+                    if pq_fwd.data.len() <= pq_bwd.data.len() {
+                        let (d, u) = pq_fwd.pop();
+                        if d >= best { break; }
+                        let cur = (dist[u as usize] >> 16) as u32;
+                        if d > cur { continue; }
+
+                        let start = unsafe { *head_ref.get_unchecked(u as usize) as usize };
+                        let end = unsafe { *head_ref.get_unchecked((u + 1) as usize) as usize };
+                        for ei in start..end {
+                            let e = unsafe { *edges_ref.get_unchecked(ei) };
+                            if e.weight >= 65534 { had_large = true; continue; }
+                            let nd = d + e.weight;
+                            if nd >= best || nd >= 65534 { continue; }
+
+                            let packed = dist[e.to as usize];
+                            let cur_fwd = (packed >> 16) as u16;
+                            let nd16 = nd as u16;
+                            if nd16 < cur_fwd {
+                                if packed == !0u32 { touched.push(e.to); }
+                                dist[e.to as usize] = ((nd16 as u32) << 16) | (packed & 0xFFFF);
+                                pq_fwd.push(nd, e.to);
+
+                                let bwd_d = packed as u16;
+                                if bwd_d != u16::MAX {
+                                    let total = nd + bwd_d as u32;
+                                    if total < best { best = total; }
+                                }
+                            }
                         }
-                        let nd = d + e.weight;
-                        if nd >= best_t || nd >= 65534 {
-                            if nd >= 65534 { had_large_edge = true; }
-                            continue;
-                        }
-                        if e.to == t {
-                            best_t = nd;
-                            continue;
-                        }
+                    } else {
+                        let (d, u) = pq_bwd.pop();
+                        if d >= best { break; }
+                        let cur = (dist[u as usize] & 0xFFFF) as u32;
+                        if d > cur { continue; }
 
-                        let cur_stored = unsafe { *dist16.get_unchecked(e.to as usize) };
-                        let nd16 = nd as u16;
-                        if nd16 < cur_stored {
-                            if cur_stored == u16::MAX { touched.push(e.to); }
-                            unsafe { *dist16.get_unchecked_mut(e.to as usize) = nd16; }
-                            pq.push(nd, e.to);
+                        let start = unsafe { *rhead_ref.get_unchecked(u as usize) as usize };
+                        let end = unsafe { *rhead_ref.get_unchecked((u + 1) as usize) as usize };
+                        for ei in start..end {
+                            let e = unsafe { *redges_ref.get_unchecked(ei) };
+                            if e.weight >= 65534 { had_large = true; continue; }
+                            let nd = d + e.weight;
+                            if nd >= best || nd >= 65534 { continue; }
+
+                            let packed = dist[e.to as usize];
+                            let cur_bwd = packed as u16;
+                            let nd16 = nd as u16;
+                            if nd16 < cur_bwd {
+                                if packed == !0u32 { touched.push(e.to); }
+                                dist[e.to as usize] = (packed & 0xFFFF_0000) | (nd16 as u32);
+                                pq_bwd.push(nd, e.to);
+
+                                let fwd_d = (packed >> 16) as u16;
+                                if fwd_d != u16::MAX {
+                                    let total = nd + fwd_d as u32;
+                                    if total < best { best = total; }
+                                }
+                            }
                         }
                     }
                 }
 
-                for &u in &touched {
-                    unsafe { *dist16.get_unchecked_mut(u as usize) = u16::MAX; }
-                }
+                for &u in &touched { dist[u as usize] = !0u32; }
                 touched.clear();
-                pq.clear();
+                pq_fwd.clear();
+                pq_bwd.clear();
 
-                let ans = if best_t != u32::MAX {
-                    best_t as i64
-                } else if had_large_edge {
+                let ans = if best != u32::MAX {
+                    best as i64
+                } else if had_large {
                     dijkstra64(&head_ref, &edges_ref, s, t)
                 } else {
                     -1
@@ -446,11 +461,8 @@ fn main() {
         }).unwrap());
     }
 
-    for w in workers {
-        w.join().unwrap();
-    }
+    for w in workers { w.join().unwrap(); }
 
-    // 3. Fast output generation
     let mut out_buffer = Vec::with_capacity(32 * 1024);
     for d in all_answers {
         if d < 0 {
