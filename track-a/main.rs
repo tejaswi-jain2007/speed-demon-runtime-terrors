@@ -78,6 +78,7 @@ struct Worker<'a> {
     big: Vec<Vec<(u32, u32)>>,
     region: *mut u8,
     used: usize,
+    reserved: usize,
 }
 unsafe impl<'a> Send for Worker<'a> {}
 unsafe impl<'a> Sync for Worker<'a> {}
@@ -88,12 +89,14 @@ impl<'a> Worker<'a> {
             endpoints: EndpointTable::new(),
             head: [std::ptr::null_mut(); HOURS],
             big: (0..HOURS).map(|_| Vec::new()).collect(),
-            region: std::ptr::null_mut(), used: 0,
+            region: std::ptr::null_mut(), used: 0, reserved: 0,
         }
     }
     unsafe fn parse(&mut self, mut p: *const u8, end: *const u8) {
         if p >= end { return; }
-        self.region = mmap(std::ptr::null_mut(), 8 * 1024 * 1024, 3, 0x22, -1, 0);
+        let reserve = 72 * std::mem::size_of::<Block>();
+        self.reserved = reserve;
+        self.region = mmap(std::ptr::null_mut(), reserve, 3, 0x22, -1, 0);
         if self.region == !0 as *mut u8 { std::process::exit(1); }
         while p < end {
             let day_idx = if *p.add(6) == b'0' { (*p.add(9) - b'0') as i32 } else { (*p.add(9) - b'0' + 1) as i32 };
@@ -111,6 +114,11 @@ impl<'a> Worker<'a> {
             if lat >= BIG { self.big[h].push((lat, key)); continue; }
             let b = &mut self.head[h];
             if (*b).is_null() || (*(*b)).n as usize == BLOCK_CAP {
+                if self.used + std::mem::size_of::<Block>() > self.reserved {
+                    let extra = 16 * std::mem::size_of::<Block>();
+                    let p = mmap(std::ptr::null_mut(), extra, 3, 0x22, -1, 0);
+                    if p != !0 as *mut u8 { self.region = p; self.used = 0; self.reserved = extra; }
+                }
                 let fresh = self.region.add(self.used) as *mut Block;
                 self.used += std::mem::size_of::<Block>();
                 (*fresh).next = *b; (*fresh).n = 0; *b = fresh;
@@ -243,9 +251,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let names_slice = &*n_ptr;
                 let ne = names_slice.len();
 
-                let mut count = [0u32; 1024];
-                let mut errors = [0u32; 1024];
-                let mut cursor = [0u32; 1024];
+                let mut count = vec![0u32; ne + 1];
+                let mut errors = vec![0u32; ne];
+                let mut cursor = vec![0u32; ne];
                 let mut lat: Vec<u32> = Vec::with_capacity(32768);
                 let mut line = [0u8; 512];
                 let mut thread_buf: Vec<u8> = Vec::with_capacity(32768);
@@ -253,8 +261,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 loop {
                     let h = next_h_ref.fetch_add(1, Ordering::Relaxed);
                     if h >= HOURS { break; }
-                    count[..=ne].fill(0);
-                    errors[..ne].fill(0);
+                    count.fill(0);
+                    errors.fill(0);
 
                     for wt in 0..NTHREADS {
                         let (w_item, r) = (&workers_slice[wt], &rank_slice[wt]);
@@ -273,7 +281,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     for e in 0..ne { count[e + 1] += count[e]; }
-                    cursor[..ne].copy_from_slice(&count[..ne]);
+                    cursor.copy_from_slice(&count[..ne]);
                     let total_lat = count[ne] as usize;
                     lat.clear();
                     if lat.capacity() < total_lat { lat.reserve(total_lat - lat.capacity()); }
@@ -288,7 +296,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let (rec, e) = (b_ref.rec[i], r[(b_ref.rec[i] & ID_MASK) as usize] as usize);
                                 lat[cursor[e] as usize] = rec >> KEY_BITS; cursor[e] += 1;
                             }
-                            b = b_ref.next;
+                            let next_b = b_ref.next;
+                            madvise(b as *mut u8, std::mem::size_of::<Block>(), 4);
+                            b = next_b;
                         }
                         for &(l, key) in &w_item.big[h] {
                             let e = r[(key & ID_MASK) as usize] as usize;

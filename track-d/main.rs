@@ -276,9 +276,6 @@ fn main() {
                     h_ref[(u + 1) as usize].fetch_add(1, Ordering::Relaxed);
                     rh_ref[(v + 1) as usize].fetch_add(1, Ordering::Relaxed);
                 }
-                let s = (start + 4095) & !4095;
-                let e = end & !4095;
-                if e > s { unsafe { madvise((g_ptr_val + s) as *mut u8, e - s, 4); } }
             });
         }
     });
@@ -348,9 +345,6 @@ fn main() {
                     let mut guard = lm.lock().unwrap();
                     for (u, v, w) in local_large { guard.insert((u, v), w); }
                 }
-                let s = (start + 4095) & !4095;
-                let e = end & !4095;
-                if e > s { unsafe { madvise((g_ptr_val + s) as *mut u8, e - s, 4); } }
             });
         }
     });
@@ -416,7 +410,7 @@ fn main() {
         return;
     }
 
-    let num_workers = 12.min(num_queries).max(1);
+    let num_workers = 8.min(num_queries).max(1);
     let head_arc = Arc::new(final_head);
     let rhead_arc = Arc::new(final_rev_head);
     let edges_arc = Arc::new(edges);
