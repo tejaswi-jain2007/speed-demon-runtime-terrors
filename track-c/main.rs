@@ -249,7 +249,7 @@ fn main() {
     for t in 0..num_threads {
         let (rec_ref, rlookup_ref, start, end) = (Arc::clone(&rec_mmap), Arc::clone(&rlookup_arc), splits[t], splits[t + 1]);
         handles.push(thread::spawn(move || {
-            let (mut local_aggs, mut local_names) = (vec![LocalCountryAgg::new(); num_countries], Vec::with_capacity(32768));
+            let (mut local_aggs, mut local_names) = (vec![LocalCountryAgg::new(); num_countries], Vec::with_capacity(16384));
             let d = rec_ref.as_slice();
             parse_csv_chunk(d, start, end, &rlookup_ref, &mut local_aggs, &mut local_names);
             unsafe { madvise_dontneed(d.as_ptr().add(start), end - start); }
@@ -258,22 +258,36 @@ fn main() {
     }
 
     let mut thread_results = Vec::with_capacity(num_threads);
-    let mut all_names: Vec<u64> = Vec::with_capacity(250_000);
+    let mut country_names: Vec<Vec<u64>> = vec![Vec::with_capacity(2048); num_countries];
     for h in handles {
         let (aggs, names) = h.join().unwrap();
         thread_results.push(aggs);
-        all_names.extend_from_slice(&names);
+        for packed in names {
+            country_names[(packed >> 48) as usize].push(packed & 0x0000_FFFF_FFFF_FFFF);
+        }
     }
     drop(rec_mmap);
 
-    all_names.sort_unstable();
-    all_names.dedup();
-
-    for &packed in &all_names {
-        let cid = (packed >> 48) as usize;
-        countries[cid].distinct_names += 1;
+    let country_names_ptr = country_names.as_mut_ptr() as usize;
+    let mut dedup_handles = Vec::with_capacity(num_threads);
+    let c_per_thread = (num_countries + num_threads - 1) / num_threads;
+    for t in 0..num_threads {
+        let (start_c, end_c) = (t * c_per_thread, (t * c_per_thread + c_per_thread).min(num_countries));
+        dedup_handles.push(thread::spawn(move || {
+            let c_ptr = country_names_ptr as *mut Vec<u64>;
+            let mut counts = Vec::with_capacity(end_c - start_c);
+            for c in start_c..end_c {
+                let list = unsafe { &mut *c_ptr.add(c) };
+                if list.is_empty() { counts.push((c, 0)); }
+                else { list.sort_unstable(); list.dedup(); counts.push((c, list.len())); }
+            }
+            counts
+        }));
     }
-    drop(all_names);
+    for dh in dedup_handles {
+        for (c, distinct) in dh.join().unwrap() { countries[c].distinct_names = distinct; }
+    }
+    drop(country_names);
 
     for c in 0..num_countries {
         let dest = &mut countries[c];
