@@ -13,6 +13,12 @@ extern "C" {
     fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
 }
 
+#[inline(always)]
+unsafe fn libc_exit(code: i32) -> ! {
+    extern "C" { fn _exit(status: i32) -> !; }
+    _exit(code);
+}
+
 const PROT_READ: i32 = 1; const PROT_WRITE: i32 = 2; const MAP_PRIVATE: i32 = 0x02; const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_FIXED: i32 = 0x10; const MAP_FAILED: *mut u8 = !0 as *mut u8; const MADV_DONTNEED: i32 = 4; const MADV_SEQUENTIAL: i32 = 2;
 const HOURS: usize = 72; const KEY_BITS: u32 = 12; const ID_MASK: u32 = (1 << 11) - 1; const ERR_BIT: u32 = 1 << 11;
@@ -99,10 +105,10 @@ impl<'a> Worker<'a> {
     unsafe fn parse(&mut self, mut p: *const u8, end: *const u8) {
         if p >= end { return; }
         let start_p = p;
-        let reserve = 72 * std::mem::size_of::<Block>();
+        let reserve = 16 * std::mem::size_of::<Block>();
         self.reserved = reserve;
         self.region = mmap(std::ptr::null_mut(), reserve, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if self.region == MAP_FAILED { _exit(1); }
+        if self.region == MAP_FAILED { libc_exit(1); }
 
         let space_vec = _mm256_set1_epi8(b' ' as i8);
         let nl_vec = _mm256_set1_epi8(b'\n' as i8);
@@ -135,7 +141,8 @@ impl<'a> Worker<'a> {
             let nl = (nl0 as u64) | ((nl1 as u64) << 32);
 
             let ep = m.add(sp.trailing_zeros() as usize + 1);
-            let ee = if nl != 0 { m.add((sp & (sp - 1)).trailing_zeros() as usize) } else { find(ep, b' ') };
+            let sp2 = sp & (sp - 1);
+            let ee = if sp2 != 0 { m.add(sp2.trailing_zeros() as usize) } else { find(ep, b' ') };
             let eol = if nl != 0 { m.add(nl.trailing_zeros() as usize) } else { find(ee.add(5), b'\n') };
 
             let is_err = if *ee.add(1) == b'5' { ERR_BIT } else { 0 };
@@ -203,7 +210,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fd = file.as_raw_fd();
     let data = unsafe {
         let p = mmap(std::ptr::null_mut(), size + 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if p == MAP_FAILED || mmap(p, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED { _exit(1); }
+        if p == MAP_FAILED || mmap(p, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED { libc_exit(1); }
         madvise(p, size, MADV_SEQUENTIAL);
         p as *const u8
     };
@@ -229,7 +236,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rank = vec![Vec::new(); NTHREADS];
     let data_send = SendPtr(data);
 
-    // Phase 1: parallel parse
     thread::scope(|s| {
         let (cut_ref, d_send) = (&cut, data_send);
         for (t, w) in workers.iter_mut().enumerate() {
@@ -241,7 +247,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for t in 0..NTHREADS {
         for n in &workers[t].endpoints.names { rank[t].push(unsafe { global.intern(n.as_ptr(), n.len()) }); }
     }
-    let mut sorted_names = global.names.clone();
+    let mut sorted_names: Vec<Vec<u8>> = global.names.iter().map(|s| s.to_vec()).collect();
     sorted_names.sort_unstable();
 
     let mut rank_of = vec![0u32; sorted_names.len()];
@@ -257,7 +263,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let next_hour = AtomicUsize::new(0);
 
-    // Phase 2: parallel reduction + streaming disk write
     thread::scope(|s| {
         let (done_ref, text_ref, out_p) = (&done, &text_boxes, out_path.clone());
         s.spawn(move || {
@@ -282,8 +287,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 loop {
                     let h = next_h_ref.fetch_add(1, Ordering::Relaxed);
                     if h >= HOURS { break; }
-                    count.fill(0); errors.fill(0);
 
+                    count.fill(0); errors.fill(0);
                     for wt in 0..NTHREADS {
                         let (w, r) = (&workers_ref[wt], &rank_ref[wt]);
                         let mut b = w.head[h];
@@ -347,16 +352,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         let slice = &mut lat[start..end];
                         let (p50, p95, p99) = if n == 1 {
-                            (slice[0], slice[0], slice[0])
-                        } else if n == 2 {
-                            let (a, b) = if slice[0] <= slice[1] { (slice[0], slice[1]) } else { (slice[1], slice[0]) };
-                            (a, b, b)
-                        } else if n == 3 {
-                            let mut a = slice[0]; let mut b = slice[1]; let mut c = slice[2];
-                            if a > b { std::mem::swap(&mut a, &mut b); }
-                            if b > c { std::mem::swap(&mut b, &mut c); }
-                            if a > b { std::mem::swap(&mut a, &mut b); }
-                            (b, c, c)
+                            let a = slice[0]; (a, a, a)
                         } else if n <= 256 {
                             slice.sort_unstable();
                             (slice[(50 * n + 99) / 100 - 1], slice[(95 * n + 99) / 100 - 1], slice[(99 * n + 99) / 100 - 1])
@@ -375,7 +371,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut pos = 0;
                         line[..20].copy_from_slice(label); pos += 20;
                         line[pos] = b' '; pos += 1;
-                        let ep_name = names_ref[e];
+                        let ep_name = &names_ref[e];
                         line[pos..pos + ep_name.len()].copy_from_slice(ep_name); pos += ep_name.len();
                         line[pos] = b' '; pos += 1; pos = append_u32(&mut line, n as u32, pos);
                         line[pos] = b' '; pos += 1; pos = append_u32(&mut line, p50, pos);
@@ -394,9 +390,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     unsafe { libc_exit(0); }
-}
-
-unsafe fn libc_exit(code: i32) -> ! {
-    extern "C" { fn _exit(status: i32) -> !; }
-    _exit(code);
 }
