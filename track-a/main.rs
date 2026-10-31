@@ -271,18 +271,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (&next_hour, &done, &text_boxes, &workers, &rank, &labels, &sorted_names, num_endpoints);
 
         for _ in 0..NTHREADS {
-            s.spawn(|| {
+            let (next_h, done, text, workers, rank, labels, names) =
+                (next_h_ref, done_ref, text_ref, workers_ref, rank_ref, labels_ref, names_ref);
+            s.spawn(move || {
                 let (mut count, mut errors, mut cursor) = (vec![0u32; ne + 1], vec![0u32; ne], vec![0u32; ne]);
                 let mut lat: Vec<u32> = Vec::new();
                 let mut line = [0u8; 512];
 
                 loop {
-                    let h = next_h_ref.fetch_add(1, Ordering::Relaxed);
+                    let h = next_h.fetch_add(1, Ordering::Relaxed);
                     if h >= HOURS { break; }
 
                     count.fill(0); errors.fill(0);
                     for wt in 0..NTHREADS {
-                        let (w, r) = (&workers_ref[wt], &rank_ref[wt]);
+                        let (w, r) = (&workers[wt], &rank[wt]);
                         let mut b = w.head[h];
                         while !b.is_null() {
                             unsafe {
@@ -310,7 +312,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     unsafe { lat.set_len(total_lat); }
 
                     for wt in 0..NTHREADS {
-                        let (w, r) = (&workers_ref[wt], &rank_ref[wt]);
+                        let (w, r) = (&workers[wt], &rank[wt]);
                         let mut b = w.head[h];
                         while !b.is_null() {
                             unsafe {
@@ -333,8 +335,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    let label = &labels_ref[h];
-                    let mut out_text = text_ref[h].lock().unwrap();
+                    let label = &labels[h];
+                    let mut out_text = text[h].lock().unwrap();
                     out_text.reserve(ne * 64);
 
                     for e in 0..ne {
@@ -363,7 +365,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut pos = 0;
                         line[..20].copy_from_slice(label); pos += 20;
                         line[pos] = b' '; pos += 1;
-                        let ep_name = names_ref[e];
+                        let ep_name = names[e];
                         line[pos..pos + ep_name.len()].copy_from_slice(ep_name); pos += ep_name.len();
                         line[pos] = b' '; pos += 1; pos = append_u32(&mut line, n as u32, pos);
                         line[pos] = b' '; pos += 1; pos = append_u32(&mut line, p50, pos);
@@ -375,7 +377,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         out_text.extend_from_slice(&line[..pos]);
                     }
 
-                    done_ref[h].store(true, Ordering::Release);
+                    done[h].store(true, Ordering::Release);
                 }
             });
         }

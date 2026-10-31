@@ -301,7 +301,7 @@ fn main() {
     let mut thread_names = vec![Vec::<u64>::new(); num_threads];
 
     thread::scope(|s| {
-        let rec_ptr = rec_data.as_ptr();
+        let rec_slice = rec_data;
         let rlookup_ref = &flat;
         let splits_ref = &splits;
         let aggs_slice = &mut thread_aggs[..];
@@ -313,8 +313,8 @@ fn main() {
                 let mut filter = vec![0u64; 16384];
                 local_names.reserve(32768);
                 unsafe {
-                    parse_csv_chunk(rec_ptr, start, end, rlookup_ref, local_aggs, &mut filter, local_names);
-                    madvise_dontneed(rec_ptr.add(start), end - start);
+                    parse_csv_chunk(rec_slice.as_ptr(), start, end, rlookup_ref, local_aggs, &mut filter, local_names);
+                    madvise_dontneed(rec_slice.as_ptr().add(start), end - start);
                 }
                 local_names.sort_unstable();
                 local_names.dedup();
