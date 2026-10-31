@@ -167,7 +167,7 @@ impl LocalCountryAgg {
     }
 }
 
-const B_CAP: usize = 256;
+const B_CAP: usize = 128;
 
 #[derive(Clone, Copy)]
 struct Block {
@@ -186,7 +186,7 @@ impl ThreadPool {
         ThreadPool {
             heads: [!0; 242],
             lens: [B_CAP as u16; 242],
-            blocks: Vec::with_capacity(300),
+            blocks: Vec::with_capacity(1000),
         }
     }
     #[inline(always)]
@@ -453,7 +453,7 @@ fn main() {
         rp += 1;
     }
 
-    let mut flat = vec![0u8; 100_000];
+    let mut flat = vec![0u8; 1_000_000];
     while rp < rend {
         if r_data[rp] == b'\r' || r_data[rp] == b'\n' {
             rp += 1;

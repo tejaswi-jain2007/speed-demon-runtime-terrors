@@ -137,7 +137,7 @@ impl<'a> Worker<'a> {
         if p >= end {
             return;
         }
-        let reserve = 48 * std::mem::size_of::<Block>();
+        let reserve = 72 * std::mem::size_of::<Block>();
         self.reserved = reserve;
         self.region = mmap(
             std::ptr::null_mut(),
@@ -158,6 +158,7 @@ impl<'a> Worker<'a> {
 
             let m = p.add(28);
             let sp = (match32(m, b' ') as u64) | ((match32(m.add(32), b' ') as u64) << 32);
+            let nl = (match32(m, b'\n') as u64) | ((match32(m.add(32), b'\n') as u64) << 32);
             let ep = m.add(sp.trailing_zeros() as usize + 1);
             let sp_after = sp & (sp - 1);
             let ee = if sp_after != 0 {
@@ -165,17 +166,22 @@ impl<'a> Worker<'a> {
             } else {
                 find(ep, b' ')
             };
+            let eol = if nl != 0 {
+                m.add(nl.trailing_zeros() as usize)
+            } else {
+                find(ee.add(5), b'\n')
+            };
 
             let is_err = ((*ee.add(1) == b'5') as u32) << 11;
             let key = self.endpoints.intern(ep, ee as usize - ep as usize) | is_err;
 
             let mut lat = (*ee.add(5) - b'0') as u32;
             let mut cur = ee.add(6);
-            while *cur >= b'0' {
+            while cur < eol {
                 lat = lat * 10 + (*cur - b'0') as u32;
                 cur = cur.add(1);
             }
-            p = cur.add(1);
+            p = eol.add(1);
 
             if lat >= BIG {
                 self.big.push((h, lat, key));
