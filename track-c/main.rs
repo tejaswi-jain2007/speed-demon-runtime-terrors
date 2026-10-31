@@ -59,6 +59,15 @@ impl FastMmap {
 impl Drop for FastMmap { fn drop(&mut self) { unsafe { munmap(self.ptr as *mut u8, self.len); } } }
 
 #[inline(always)]
+unsafe fn parse_u64_len(p: *const u8, len: usize) -> u64 {
+    let mut v = (*p - b'0') as u64;
+    for i in 1..len {
+        v = v * 10 + (*p.add(i) - b'0') as u64;
+    }
+    v
+}
+
+#[inline(always)]
 fn append_u64(buf: &mut Vec<u8>, mut v: u64) {
     if v == 0 { buf.push(b'0'); return; }
     let (mut t, mut i) = ([0u8; 20], 20);
@@ -137,10 +146,12 @@ unsafe fn parse_csv_chunk(
         if *p == 0xEF && p.add(3) <= end_ptr && *p.add(1) == 0xBB && *p.add(2) == 0xBF { p = p.add(3); }
         if p >= end_ptr { break; }
 
-        let mut record_id = (*p - b'0') as u64;
-        p = p.add(1);
-        while *p != b',' { record_id = record_id * 10 + (*p - b'0') as u64; p = p.add(1); }
-        p = p.add(1);
+        let w = (p as *const u64).read_unaligned();
+        let v = w ^ 0x2C2C2C2C2C2C2C2Cu64;
+        let z = v.wrapping_sub(0x0101010101010101u64) & !v & 0x8080808080808080u64;
+        let id_len = (z.trailing_zeros() >> 3) as usize;
+        let record_id = parse_u64_len(p, id_len);
+        p = p.add(id_len + 1);
 
         let (name_hash, name_len) = if *p == b',' {
             p = p.add(1); (0u32, 0u64)
