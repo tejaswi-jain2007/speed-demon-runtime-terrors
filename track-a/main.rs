@@ -11,7 +11,6 @@ extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
-    fn _exit(status: i32) -> !;
 }
 
 const PROT_READ: i32 = 1; const PROT_WRITE: i32 = 2; const MAP_PRIVATE: i32 = 0x02; const MAP_ANONYMOUS: i32 = 0x20;
@@ -394,5 +393,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    unsafe { _exit(0); }
+    unsafe { libc_exit(0); }
+}
+
+unsafe fn libc_exit(code: i32) -> ! {
+    extern "C" { fn _exit(status: i32) -> !; }
+    _exit(code);
 }
