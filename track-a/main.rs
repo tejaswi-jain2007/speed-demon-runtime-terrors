@@ -30,8 +30,8 @@ unsafe fn load8(p: *const u8) -> u64 {
 }
 
 #[inline(always)]
-unsafe fn find(mut s: *const u8, c: u8) -> *const u8 {
-    let t = _mm256_set1_epi8(c as i8);
+unsafe fn find_nl(mut s: *const u8) -> *const u8 {
+    let t = _mm256_set1_epi8(b'\n' as i8);
     loop {
         let m =
             _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(s as *const _), t)) as u32;
@@ -181,36 +181,29 @@ impl<'a> Worker<'a> {
             _exit(1);
         }
 
-        let (space_vec, nl_vec) = (_mm256_set1_epi8(b' ' as i8), _mm256_set1_epi8(b'\n' as i8));
+        let sp_vec128 = _mm_set1_epi8(b' ' as i8);
         let mut cur_b: [*mut Block; HOURS] = [std::ptr::null_mut(); HOURS];
 
         while p < end {
             let day = (*p.add(9) - b'0' + *p.add(6) - b'0') as usize;
             let h = day * 24 + ((*p.add(11) - b'0') * 10 + (*p.add(12) - b'0')) as usize - 18;
-            let m = p.add(28);
-            let v0 = _mm256_loadu_si256(m as *const __m256i);
-            let v1 = _mm256_loadu_si256(m.add(32) as *const __m256i);
-            let sp0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, space_vec)) as u32;
-            let sp1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, space_vec)) as u32;
-            let nl0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, nl_vec)) as u32;
-            let nl1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, nl_vec)) as u32;
-            let (sp, nl) = (
-                (sp0 as u64) | ((sp1 as u64) << 32),
-                (nl0 as u64) | ((nl1 as u64) << 32),
-            );
-            let ep = m.add(sp.trailing_zeros() as usize + 1);
-            let (ee, eol) = if nl != 0 {
-                (
-                    m.add((sp & (sp - 1)).trailing_zeros() as usize),
-                    m.add(nl.trailing_zeros() as usize),
-                )
-            } else {
-                let ee = find(ep, b' ');
-                (ee, find(ee.add(5), b'\n'))
-            };
-            let is_err = ((*ee.add(1) == b'5') as u32) << 11;
+
+            let v = load8(p.add(31)) ^ 0x2020202020202020u64;
+            let mask = v.wrapping_sub(0x0101010101010101u64) & !v & 0x8080808080808080u64;
+            let ep = p.add(32 + (mask.trailing_zeros() as usize >> 3));
+
+            let eol = find_nl(p.add(39));
+
+            let chunk = _mm_loadu_si128(eol.sub(16) as *const __m128i);
+            let sp_mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, sp_vec128)) as u32;
+            let sp_offset = 31 - sp_mask.leading_zeros() as usize;
+            let sp_lat = eol.sub(16).add(sp_offset);
+
+            let ee = sp_lat.sub(4);
+            let is_err = ((*sp_lat.sub(3) == b'5') as u32) << 11;
             let key = self.ep.intern(ep, ee as usize - ep as usize) | is_err;
-            let lat = parse_digits(eol, (eol as usize - ee as usize - 5) as u32);
+            let lat_len = eol as usize - sp_lat as usize - 1;
+            let lat = parse_digits(eol, lat_len as u32);
             p = eol.add(1);
 
             if lat >= BIG {
@@ -344,21 +337,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rank[wt].push(unsafe { global.intern(n.as_ptr(), n.len()) });
         }
     }
-    let mut sorted = global.names.clone();
-    sorted.sort_unstable();
-    let mut rank_of = vec![0u32; sorted.len()];
-    for (i, n) in sorted.iter().enumerate() {
-        rank_of[unsafe { global.intern(n.as_ptr(), n.len()) } as usize] = i as u32;
+    let mut sorted_with_id: Vec<(u16, &[u8])> = global
+        .names
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| (i as u16, n))
+        .collect();
+    sorted_with_id.sort_unstable_by_key(|&(_, n)| n);
+    let mut rank_of = vec![0u32; sorted_with_id.len()];
+    for (new_rank, &(orig_id, _)) in sorted_with_id.iter().enumerate() {
+        rank_of[orig_id as usize] = new_rank as u32;
     }
     for wt in 0..NTHREADS {
         for id in &mut rank[wt] {
             *id = rank_of[*id as usize];
         }
     }
+    let sorted: Vec<&[u8]> = sorted_with_id.iter().map(|&(_, n)| n).collect();
     let ne = sorted.len();
-    unsafe {
-        madvise(data as *mut u8, size + 4096, 4);
-    }
 
     let next_hour = AtomicUsize::new(0);
     let out_boxes: Vec<SyncBox<Vec<u8>>> = (0..HOURS)
@@ -429,9 +425,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     lat[cursor[e] as usize] = rec >> KEY_BITS;
                                     cursor[e] += 1;
                                 }
-                                let next_b = br.next;
-                                madvise(b as *mut u8, std::mem::size_of::<Block>(), 4);
-                                b = next_b;
+                                b = br.next;
                             }
                         }
                         for &(l, key) in &w.big[h] {
