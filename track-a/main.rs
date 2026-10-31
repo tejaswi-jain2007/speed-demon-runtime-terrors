@@ -144,20 +144,13 @@ impl<'a> Worker<'a> {
             let hour = ((*p.add(11) - b'0') * 10 + (*p.add(12) - b'0')) as i32;
             let h = (day_idx * 24 + hour - 18) as usize;
 
-            let mut ep = p.add(32);
-            if *p.add(31) != b' ' {
-                if *p.add(32) == b' ' {
-                    ep = p.add(33);
-                } else if *p.add(33) == b' ' {
-                    ep = p.add(34);
-                } else if *p.add(34) == b' ' {
-                    ep = p.add(35);
-                } else {
-                    ep = p.add(36);
-                }
+            let mut ep = p.add(31);
+            while *ep != b' ' {
+                ep = ep.add(1);
             }
+            ep = ep.add(1);
 
-            let mut s = p.add(48);
+            let mut s = p.add(32);
             let eol = loop {
                 let v = _mm256_loadu_si256(s as *const __m256i);
                 let cmp = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\n' as i8));
@@ -168,13 +161,20 @@ impl<'a> Worker<'a> {
                 s = s.add(32);
             };
 
-            let mut sp = eol.sub(1);
-            let mut lat = 0u32;
-            let mut mul = 1u32;
+            let mut end_lat = eol;
+            if *end_lat.sub(1) == b'\r' {
+                end_lat = end_lat.sub(1);
+            }
+            let mut sp = end_lat.sub(1);
             while *sp != b' ' {
-                lat += (*sp - b'0') as u32 * mul;
-                mul *= 10;
                 sp = sp.sub(1);
+            }
+
+            let mut lat = 0u32;
+            let mut q = sp.add(1);
+            while q < end_lat {
+                lat = lat * 10 + (*q - b'0') as u32;
+                q = q.add(1);
             }
 
             let is_err = if *sp.sub(3) == b'5' { ERR_BIT } else { 0 };
@@ -376,20 +376,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let text_ref = &text_boxes;
         let out_p = out_path.clone();
         s.spawn(move || {
-            let mut out_file = match File::create(&out_p) {
-                Ok(f) => f,
-                Err(_) => return,
-            };
+            let mut out_file = File::create(&out_p).expect("create out_file");
             for h in 0..HOURS {
                 loop {
                     if let Some(buf) = text_ref[h].lock().unwrap().take() {
-                        out_file.write_all(&buf).ok();
+                        out_file.write_all(&buf).expect("write_all");
                         break;
                     }
                     std::thread::yield_now();
                 }
             }
-            out_file.flush().ok();
+            out_file.flush().expect("flush");
         });
 
         let next_h_ref = &next_hour;
