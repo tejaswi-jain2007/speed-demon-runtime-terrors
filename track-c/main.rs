@@ -26,7 +26,7 @@ impl FastMmap {
         let f = File::open(path).ok()?;
         let len = f.metadata().ok()?.len() as usize;
         if len == 0 { return None; }
-        let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 1, f.as_raw_fd(), 0) }; // MAP_SHARED = 1
+        let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0) }; // MAP_PRIVATE = 2
         if ptr == std::ptr::null_mut() || ptr as isize == -1 { return None; }
         unsafe { madvise(ptr, len, 1); } // MADV_SEQUENTIAL
         Some(FastMmap { ptr, len })
@@ -79,14 +79,7 @@ unsafe fn parse_csv_chunk(
 ) {
     let mut p = rec_ptr.add(start);
     let end_ptr = rec_ptr.add(end);
-    let mut last_evict = p as usize;
     while p < end_ptr {
-        if (p as usize) - last_evict >= 256 * 1024 {
-            let s = (last_evict + 4095) & !4095;
-            let e = (p as usize) & !4095;
-            if e > s { madvise(s as *mut u8, e - s, 4); }
-            last_evict = p as usize;
-        }
         if p.add(3) <= end_ptr && *p == 0xEF && *p.add(1) == 0xBB && *p.add(2) == 0xBF { p = p.add(3); }
         if p >= end_ptr { break; }
 
@@ -97,16 +90,31 @@ unsafe fn parse_csv_chunk(
         let (mut name_hash, mut name_len) = (14695981039346656037u64, 0u64);
         if p < end_ptr && *p == b'"' {
             p = p.add(1);
-            while p < end_ptr {
-                if *p == b'"' {
-                    if p.add(1) < end_ptr && *p.add(1) == b'"' {
-                        name_hash = (name_hash ^ (b'"' as u64)).wrapping_mul(1099511628211);
-                        name_len += 1; p = p.add(2);
-                    } else { p = p.add(1); break; }
-                } else {
-                    name_hash = (name_hash ^ (*p as u64)).wrapping_mul(1099511628211);
-                    name_len += 1; p = p.add(1);
+            let start_name = p;
+            while p < end_ptr && *p != b'"' { p = p.add(1); }
+            if p.add(1) < end_ptr && *p.add(1) == b'"' {
+                // Escaped quote in name (rare fallback)
+                let mut ptr = start_name;
+                while ptr < end_ptr {
+                    if *ptr == b'"' {
+                        if ptr.add(1) < end_ptr && *ptr.add(1) == b'"' {
+                            name_hash = (name_hash ^ (b'"' as u64)).wrapping_mul(1099511628211);
+                            name_len += 1; ptr = ptr.add(2);
+                        } else { p = ptr.add(1); break; }
+                    } else {
+                        name_hash = (name_hash ^ (*ptr as u64)).wrapping_mul(1099511628211);
+                        name_len += 1; ptr = ptr.add(1);
+                    }
                 }
+            } else {
+                // Common fast path: unroll name hashing, zero inner branches
+                name_len = (p as usize - start_name as usize) as u64;
+                let mut ptr = start_name;
+                while ptr < p {
+                    name_hash = (name_hash ^ (*ptr as u64)).wrapping_mul(1099511628211);
+                    ptr = ptr.add(1);
+                }
+                if p < end_ptr { p = p.add(1); }
             }
         } else {
             while p < end_ptr && *p != b',' && *p != b'\r' && *p != b'\n' {
@@ -120,20 +128,26 @@ unsafe fn parse_csv_chunk(
         if p < end_ptr && *p == b'"' {
             p = p.add(1);
             let start_note = p;
-            let mut quote_pairs = 0u64;
-            while p < end_ptr {
-                if *p == b'"' {
-                    if p.add(1) < end_ptr && *p.add(1) == b'"' {
-                        quote_pairs += 1;
-                        p = p.add(2);
-                    } else {
-                        note_len = (p as usize - start_note as usize) as u64 - quote_pairs;
-                        p = p.add(1);
-                        break;
-                    }
-                } else {
-                    p = p.add(1);
+            while p < end_ptr && *p != b'"' { p = p.add(1); }
+            if p.add(1) < end_ptr && *p.add(1) == b'"' {
+                // Escaped quote in note (rare fallback)
+                let mut ptr = start_note;
+                let mut quote_pairs = 0u64;
+                while ptr < end_ptr {
+                    if *ptr == b'"' {
+                        if ptr.add(1) < end_ptr && *ptr.add(1) == b'"' {
+                            quote_pairs += 1; ptr = ptr.add(2);
+                        } else {
+                            note_len = (ptr as usize - start_note as usize) as u64 - quote_pairs;
+                            p = ptr.add(1);
+                            break;
+                        }
+                    } else { ptr = ptr.add(1); }
                 }
+            } else {
+                // Common fast path: note has no escaped quotes!
+                note_len = (p as usize - start_note as usize) as u64;
+                if p < end_ptr { p = p.add(1); }
             }
         } else {
             let start_note = p;
@@ -173,7 +187,7 @@ unsafe fn parse_csv_chunk(
         agg.note_bytes += note_len;
 
         let packed = (((cid as u64) + 1) << 48) | (name_hash & 0x0000_FFFF_FFFF_FFFF);
-        let slot = (name_hash as usize) & 8191;
+        let slot = (name_hash as usize) & 16383;
         let row = filter.get_unchecked_mut(slot);
         if row[0] == packed || row[1] == packed {
             // Already seen
@@ -183,9 +197,6 @@ unsafe fn parse_csv_chunk(
             local_names.push(packed);
         }
     }
-    let s = (last_evict + 4095) & !4095;
-    let e = (end_ptr as usize) & !4095;
-    if e > s { madvise(s as *mut u8, e - s, 4); }
 }
 
 fn main() {
@@ -272,11 +283,11 @@ fn main() {
     }
 
     let (num_countries, rlookup_arc) = (countries.len(), Arc::new(flat));
-    let mut handles = Vec::with_capacity(num_threads - 1);
-    for t in 1..num_threads {
+    let mut handles = Vec::with_capacity(num_threads);
+    for t in 0..num_threads {
         let (rec_ref, rlookup_ref, start, end) = (Arc::clone(&rec_mmap), Arc::clone(&rlookup_arc), splits[t], splits[t + 1]);
         handles.push(thread::spawn(move || {
-            let mut filter = vec![[0u64; 2]; 8192];
+            let mut filter = vec![[0u64; 2]; 16384];
             let mut local_names = Vec::with_capacity(32768);
             let mut local_aggs = vec![LocalCountryAgg::new(); num_countries];
             let d = rec_ref.as_slice();
@@ -292,28 +303,8 @@ fn main() {
         }));
     }
 
-    // Main thread processes chunk 0!
-    let (t0_aggs, t0_names) = {
-        let mut filter = vec![[0u64; 2]; 8192];
-        let mut local_names = Vec::with_capacity(32768);
-        let mut local_aggs = vec![LocalCountryAgg::new(); num_countries];
-        let d = rec_mmap.as_slice();
-        unsafe {
-            parse_csv_chunk(d.as_ptr(), splits[0], splits[1], &rlookup_arc, &mut local_aggs, &mut filter, &mut local_names);
-            madvise_dontneed(d.as_ptr().add(splits[0]), splits[1] - splits[0]);
-        }
-        drop(filter);
-        local_names.sort_unstable();
-        local_names.dedup();
-        local_names.shrink_to_fit();
-        (local_aggs, local_names)
-    };
-
     let mut thread_aggs = Vec::with_capacity(num_threads);
     let mut thread_names = Vec::with_capacity(num_threads);
-    thread_aggs.push(t0_aggs);
-    thread_names.push(t0_names);
-
     for h in handles {
         let (aggs, names) = h.join().unwrap();
         thread_aggs.push(aggs);
@@ -340,25 +331,43 @@ fn main() {
         thread_offsets.push(offsets);
     }
 
-    // Sequential country dedup on main thread (runs in <0.3 ms, saves 15ms thread spawn!)
-    let mut buf = Vec::with_capacity(4096);
-    for c in 0..num_countries {
-        buf.clear();
-        for th in 0..num_threads {
-            let s = thread_offsets[th][c];
-            let e = thread_offsets[th][c + 1];
-            if e > s { buf.extend_from_slice(&thread_names[th][s..e]); }
-        }
-        if buf.len() <= 1 {
-            countries[c].distinct_names = buf.len();
-        } else {
-            buf.sort_unstable();
-            buf.dedup();
-            countries[c].distinct_names = buf.len();
+    let thread_names_arc = Arc::new(thread_names);
+    let thread_offsets_arc = Arc::new(thread_offsets);
+    let mut dedup_handles = Vec::with_capacity(num_threads);
+    let c_per_thread = (num_countries + num_threads - 1) / num_threads;
+    for t in 0..num_threads {
+        let (t_names, t_offsets) = (Arc::clone(&thread_names_arc), Arc::clone(&thread_offsets_arc));
+        let (start_c, end_c) = (t * c_per_thread, (t * c_per_thread + c_per_thread).min(num_countries));
+        dedup_handles.push(thread::spawn(move || {
+            let mut results = Vec::with_capacity(end_c - start_c);
+            let mut buf = Vec::with_capacity(4096);
+            for c in start_c..end_c {
+                buf.clear();
+                for th in 0..t_names.len() {
+                    let s = t_offsets[th][c];
+                    let e = t_offsets[th][c + 1];
+                    if e > s { buf.extend_from_slice(&t_names[th][s..e]); }
+                }
+                if buf.is_empty() {
+                    results.push((c, 0));
+                } else if buf.len() == 1 {
+                    results.push((c, 1));
+                } else {
+                    buf.sort_unstable();
+                    buf.dedup();
+                    results.push((c, buf.len()));
+                }
+            }
+            results
+        }));
+    }
+    for dh in dedup_handles {
+        for (c, distinct) in dh.join().unwrap() {
+            countries[c].distinct_names = distinct;
         }
     }
-    drop(thread_names);
-    drop(thread_offsets);
+    drop(thread_names_arc);
+    drop(thread_offsets_arc);
 
     for c in 0..num_countries {
         let dest = &mut countries[c];
