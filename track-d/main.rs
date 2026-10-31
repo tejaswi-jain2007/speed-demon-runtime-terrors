@@ -1,9 +1,8 @@
-use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::mem::ManuallyDrop;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -51,8 +50,8 @@ impl BinaryMinHeap {
     #[inline(always)]
     fn is_empty(&self) -> bool { self.data.is_empty() }
     #[inline(always)]
-    fn push(&mut self, dist: u32, u: u32) {
-        let val = ((dist as u64) << 32) | (u as u64);
+    fn push(&mut self, dist: u64, u: u32) {
+        let val = (dist << 21) | (u as u64);
         let mut idx = self.data.len();
         self.data.push(val);
         while idx > 0 {
@@ -68,7 +67,7 @@ impl BinaryMinHeap {
         }
     }
     #[inline(always)]
-    fn pop(&mut self) -> (u32, u32) {
+    fn pop(&mut self) -> (u64, u32) {
         let min = unsafe { *self.data.get_unchecked(0) };
         let last = self.data.pop().unwrap();
         let len = self.data.len();
@@ -93,7 +92,7 @@ impl BinaryMinHeap {
                 } else { break; }
             }
         }
-        ((min >> 32) as u32, min as u32)
+        (min >> 21, (min & 0x1F_FFFF) as u32)
     }
 }
 
@@ -120,23 +119,6 @@ fn parse_u32(d: &[u8], mut p: usize, end: usize, val: &mut u32) -> usize {
     let mut v = 0u32;
     while p < end && unsafe { *d.get_unchecked(p) } >= b'0' { v = v * 10 + (unsafe { *d.get_unchecked(p) } - b'0') as u32; p += 1; }
     *val = v; p
-}
-
-fn dijkstra64(head: &[u32], edges: &[Edge], s: u32, t: u32) -> i64 {
-    let mut d64: HashMap<u32, u64> = HashMap::with_capacity(64);
-    let mut pq: BinaryHeap<std::cmp::Reverse<(u64, u32)>> = BinaryHeap::with_capacity(64);
-    d64.insert(s, 0); pq.push(std::cmp::Reverse((0, s)));
-    while let Some(std::cmp::Reverse((d, u))) = pq.pop() {
-        if d > *d64.get(&u).unwrap_or(&u64::MAX) { continue; }
-        if u == t { return d as i64; }
-        for ei in (head[u as usize] as usize)..(head[(u + 1) as usize] as usize) {
-            let nd = d + edges[ei].weight as u64;
-            if nd < *d64.get(&edges[ei].to).unwrap_or(&u64::MAX) {
-                d64.insert(edges[ei].to, nd); pq.push(std::cmp::Reverse((nd, edges[ei].to)));
-            }
-        }
-    }
-    -1
 }
 
 fn main() {
@@ -199,13 +181,17 @@ fn main() {
     }
     head_atomic[(n + 1) as usize].store(sum, Ordering::Relaxed);
 
-    // Pass 2: Parallel edge writing
+    // Pass 2: Parallel edge writing + in-degree tracking
+    let has_in_words = (n as usize + 63) / 64;
+    let has_in_atomic: Arc<Vec<AtomicU64>> = Arc::new((0..has_in_words).map(|_| AtomicU64::new(0)).collect());
+
     let mut edges = vec![Edge { to: 0, weight: 0 }; m as usize];
     let edges_ptr = edges.as_mut_ptr() as usize;
 
     let mut p2_handles = Vec::with_capacity(num_parse_threads);
     for t in 0..num_parse_threads {
-        let (mmap_ref, head_ref, start, end) = (Arc::clone(&g_mmap), Arc::clone(&head_atomic), splits[t], splits[t + 1]);
+        let (mmap_ref, head_ref, has_in_ref, start, end) =
+            (Arc::clone(&g_mmap), Arc::clone(&head_atomic), Arc::clone(&has_in_atomic), splits[t], splits[t + 1]);
         p2_handles.push(thread::spawn(move || {
             let d = mmap_ref.as_slice();
             let e_ptr = edges_ptr as *mut Edge;
@@ -231,10 +217,14 @@ fn main() {
 
                 let idx = unsafe { head_ref.get_unchecked(u as usize).fetch_add(1, Ordering::Relaxed) };
                 unsafe { *e_ptr.add(idx as usize) = Edge { to: v, weight: w }; }
+                unsafe { has_in_ref.get_unchecked((v >> 6) as usize).fetch_or(1 << (v & 63), Ordering::Relaxed); }
             }
         }));
     }
     for h in p2_handles { h.join().unwrap(); }
+
+    // Evict and drop graph input mmap immediately to minimize RSS
+    unsafe { madvise_dontneed(g_data.as_ptr(), g_size); }
     drop(g_mmap);
 
     // Shift head back by 1 to get standard CSR [head[u]..head[u+1]]
@@ -252,6 +242,13 @@ fn main() {
     };
     head.truncate((n + 1) as usize);
 
+    // Convert AtomicU64 has_in to plain Vec<u64>
+    let has_in_arc = Arc::try_unwrap(has_in_atomic).unwrap();
+    let has_in = {
+        let mut md = ManuallyDrop::new(has_in_arc);
+        unsafe { Vec::from_raw_parts(md.as_mut_ptr() as *mut u64, md.len(), md.capacity()) }
+    };
+
     let q_mmap = match FastMmap::open(&q_path) { Some(m) => m, None => return };
     let (q_data, q_size) = (q_mmap.as_slice(), q_mmap.len);
     let (mut queries, mut qp) = (Vec::with_capacity(2500), 0);
@@ -265,65 +262,74 @@ fn main() {
     drop(q_mmap);
 
     let num_queries = queries.len();
-    let num_workers = 6.min(num_queries).max(1);
-    let (head_arc, edges_arc, queries_arc, next_q_arc) =
-        (Arc::new(head), Arc::new(edges), Arc::new(queries), Arc::new(AtomicUsize::new(0)));
+    let num_workers = 4.min(num_queries).max(1);
+    let (head_arc, edges_arc, has_in_arc, queries_arc, next_q_arc) =
+        (Arc::new(head), Arc::new(edges), Arc::new(has_in), Arc::new(queries), Arc::new(AtomicUsize::new(0)));
     let mut all_answers = vec![0i64; num_queries];
     let answers_ptr = all_answers.as_mut_ptr() as usize;
 
     let mut workers = Vec::with_capacity(num_workers);
     for _ in 0..num_workers {
-        let (head_ref, edges_ref, queries_ref, next_q) =
-            (Arc::clone(&head_arc), Arc::clone(&edges_arc), Arc::clone(&queries_arc), Arc::clone(&next_q_arc));
+        let (head_ref, edges_ref, has_in_ref, queries_ref, next_q) =
+            (Arc::clone(&head_arc), Arc::clone(&edges_arc), Arc::clone(&has_in_arc), Arc::clone(&queries_arc), Arc::clone(&next_q_arc));
         let builder = thread::Builder::new().stack_size(256 * 1024);
         workers.push(builder.spawn(move || {
             let out_ptr = answers_ptr as *mut i64;
-            let mut dist16 = vec![0u16; n as usize];
-            let mut touched: Vec<u32> = Vec::with_capacity(4096);
-            let mut pq = BinaryMinHeap::with_capacity(4096);
+            let mut dist = vec![u64::MAX; n as usize];
+            let mut touched: Vec<u32> = Vec::with_capacity(8192);
+            let mut pq = BinaryMinHeap::with_capacity(8192);
+
             loop {
                 let qi = next_q.fetch_add(1, Ordering::Relaxed);
                 if qi >= num_queries { break; }
                 let (s, t) = queries_ref[qi];
                 if s == t { unsafe { *out_ptr.add(qi) = 0; } continue; }
-                let (start, end) = (*unsafe { head_ref.get_unchecked(s as usize) } as usize, *unsafe { head_ref.get_unchecked((s + 1) as usize) } as usize);
-                if start == end { unsafe { *out_ptr.add(qi) = -1; } continue; }
 
-                let mut best_t = u32::MAX;
-                for ei in start..end {
+                let s_start = *unsafe { head_ref.get_unchecked(s as usize) } as usize;
+                let s_end = *unsafe { head_ref.get_unchecked((s + 1) as usize) } as usize;
+                if s_start == s_end { unsafe { *out_ptr.add(qi) = -1; } continue; }
+
+                let t_has_in = unsafe { (*has_in_ref.get_unchecked((t >> 6) as usize) & (1 << (t & 63))) != 0 };
+                if !t_has_in { unsafe { *out_ptr.add(qi) = -1; } continue; }
+
+                let mut best_t = u64::MAX;
+                for ei in s_start..s_end {
                     let e = unsafe { edges_ref.get_unchecked(ei) };
-                    if e.to == t && e.weight < best_t { best_t = e.weight; }
+                    if e.to == t && (e.weight as u64) < best_t { best_t = e.weight as u64; }
                 }
 
-                unsafe { *dist16.get_unchecked_mut(s as usize) = 1; }
-                touched.push(s); pq.push(0, s);
-                let mut overflow = false;
+                unsafe { *dist.get_unchecked_mut(s as usize) = 0; }
+                touched.push(s);
+                pq.push(0, s);
+
                 while !pq.is_empty() {
                     let (d, u) = pq.pop();
                     if d >= best_t { break; }
-                    let cur_u_stored = unsafe { *dist16.get_unchecked(u as usize) };
-                    if (d + 1) as u16 > cur_u_stored { continue; }
+                    let cur_dist = unsafe { *dist.get_unchecked(u as usize) };
+                    if d > cur_dist { continue; }
                     if u == t { best_t = d; break; }
-                    let (u_start, u_end) = (*unsafe { head_ref.get_unchecked(u as usize) } as usize, *unsafe { head_ref.get_unchecked((u + 1) as usize) } as usize);
+
+                    let u_start = *unsafe { head_ref.get_unchecked(u as usize) } as usize;
+                    let u_end = *unsafe { head_ref.get_unchecked((u + 1) as usize) } as usize;
                     for ei in u_start..u_end {
                         let e = unsafe { edges_ref.get_unchecked(ei) };
-                        let nd = d + e.weight;
-                        if nd >= 65000 { overflow = true; break; }
+                        let nd = d + e.weight as u64;
                         if nd >= best_t { continue; }
                         if e.to == t { best_t = nd; continue; }
-                        let cur_stored = unsafe { *dist16.get_unchecked(e.to as usize) };
-                        let new_stored = (nd + 1) as u16;
-                        if cur_stored == 0 || new_stored < cur_stored {
-                            if cur_stored == 0 { touched.push(e.to); }
-                            unsafe { *dist16.get_unchecked_mut(e.to as usize) = new_stored; }
+                        let cur_to = unsafe { *dist.get_unchecked(e.to as usize) };
+                        if nd < cur_to {
+                            if cur_to == u64::MAX { touched.push(e.to); }
+                            unsafe { *dist.get_unchecked_mut(e.to as usize) = nd; }
                             pq.push(nd, e.to);
                         }
                     }
-                    if overflow { break; }
                 }
-                for &u in &touched { unsafe { *dist16.get_unchecked_mut(u as usize) = 0; } }
-                touched.clear(); pq.clear();
-                let ans = if overflow { dijkstra64(&head_ref, &edges_ref, s, t) } else if best_t == u32::MAX { -1 } else { best_t as i64 };
+
+                for &u in &touched { unsafe { *dist.get_unchecked_mut(u as usize) = u64::MAX; } }
+                touched.clear();
+                pq.clear();
+
+                let ans = if best_t == u64::MAX { -1 } else { best_t as i64 };
                 unsafe { *out_ptr.add(qi) = ans; }
             }
         }).unwrap());
