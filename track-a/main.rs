@@ -1,9 +1,11 @@
-// Speed Demon 2026 - Track A (Ingest) - Clean & Fast
+// Speed Demon 2026 - Track A (Ingest) - Ultra High Performance
 use std::arch::x86_64::*;
+use std::cell::UnsafeCell;
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::thread;
 
 extern "C" {
@@ -33,18 +35,6 @@ unsafe fn find_nl(mut s: *const u8) -> *const u8 {
         if m != 0 { return s.add(m.trailing_zeros() as usize); }
         s = s.add(32);
     }
-}
-
-#[inline(always)]
-unsafe fn parse_digits_simd(chunk: __m128i, len: u32) -> u32 {
-    let v = _mm_subs_epu8(chunk, _mm_set1_epi8(b'0' as i8));
-    let lane = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    let v = _mm_and_si128(v, _mm_cmpgt_epi8(lane, _mm_set1_epi8((15 - len) as i8)));
-    let v = _mm_maddubs_epi16(v, _mm_set1_epi16(0x010A));
-    let v = _mm_madd_epi16(v, _mm_set1_epi32(0x00010064));
-    let v = _mm_packus_epi32(v, v);
-    let v = _mm_madd_epi16(v, _mm_set1_epi32(0x00012710));
-    (_mm_cvtsi128_si32(v) as u32).wrapping_mul(100000000) + (_mm_extract_epi32(v, 1) as u32)
 }
 
 #[inline(always)]
@@ -117,7 +107,6 @@ impl<'a> Worker<'a> {
         self.region = mmap(std::ptr::null_mut(), self.reserved, 3, 0x22, -1, 0);
         if self.region == !0 as *mut u8 { _exit(1); }
 
-        let sp_vec128 = _mm_set1_epi8(b' ' as i8);
         let mut cur_b: [*mut Block; HOURS] = [std::ptr::null_mut(); HOURS];
 
         while p < end {
@@ -130,16 +119,18 @@ impl<'a> Worker<'a> {
 
             let eol = find_nl(p.add(39));
 
-            let chunk = _mm_loadu_si128(eol.sub(16) as *const __m128i);
-            let sp_mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, sp_vec128)) as u32;
-            let sp_offset = 31 - sp_mask.leading_zeros() as usize;
-            let sp_lat = eol.sub(16).add(sp_offset);
-
-            let ee = sp_lat.sub(4);
-            let is_err = ((*sp_lat.sub(3) == b'5') as u32) << 11;
+            // Fast backwards latency & status parsing directly from eol
+            let mut lat = 0u32;
+            let mut cur = eol.sub(1);
+            let mut mul = 1u32;
+            while *cur != b' ' {
+                lat += (*cur - b'0') as u32 * mul;
+                mul *= 10;
+                cur = cur.sub(1);
+            }
+            let is_err = ((*cur.sub(3) == b'5') as u32) << 11;
+            let ee = cur.sub(4);
             let key = self.ep.intern(ep, ee as usize - ep as usize) | is_err;
-            let lat_len = eol as usize - sp_lat as usize - 1;
-            let lat = parse_digits_simd(chunk, lat_len as u32);
             p = eol.add(1);
 
             if lat >= BIG {
@@ -166,6 +157,9 @@ impl<'a> Worker<'a> {
         }
     }
 }
+
+struct SyncBox<T>(UnsafeCell<T>);
+unsafe impl<T> Sync for SyncBox<T> {}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe { prctl(14, 1, 0, 0, 0); }
@@ -245,10 +239,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe { madvise(data as *mut u8, size + 4096, 4); }
 
     let next_hour = AtomicUsize::new(0);
-    let mut hour_outputs: Vec<Vec<u8>> = (0..HOURS).map(|_| Vec::new()).collect();
+    let out_boxes: Vec<SyncBox<Vec<u8>>> = (0..HOURS).map(|_| SyncBox(UnsafeCell::new(Vec::new()))).collect();
+    let ready: Vec<AtomicBool> = (0..HOURS).map(|_| AtomicBool::new(false)).collect();
+    let next_to_write = AtomicUsize::new(0);
+    let out_file = Mutex::new(std::io::BufWriter::with_capacity(512 * 1024, File::create(&out_p)?));
+
     thread::scope(|s| {
-        let (next_h, wrk_r, rk_r, lbl_r, nm_r) = (&next_hour, &workers, &rank, &labels, &sorted);
-        let out_ptr = hour_outputs.as_mut_ptr() as usize;
+        let (next_h, wrk_r, rk_r, lbl_r, nm_r, out_r, rdy_r, next_w, file_m) = (
+            &next_hour, &workers, &rank, &labels, &sorted, &out_boxes, &ready, &next_to_write, &out_file,
+        );
 
         for _ in 0..NTHREADS {
             s.spawn(move || {
@@ -316,7 +315,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     let label = &lbl_r[h];
-                    let out_text = unsafe { &mut *((out_ptr as *mut Vec<u8>).add(h)) };
+                    let out_text = unsafe { &mut *out_r[h].0.get() };
                     out_text.reserve(ne * 64);
 
                     for e in 0..ne {
@@ -354,15 +353,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         line[pos] = b'\n'; pos += 1;
                         out_text.extend_from_slice(&line[..pos]);
                     }
+
+                    rdy_r[h].store(true, Ordering::Release);
+
+                    // Cooperative progressive writer: flush ready hours immediately
+                    if let Ok(mut writer) = file_m.try_lock() {
+                        let mut cur = next_w.load(Ordering::Relaxed);
+                        while cur < HOURS && rdy_r[cur].load(Ordering::Acquire) {
+                            let out_bytes = unsafe { &mut *out_r[cur].0.get() };
+                            let _ = writer.write_all(out_bytes);
+                            out_bytes.clear();
+                            out_bytes.shrink_to_fit();
+                            cur += 1;
+                        }
+                        next_w.store(cur, Ordering::Relaxed);
+                    }
                 }
             });
         }
     });
 
-    let mut out_file = std::io::BufWriter::with_capacity(512 * 1024, File::create(&out_p)?);
-    for h in 0..HOURS {
-        out_file.write_all(&hour_outputs[h])?;
+    let mut writer = out_file.lock().unwrap();
+    let mut cur = next_to_write.load(Ordering::Relaxed);
+    while cur < HOURS {
+        let out_bytes = unsafe { &*out_boxes[cur].0.get() };
+        let _ = writer.write_all(out_bytes);
+        cur += 1;
     }
-    out_file.flush()?;
+    writer.flush().ok();
     unsafe { _exit(0); }
 }
