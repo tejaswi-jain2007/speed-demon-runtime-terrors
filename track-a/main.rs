@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
 extern "C" {
@@ -21,6 +21,7 @@ const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_FIXED: i32 = 0x10;
 const MAP_FAILED: *mut u8 = !0 as *mut u8;
 const MADV_DONTNEED: i32 = 4;
+const MADV_SEQUENTIAL: i32 = 2;
 
 const HOURS: usize = 72;
 const KEY_BITS: u32 = 12;
@@ -28,12 +29,39 @@ const ID_MASK: u32 = (1 << 11) - 1;
 const ERR_BIT: u32 = 1 << 11;
 const BIG: u32 = 1 << 20;
 const NTHREADS: usize = 12;
-const BLOCK_CAP: usize = (8192 - 16) / 4;
-const MAX_BLOCKS: usize = 160;
+const BLOCK_CAP: usize = (16384 - 16) / 4;
 
 #[inline(always)]
 unsafe fn load8(p: *const u8) -> u64 {
     (p as *const u64).read_unaligned()
+}
+
+#[inline(always)]
+unsafe fn find(mut s: *const u8, c: u8) -> *const u8 {
+    let target = _mm256_set1_epi8(c as i8);
+    loop {
+        let v = _mm256_loadu_si256(s as *const __m256i);
+        let m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, target)) as u32;
+        if m != 0 {
+            return s.add(m.trailing_zeros() as usize);
+        }
+        s = s.add(32);
+    }
+}
+
+#[inline(always)]
+unsafe fn parse_digits(end: *const u8, len: u32) -> u32 {
+    let v = _mm_loadu_si128(end.sub(16) as *const __m128i);
+    let v = _mm_subs_epu8(v, _mm_set1_epi8(b'0' as i8));
+    let lane = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let v = _mm_and_si128(v, _mm_cmpgt_epi8(lane, _mm_set1_epi8((15 - len) as i8)));
+    let v = _mm_maddubs_epi16(v, _mm_set1_epi16(0x010A));
+    let v = _mm_madd_epi16(v, _mm_set1_epi32(0x00010064));
+    let v = _mm_packus_epi32(v, v);
+    let v = _mm_madd_epi16(v, _mm_set1_epi32(0x00012710));
+    let high = _mm_cvtsi128_si32(v) as u32;
+    let low = _mm_extract_epi32(v, 1) as u32;
+    high.wrapping_mul(100000000) + low
 }
 
 #[derive(Copy, Clone)]
@@ -102,6 +130,7 @@ struct Worker<'a> {
     big: Vec<Vec<(u32, u32)>>,
     region: *mut u8,
     used: usize,
+    reserved: usize,
 }
 
 unsafe impl<'a> Send for Worker<'a> {}
@@ -115,6 +144,7 @@ impl<'a> Worker<'a> {
             big: (0..HOURS).map(|_| Vec::new()).collect(),
             region: std::ptr::null_mut(),
             used: 0,
+            reserved: 0,
         }
     }
 
@@ -122,7 +152,8 @@ impl<'a> Worker<'a> {
         if p >= end {
             return;
         }
-        let reserve = MAX_BLOCKS * std::mem::size_of::<Block>();
+        let reserve = 72 * std::mem::size_of::<Block>();
+        self.reserved = reserve;
         self.region = mmap(
             std::ptr::null_mut(),
             reserve,
@@ -135,7 +166,18 @@ impl<'a> Worker<'a> {
             std::process::exit(1);
         }
 
+        let space_vec = _mm256_set1_epi8(b' ' as i8);
+        let nl_vec = _mm256_set1_epi8(b'\n' as i8);
+        let mut madvise_ptr = p as usize & !4095;
+
         while p < end {
+            // Drop processed input pages every 1MB to keep RSS locked at minimum
+            let curr_page = p as usize & !4095;
+            if curr_page > madvise_ptr + 1048576 {
+                madvise(madvise_ptr as *mut u8, curr_page - madvise_ptr, MADV_DONTNEED);
+                madvise_ptr = curr_page;
+            }
+
             let day_idx = if *p.add(6) == b'0' {
                 (*p.add(9) - b'0') as i32
             } else {
@@ -144,43 +186,32 @@ impl<'a> Worker<'a> {
             let hour = ((*p.add(11) - b'0') * 10 + (*p.add(12) - b'0')) as i32;
             let h = (day_idx * 24 + hour - 18) as usize;
 
-            let mut ep = p.add(31);
-            while *ep != b' ' {
-                ep = ep.add(1);
-            }
-            ep = ep.add(1);
+            let m = p.add(28);
+            let v0 = _mm256_loadu_si256(m as *const __m256i);
+            let v1 = _mm256_loadu_si256(m.add(32) as *const __m256i);
+            let sp0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, space_vec)) as u32;
+            let sp1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, space_vec)) as u32;
+            let nl0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, nl_vec)) as u32;
+            let nl1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, nl_vec)) as u32;
 
-            let mut s = p.add(32);
-            let eol = loop {
-                let v = _mm256_loadu_si256(s as *const __m256i);
-                let cmp = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\n' as i8));
-                let mask = _mm256_movemask_epi8(cmp) as u32;
-                if mask != 0 {
-                    break s.add(mask.trailing_zeros() as usize);
-                }
-                s = s.add(32);
+            let sp = (sp0 as u64) | ((sp1 as u64) << 32);
+            let nl = (nl0 as u64) | ((nl1 as u64) << 32);
+
+            let ep = m.add(sp.trailing_zeros() as usize + 1);
+            let ee = if nl != 0 {
+                m.add((sp & (sp - 1)).trailing_zeros() as usize)
+            } else {
+                find(ep, b' ')
+            };
+            let eol = if nl != 0 {
+                m.add(nl.trailing_zeros() as usize)
+            } else {
+                find(ee.add(5), b'\n')
             };
 
-            let mut end_lat = eol;
-            if *end_lat.sub(1) == b'\r' {
-                end_lat = end_lat.sub(1);
-            }
-            let mut sp = end_lat.sub(1);
-            while *sp != b' ' {
-                sp = sp.sub(1);
-            }
-
-            let mut lat = 0u32;
-            let mut q = sp.add(1);
-            while q < end_lat {
-                lat = lat * 10 + (*q - b'0') as u32;
-                q = q.add(1);
-            }
-
-            let is_err = if *sp.sub(3) == b'5' { ERR_BIT } else { 0 };
-            let ee = sp.sub(4);
-            let ep_len = ee as usize - ep as usize;
-            let key = self.endpoints.intern(ep, ep_len) | is_err;
+            let is_err = if *ee.add(1) == b'5' { ERR_BIT } else { 0 };
+            let key = self.endpoints.intern(ep, ee as usize - ep as usize) | is_err;
+            let lat = parse_digits(eol, (eol as usize - ee as usize - 5) as u32);
             p = eol.add(1);
 
             if lat >= BIG {
@@ -190,6 +221,15 @@ impl<'a> Worker<'a> {
 
             let b = &mut self.head[h];
             if (*b).is_null() || (*(*b)).n as usize == BLOCK_CAP {
+                if self.used + std::mem::size_of::<Block>() > self.reserved {
+                    let extra = 16 * std::mem::size_of::<Block>();
+                    let p_m = mmap(std::ptr::null_mut(), extra, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                    if p_m != MAP_FAILED {
+                        self.region = p_m;
+                        self.used = 0;
+                        self.reserved = extra;
+                    }
+                }
                 let fresh = self.region.add(self.used) as *mut Block;
                 self.used += std::mem::size_of::<Block>();
                 (*fresh).next = *b;
@@ -199,6 +239,12 @@ impl<'a> Worker<'a> {
             let b_ref = &mut *(*b);
             b_ref.rec[b_ref.n as usize] = (lat << KEY_BITS) | key;
             b_ref.n += 1;
+        }
+
+        // Drop remaining input pages
+        let ef = (end as usize) & !4095;
+        if ef > madvise_ptr {
+            madvise(madvise_ptr as *mut u8, ef - madvise_ptr, MADV_DONTNEED);
         }
     }
 }
@@ -293,6 +339,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if mmap(p, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED {
             std::process::exit(1);
         }
+        madvise(p, size, MADV_SEQUENTIAL);
         p as *const u8
     };
 
@@ -317,8 +364,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut workers: Vec<Worker> = (0..NTHREADS).map(|_| Worker::new()).collect();
-    let text_boxes: Vec<std::sync::Mutex<Option<Vec<u8>>>> =
-        (0..HOURS).map(|_| std::sync::Mutex::new(None)).collect();
+    let done: Vec<AtomicBool> = (0..HOURS).map(|_| AtomicBool::new(false)).collect();
+    let text_boxes: Vec<std::sync::Mutex<Vec<u8>>> =
+        (0..HOURS).map(|_| std::sync::Mutex::new(Vec::new())).collect();
 
     let mut rank = vec![Vec::new(); NTHREADS];
     let data_send = SendPtr(data);
@@ -333,11 +381,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let from = d_send.as_ptr().add(cut_ref[t]);
                 let to = d_send.as_ptr().add(cut_ref[t + 1]);
                 w.parse(from, to);
-                let sf = (from as usize + 4095) & !4095;
-                let ef = (to as usize) & !4095;
-                if ef > sf {
-                    madvise(sf as *mut u8, ef - sf, MADV_DONTNEED);
-                }
             });
         }
     });
@@ -373,20 +416,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Second phase: parallel hour reduction + streaming disk writer
     thread::scope(|s| {
+        let done_ref = &done;
         let text_ref = &text_boxes;
         let out_p = out_path.clone();
         s.spawn(move || {
-            let mut out_file = File::create(&out_p).expect("create out_file");
+            let mut out_file = match File::create(&out_p) {
+                Ok(f) => f,
+                Err(_) => return,
+            };
             for h in 0..HOURS {
-                loop {
-                    if let Some(buf) = text_ref[h].lock().unwrap().take() {
-                        out_file.write_all(&buf).expect("write_all");
-                        break;
-                    }
-                    std::thread::yield_now();
+                while !done_ref[h].load(Ordering::Acquire) {
+                    std::hint::spin_loop();
                 }
+                let mut buf = text_ref[h].lock().unwrap();
+                out_file.write_all(&buf).ok();
+                *buf = Vec::new();
             }
-            out_file.flush().expect("flush");
+            out_file.flush().ok();
         });
 
         let next_h_ref = &next_hour;
@@ -480,7 +526,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     // Format lines
                     let label = &labels_ref[h];
-                    let mut out_text = Vec::with_capacity(ne * 64);
+                    let mut out_text = text_ref[h].lock().unwrap();
+                    out_text.reserve(ne * 64);
 
                     for e in 0..ne {
                         let start = count[e] as usize;
@@ -542,7 +589,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         out_text.extend_from_slice(&line[..pos]);
                     }
 
-                    *text_ref[h].lock().unwrap() = Some(out_text);
+                    done_ref[h].store(true, Ordering::Release);
                 }
             });
         }
