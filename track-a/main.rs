@@ -1,13 +1,12 @@
 // Speed Demon 2026 - Track A (Ingest)
 // Team: Runtime Terrors
 use std::arch::x86_64::*;
-use std::cell::UnsafeCell;
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Barrier;
+use std::sync::Mutex;
 use std::thread;
 
 extern "C" {
@@ -116,8 +115,8 @@ struct Worker<'a> {
     pool_cap: usize,
 }
 
-struct WorkerCell<'a>(UnsafeCell<Worker<'a>>);
-unsafe impl<'a> Sync for WorkerCell<'a> {}
+unsafe impl<'a> Send for Worker<'a> {}
+unsafe impl<'a> Sync for Worker<'a> {}
 
 impl<'a> Worker<'a> {
     fn new() -> Self {
@@ -194,17 +193,6 @@ fn append_u32(buf: &mut [u8], mut val: u32, mut pos: usize) -> usize {
     pos
 }
 
-struct SharedState<'a> {
-    names: Vec<&'a [u8]>,
-    rank: [[u32; 256]; NTHREADS],
-    num_endpoints: usize,
-}
-struct SyncShared<'a>(UnsafeCell<SharedState<'a>>);
-unsafe impl<'a> Sync for SyncShared<'a> {}
-
-struct SyncOutBufs(UnsafeCell<Vec<Vec<u8>>>);
-unsafe impl Sync for SyncOutBufs {}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe { prctl(14, 1, 0, 0, 0); }
 
@@ -254,65 +242,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     cut[NTHREADS] = size;
 
-    let workers: Vec<WorkerCell> = (0..NTHREADS).map(|_| WorkerCell(UnsafeCell::new(Worker::new()))).collect();
-    let barrier = Barrier::new(NTHREADS);
-    let next_hour = AtomicUsize::new(0);
-    let shared = SyncShared(UnsafeCell::new(SharedState { names: Vec::new(), rank: [[0; 256]; NTHREADS], num_endpoints: 0 }));
-    let out_bufs = SyncOutBufs(UnsafeCell::new((0..HOURS).map(|_| Vec::with_capacity(2048)).collect()));
-
+    let mut workers: Vec<Worker> = (0..NTHREADS).map(|_| Worker::new()).collect();
+    let mut rank = vec![Vec::new(); NTHREADS];
     let d_send = SendPtr(data);
-    let cut_ref = &cut;
-    let barrier_ref = &barrier;
-    let workers_ref = &workers;
-    let next_h_ref = &next_hour;
-    let shared_ref = &shared;
-    let out_bufs_ref = &out_bufs;
-    let labels_ref = &labels;
 
+    // Phase 1: parse chunks in parallel
     thread::scope(|s| {
-        for t in 0..NTHREADS {
+        let cut_ref = &cut;
+        for (t, w) in workers.iter_mut().enumerate() {
             s.spawn(move || unsafe {
                 let from = d_send.0.add(cut_ref[t]);
                 let to = d_send.0.add(cut_ref[t + 1]);
-                let w = &mut *workers_ref[t].0.get();
                 w.parse(from, to);
-
                 let sf = (from as usize + 4095) & !4095;
                 let ef = (to as usize) & !4095;
                 if ef > sf { madvise(sf as *mut u8, ef - sf, MADV_DONTNEED); }
+            });
+        }
+    });
 
-                barrier_ref.wait();
+    // Reconcile endpoints across workers
+    let mut global = EndpointTable::new();
+    for t in 0..NTHREADS {
+        for n in &workers[t].endpoints.names {
+            rank[t].push(unsafe { global.intern(n.as_ptr(), n.len()) });
+        }
+    }
+    let mut sorted_names = global.names.clone();
+    sorted_names.sort_unstable();
 
-                if t == 0 {
-                    let state = &mut *shared_ref.0.get();
-                    let mut global = EndpointTable::new();
-                    let mut temp_rank = vec![Vec::new(); NTHREADS];
-                    for wt in 0..NTHREADS {
-                        let w_other = &*workers_ref[wt].0.get();
-                        for n in &w_other.endpoints.names {
-                            temp_rank[wt].push(global.intern(n.as_ptr(), n.len()));
-                        }
-                    }
-                    state.names = global.names.clone();
-                    state.names.sort_unstable();
-                    let mut rank_of = vec![0u32; state.names.len()];
-                    for (i, n) in state.names.iter().enumerate() {
-                        let gid = global.intern(n.as_ptr(), n.len()) as usize;
-                        rank_of[gid] = i as u32;
-                    }
-                    for wt in 0..NTHREADS {
-                        for (local_id, &gid) in temp_rank[wt].iter().enumerate() {
-                            state.rank[wt][local_id] = rank_of[gid as usize];
-                        }
-                    }
-                    state.num_endpoints = state.names.len();
-                    madvise(d_send.0 as *mut u8, size, MADV_DONTNEED);
-                }
+    let mut rank_of = vec![0u32; sorted_names.len()];
+    for (i, n) in sorted_names.iter().enumerate() {
+        let gid = unsafe { global.intern(n.as_ptr(), n.len()) } as usize;
+        rank_of[gid] = i as u32;
+    }
+    for r in &mut rank {
+        for id in r {
+            *id = rank_of[*id as usize];
+        }
+    }
+    let num_endpoints = sorted_names.len();
 
-                barrier_ref.wait();
+    unsafe { madvise(data as *mut u8, size, MADV_DONTNEED); }
 
-                let state = &*shared_ref.0.get();
-                let ne = state.num_endpoints;
+    let next_hour = AtomicUsize::new(0);
+    let text_boxes: Vec<Mutex<Vec<u8>>> = (0..HOURS).map(|_| Mutex::new(Vec::new())).collect();
+
+    // Phase 2: parallel hour reduction
+    thread::scope(|s| {
+        let next_h_ref = &next_hour;
+        let text_ref = &text_boxes;
+        let workers_ref = &workers;
+        let rank_ref = &rank;
+        let labels_ref = &labels;
+        let names_ref = &sorted_names;
+        let ne = num_endpoints;
+
+        for _ in 0..NTHREADS {
+            s.spawn(move || {
                 let mut count = [0u32; 256];
                 let mut errors = [0u32; 256];
                 let mut cursor = [0u32; 256];
@@ -327,20 +314,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     errors[..ne].fill(0);
 
                     for wt in 0..NTHREADS {
-                        let w_other = &*workers_ref[wt].0.get();
-                        let r = &state.rank[wt];
-                        let mut b = w_other.head[h];
+                        let w = &workers_ref[wt];
+                        let r = &rank_ref[wt];
+                        let mut b = w.head[h];
                         while !b.is_null() {
-                            let b_ref = &*b;
-                            for i in 0..b_ref.n as usize {
-                                let key = b_ref.rec[i];
-                                let e = r[(key & ID_MASK) as usize] as usize;
-                                count[e + 1] += 1;
-                                errors[e] += ((key & ERR_BIT) != 0) as u32;
+                            unsafe {
+                                let b_ref = &*b;
+                                for i in 0..b_ref.n as usize {
+                                    let key = b_ref.rec[i];
+                                    let e = r[(key & ID_MASK) as usize] as usize;
+                                    count[e + 1] += 1;
+                                    errors[e] += ((key & ERR_BIT) != 0) as u32;
+                                }
+                                b = b_ref.next;
                             }
-                            b = b_ref.next;
                         }
-                        for &(l, key) in &w_other.big[h] {
+                        for &(l, key) in &w.big[h] {
                             let _ = l;
                             let e = r[(key & ID_MASK) as usize] as usize;
                             count[e + 1] += 1;
@@ -353,26 +342,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let total_lat = count[ne] as usize;
                     lat.clear();
                     lat.reserve(total_lat);
-                    lat.set_len(total_lat);
+                    unsafe { lat.set_len(total_lat); }
 
                     for wt in 0..NTHREADS {
-                        let w_other = &*workers_ref[wt].0.get();
-                        let r = &state.rank[wt];
-                        let mut b = w_other.head[h];
+                        let w = &workers_ref[wt];
+                        let r = &rank_ref[wt];
+                        let mut b = w.head[h];
                         while !b.is_null() {
-                            let b_ref = &*b;
-                            for i in 0..b_ref.n as usize {
-                                let rec = b_ref.rec[i];
-                                let e = r[(rec & ID_MASK) as usize] as usize;
-                                let dst = cursor[e] as usize;
-                                lat[dst] = rec >> KEY_BITS;
-                                cursor[e] += 1;
+                            unsafe {
+                                let b_ref = &*b;
+                                for i in 0..b_ref.n as usize {
+                                    let rec = b_ref.rec[i];
+                                    let e = r[(rec & ID_MASK) as usize] as usize;
+                                    let dst = cursor[e] as usize;
+                                    lat[dst] = rec >> KEY_BITS;
+                                    cursor[e] += 1;
+                                }
+                                let next_b = b_ref.next;
+                                madvise(b as *mut u8, std::mem::size_of::<Block>(), MADV_DONTNEED);
+                                b = next_b;
                             }
-                            let next_b = b_ref.next;
-                            madvise(b as *mut u8, std::mem::size_of::<Block>(), MADV_DONTNEED);
-                            b = next_b;
                         }
-                        for &(l, key) in &w_other.big[h] {
+                        for &(l, key) in &w.big[h] {
                             let e = r[(key & ID_MASK) as usize] as usize;
                             let dst = cursor[e] as usize;
                             lat[dst] = l;
@@ -380,8 +371,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    let out_buf = &mut (*out_bufs_ref.0.get())[h];
-                    out_buf.reserve(ne * 64);
+                    let mut out_text = text_ref[h].lock().unwrap();
+                    out_text.reserve(ne * 64);
 
                     for e in 0..ne {
                         let start = count[e] as usize;
@@ -410,7 +401,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut pos = 0;
                         line[..20].copy_from_slice(&labels_ref[h]); pos += 20;
                         line[pos] = b' '; pos += 1;
-                        let ep_name = state.names[e];
+                        let ep_name = names_ref[e];
                         line[pos..pos + ep_name.len()].copy_from_slice(ep_name); pos += ep_name.len();
                         line[pos] = b' '; pos += 1; pos = append_u32(&mut line, n as u32, pos);
                         line[pos] = b' '; pos += 1; pos = append_u32(&mut line, p50, pos);
@@ -419,7 +410,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         line[pos] = b' '; pos += 1; pos = append_u32(&mut line, err, pos);
                         line[pos] = b' '; pos += 1; pos = append_u32(&mut line, ppm, pos);
                         line[pos] = b'\n'; pos += 1;
-                        out_buf.extend_from_slice(&line[..pos]);
+                        out_text.extend_from_slice(&line[..pos]);
                     }
                 }
             });
@@ -427,9 +418,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let mut out_file = File::create(&out_path)?;
-    let all_bufs = unsafe { &*out_bufs.0.get() };
     for h in 0..HOURS {
-        out_file.write_all(&all_bufs[h])?;
+        let buf = text_boxes[h].lock().unwrap();
+        out_file.write_all(&buf)?;
     }
     out_file.flush()?;
 
