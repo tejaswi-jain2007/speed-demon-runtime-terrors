@@ -5,6 +5,7 @@ use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Barrier;
 use std::thread;
 
 extern "C" {
@@ -73,9 +74,11 @@ impl<'a> EndpointTable<'a> {
     unsafe fn intern(&mut self, s: *const u8, len: usize) -> u32 {
         let mut a = load8(s);
         let b = if len >= 8 { load8(s.add(len - 8)) } else { 0 };
+        let c = if len >= 16 { load8(s.add((len - 8) / 2)) } else { 0 };
         if len < 8 { a &= (1u64 << (8 * len)) - 1; }
         let h1 = _mm_crc32_u64(len as u64, a);
-        let h = _mm_crc32_u64(h1, b);
+        let h2 = _mm_crc32_u64(h1, c);
+        let h = _mm_crc32_u64(h2, b);
         let fp = (h as u32) | 1;
         let mut i = (h as usize) & (TABLE_SLOTS - 1);
         loop {
@@ -125,7 +128,7 @@ impl<'a> Worker<'a> {
 
     unsafe fn parse(&mut self, mut p: *const u8, end: *const u8) {
         if p >= end { return; }
-        let reserve = 76 * std::mem::size_of::<Block>();
+        let reserve = 72 * std::mem::size_of::<Block>();
         self.region = mmap(std::ptr::null_mut(), reserve, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if self.region == MAP_FAILED { std::process::exit(1); }
 
@@ -154,7 +157,7 @@ impl<'a> Worker<'a> {
             let ee = if sp_rem != 0 { m.add(sp_rem.trailing_zeros() as usize) } else { find(ep, b' ') };
             let eol = if nl != 0 { m.add(nl.trailing_zeros() as usize) } else { find(ee.add(5), b'\n') };
 
-            let is_err = if *ee.add(1) == b'5' { ERR_BIT } else { 0 };
+            let is_err = ((*ee.add(1) == b'5') as u32) << 11;
             let key = self.endpoints.intern(ep, ee as usize - ep as usize) | is_err;
             let lat = parse_digits(eol, (eol as usize - ee as usize - 5) as u32);
             p = eol.add(1);
@@ -230,6 +233,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut workers: Vec<Worker> = (0..NTHREADS).map(|_| Worker::new()).collect();
+    let barrier = Barrier::new(NTHREADS);
     let done: Vec<AtomicBool> = (0..HOURS).map(|_| AtomicBool::new(false)).collect();
     let text_boxes: Vec<std::sync::Mutex<Vec<u8>>> = (0..HOURS).map(|_| std::sync::Mutex::new(Vec::new())).collect();
     let mut rank = vec![Vec::new(); NTHREADS];
@@ -237,6 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     thread::scope(|s| {
         let cut_ref = &cut;
+        let barrier_ref = &barrier;
         for (t, w) in workers.iter_mut().enumerate() {
             s.spawn(move || unsafe {
                 let from = data_addr + cut_ref[t];
@@ -245,6 +250,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let sf = (from + 4095) & !4095;
                 let ef = to & !4095;
                 if ef > sf { madvise(sf as *mut u8, ef - sf, MADV_DONTNEED); }
+                barrier_ref.wait();
             });
         }
     });
@@ -272,13 +278,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     thread::scope(|s| {
         let (done_ref, text_ref, out_p) = (&done, &text_boxes, out_path.clone());
         s.spawn(move || {
-            let mut out_file = match File::create(&out_p) { Ok(f) => f, Err(_) => return };
+            let out_file = match File::create(&out_p) { Ok(f) => f, Err(_) => return };
+            let mut writer = std::io::BufWriter::with_capacity(512 * 1024, out_file);
             for h in 0..HOURS {
                 while !done_ref[h].load(Ordering::Acquire) { std::hint::spin_loop(); }
                 let mut buf = text_ref[h].lock().unwrap();
-                out_file.write_all(&buf).ok();
+                writer.write_all(&buf).ok();
                 *buf = Vec::new();
             }
+            writer.flush().ok();
         });
 
         let (next_h, done_ref, text_ref, workers_ref, rank_ref, labels_ref, names_ref) =
@@ -305,7 +313,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let rec = b_ref.rec[i];
                                     let e = r[(rec & ID_MASK) as usize] as usize;
                                     count[e + 1] += 1;
-                                    if (rec & ERR_BIT) != 0 { errors[e] += 1; }
+                                    errors[e] += (rec & ERR_BIT) >> 11;
                                 }
                                 b = b_ref.next;
                             }
@@ -313,7 +321,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         for &(_, key) in &w.big[h] {
                             let e = r[(key & ID_MASK) as usize] as usize;
                             count[e + 1] += 1;
-                            if (key & ERR_BIT) != 0 { errors[e] += 1; }
+                            errors[e] += (key & ERR_BIT) >> 11;
                         }
                     }
 
@@ -346,8 +354,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     let label = &labels_ref[h];
-                    let mut out_text = text_ref[h].lock().unwrap();
-                    out_text.reserve(ne * 64);
+                    let mut local_out = Vec::with_capacity(ne * 64);
 
                     for e in 0..ne {
                         let (start, end) = (count[e] as usize, count[e + 1] as usize);
@@ -357,6 +364,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let slice = &mut lat[start..end];
                         let (p50, p95, p99) = if n == 1 {
                             let a = slice[0]; (a, a, a)
+                        } else if n == 2 {
+                            let (mut a, mut b) = (slice[0], slice[1]);
+                            if a > b { std::mem::swap(&mut a, &mut b); }
+                            (a, b, b)
                         } else if n <= 256 {
                             slice.sort_unstable();
                             (slice[(50 * n + 99) / 100 - 1], slice[(95 * n + 99) / 100 - 1], slice[(99 * n + 99) / 100 - 1])
@@ -384,9 +395,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         line[pos] = b' '; pos += 1; pos = append_u32(&mut line, err, pos);
                         line[pos] = b' '; pos += 1; pos = append_u32(&mut line, ppm, pos);
                         line[pos] = b'\n'; pos += 1;
-                        out_text.extend_from_slice(&line[..pos]);
+                        local_out.extend_from_slice(&line[..pos]);
                     }
 
+                    *text_ref[h].lock().unwrap() = local_out;
                     done_ref[h].store(true, Ordering::Release);
                 }
             });
