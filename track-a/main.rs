@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
 extern "C" {
@@ -339,13 +339,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         madvise(data as *mut u8, size, MADV_DONTNEED);
     }
 
+    let done: Vec<AtomicBool> = (0..HOURS).map(|_| AtomicBool::new(false)).collect();
+    let text_boxes: Vec<std::sync::Mutex<Vec<u8>>> =
+        (0..HOURS).map(|_| std::sync::Mutex::new(Vec::new())).collect();
     let next_hour = AtomicUsize::new(0);
-    let mut out_bufs: Vec<Vec<u8>> = (0..HOURS).map(|_| Vec::with_capacity(4096)).collect();
-    let out_raw = out_bufs.as_mut_ptr() as usize;
 
     thread::scope(|s| {
-        let (next_h, workers_ref, rank_ref, labels_ref, names_ref) =
-            (&next_hour, &workers, &rank, &labels, &sorted_names);
+        let (done_ref, text_ref, out_p) = (&done, &text_boxes, out_file_path.clone());
+        s.spawn(move || {
+            let mut out_file = match File::create(&out_p) {
+                Ok(f) => f,
+                Err(_) => return,
+            };
+            for h in 0..HOURS {
+                while !done_ref[h].load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                let mut buf = text_ref[h].lock().unwrap();
+                out_file.write_all(&buf).ok();
+                *buf = Vec::new();
+            }
+        });
+
+        let (next_h, done_ref, text_ref, workers_ref, rank_ref, labels_ref, names_ref) =
+            (&next_hour, &done, &text_boxes, &workers, &rank, &labels, &sorted_names);
 
         for _ in 0..NTHREADS {
             s.spawn(move || {
@@ -411,7 +428,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     lat[cursor[e] as usize] = rec >> KEY_BITS;
                                     cursor[e] += 1;
                                 }
-                                b = b_ref.next;
+                                let next_b = b_ref.next;
+                                madvise(b as *mut u8, std::mem::size_of::<Block>(), MADV_DONTNEED);
+                                b = next_b;
                             }
                         }
                         for &(l, key) in &w.big[h] {
@@ -422,7 +441,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     let label = &labels_ref[h];
-                    let out_text = unsafe { &mut *(out_raw as *mut Vec<u8>).add(h) };
+                    let mut out_text = text_ref[h].lock().unwrap();
+                    out_text.reserve(ne * 64);
 
                     for e in 0..ne {
                         let (start, end) = (count[e] as usize, count[e + 1] as usize);
@@ -495,15 +515,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         pos += 1;
                         out_text.extend_from_slice(&line[..pos]);
                     }
+
+                    done_ref[h].store(true, Ordering::Release);
                 }
             });
         }
     });
-
-    let mut out_file = File::create(&out_file_path)?;
-    for buf in &out_bufs {
-        out_file.write_all(buf)?;
-    }
 
     unsafe {
         _exit(0);
