@@ -20,6 +20,19 @@ unsafe fn madvise_dontneed(ptr: *const u8, len: usize) {
 }
 
 #[inline(always)]
+unsafe fn find_comma(mut p: *const u8, end_ptr: *const u8) -> *const u8 {
+    let v = _mm256_set1_epi8(b',' as i8);
+    while p.add(32) <= end_ptr {
+        let chunk = _mm256_loadu_si256(p as *const __m256i);
+        let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v)) as u32;
+        if mask != 0 { return p.add(mask.trailing_zeros() as usize); }
+        p = p.add(32);
+    }
+    while p < end_ptr && *p != b',' { p = p.add(1); }
+    p
+}
+
+#[inline(always)]
 unsafe fn find_quote(mut p: *const u8, end_ptr: *const u8) -> *const u8 {
     let v = _mm256_set1_epi8(b'"' as i8);
     while p.add(32) <= end_ptr {
@@ -61,7 +74,7 @@ impl FastMmap {
         if len == 0 { return None; }
         let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0) };
         if ptr.is_null() || ptr as isize == -1 { return None; }
-        unsafe { madvise(ptr, len, 1); }
+        unsafe { madvise(ptr, len, 3 | 2); }
         Some(FastMmap { ptr, len })
     }
     #[inline(always)] fn as_slice(&self) -> &[u8] { unsafe { std::slice::from_raw_parts(self.ptr, self.len) } }
@@ -145,7 +158,7 @@ unsafe fn parse_csv_chunk(
             }
         } else {
             let start_name = p;
-            while p < end_ptr && *p != b',' && *p != b'\r' && *p != b'\n' { p = p.add(1); }
+            p = find_comma(p, end_ptr);
             let len = p as usize - start_name as usize;
             name_hash = hash_slice(start_name, len);
             name_len = len as u64;
@@ -172,7 +185,7 @@ unsafe fn parse_csv_chunk(
             }
         } else {
             let start_note = p;
-            while p < end_ptr && *p != b',' && *p != b'\r' && *p != b'\n' { p = p.add(1); }
+            p = find_comma(p, end_ptr);
             note_len = (p as usize - start_note as usize) as u64;
         }
         if p < end_ptr && *p == b',' { p = p.add(1); }
@@ -207,9 +220,17 @@ unsafe fn parse_csv_chunk(
         agg.note_bytes += note_len;
 
         let packed = (((cid as u64) + 1) << 48) | (name_hash & 0x0000_FFFF_FFFF_FFFF);
-        let slot = (name_hash as usize) & 16383;
-        let entry = filter.get_unchecked_mut(slot);
-        if *entry != packed { *entry = packed; local_names.push(packed); }
+        let mut slot = (name_hash as usize) & 65535;
+        loop {
+            let entry = filter.get_unchecked_mut(slot);
+            if *entry == 0 {
+                *entry = packed;
+                local_names.push(packed);
+                break;
+            }
+            if *entry == packed { break; }
+            slot = (slot + 1) & 65535;
+        }
     }
 }
 
@@ -310,8 +331,8 @@ fn main() {
         for (t, (local_aggs, local_names)) in aggs_slice.iter_mut().zip(names_slice.iter_mut()).enumerate() {
             let (start, end) = (splits_ref[t], splits_ref[t + 1]);
             s.spawn(move || {
-                let mut filter = vec![0u64; 16384];
-                local_names.reserve(32768);
+                let mut filter = vec![0u64; 65536];
+                local_names.reserve(16384);
                 unsafe {
                     parse_csv_chunk(rec_slice.as_ptr(), start, end, rlookup_ref, local_aggs, &mut filter, local_names);
                     madvise_dontneed(rec_slice.as_ptr().add(start), end - start);
