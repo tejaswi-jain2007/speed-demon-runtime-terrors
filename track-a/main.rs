@@ -18,8 +18,8 @@ const PROT_READ: i32 = 1;
 const PROT_WRITE: i32 = 2;
 const MAP_PRIVATE: i32 = 0x02;
 const MAP_ANONYMOUS: i32 = 0x20;
-const MAP_FIXED: i32 = 0x10;
 const MAP_FAILED: *mut u8 = !0 as *mut u8;
+const MADV_DONTNEED: i32 = 4;
 const MADV_SEQUENTIAL: i32 = 2;
 const MADV_WILLNEED: i32 = 3;
 const HOURS: usize = 72;
@@ -28,7 +28,8 @@ const ID_MASK: u32 = (1 << 11) - 1;
 const ERR_BIT: u32 = 1 << 11;
 const BIG: u32 = 1 << 20;
 const NTHREADS: usize = 12;
-const BLOCK_CAP: usize = (8192 - 16) / 4;
+const BLOCK_CAP: usize = (16384 - 16) / 4;
+const TABLE_SLOTS: usize = 2048;
 
 #[inline(always)]
 unsafe fn load8(p: *const u8) -> u64 {
@@ -36,8 +37,8 @@ unsafe fn load8(p: *const u8) -> u64 {
 }
 
 #[inline(always)]
-unsafe fn find_nl(mut s: *const u8) -> *const u8 {
-    let target = _mm256_set1_epi8(b'\n' as i8);
+unsafe fn find(mut s: *const u8, c: u8) -> *const u8 {
+    let target = _mm256_set1_epi8(c as i8);
     loop {
         let v = _mm256_loadu_si256(s as *const __m256i);
         let m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, target)) as u32;
@@ -48,15 +49,28 @@ unsafe fn find_nl(mut s: *const u8) -> *const u8 {
     }
 }
 
+#[inline(always)]
+unsafe fn parse_lat(p: *const u8, len: usize) -> u32 {
+    let mut v = (*p - b'0') as u32;
+    if len > 1 { v = v * 10 + (*p.add(1) - b'0') as u32; }
+    if len > 2 { v = v * 10 + (*p.add(2) - b'0') as u32; }
+    if len > 3 { v = v * 10 + (*p.add(3) - b'0') as u32; }
+    if len > 4 { v = v * 10 + (*p.add(4) - b'0') as u32; }
+    if len > 5 {
+        for i in 5..len { v = v * 10 + (*p.add(i) - b'0') as u32; }
+    }
+    v
+}
+
 struct EndpointTable<'a> {
-    slots: [u32; 2048],
+    slots: [u32; TABLE_SLOTS],
     names: Vec<&'a [u8]>,
 }
 
 impl<'a> EndpointTable<'a> {
     fn new() -> Self {
         Self {
-            slots: [0; 2048],
+            slots: [0; TABLE_SLOTS],
             names: Vec::with_capacity(128),
         }
     }
@@ -72,7 +86,7 @@ impl<'a> EndpointTable<'a> {
         let h = _mm_crc32_u64(_mm_crc32_u64(len as u64, a), b) as usize;
         let mut i = h;
         loop {
-            let slot = &mut self.slots[i & 2047];
+            let slot = &mut self.slots[i & (TABLE_SLOTS - 1)];
             if *slot == 0 {
                 let idx = self.names.len() as u32;
                 self.names.push(slice);
@@ -101,7 +115,6 @@ struct Worker<'a> {
     big: Vec<Vec<(u32, u32)>>,
     region: *mut u8,
     used: usize,
-    reserved: usize,
 }
 unsafe impl<'a> Send for Worker<'a> {}
 unsafe impl<'a> Sync for Worker<'a> {}
@@ -114,7 +127,6 @@ impl<'a> Worker<'a> {
             big: (0..HOURS).map(|_| Vec::new()).collect(),
             region: std::ptr::null_mut(),
             used: 0,
-            reserved: 0,
         }
     }
 
@@ -122,8 +134,7 @@ impl<'a> Worker<'a> {
         if p >= end {
             return;
         }
-        let reserve = 72 * std::mem::size_of::<Block>();
-        self.reserved = reserve;
+        let reserve = 76 * std::mem::size_of::<Block>();
         self.region = mmap(
             std::ptr::null_mut(),
             reserve,
@@ -136,6 +147,8 @@ impl<'a> Worker<'a> {
             std::process::exit(1);
         }
 
+        let space_vec = _mm256_set1_epi8(b' ' as i8);
+        let nl_vec = _mm256_set1_epi8(b'\n' as i8);
         let mut curr_ts4 = 0u32;
         let mut curr_h = 0usize;
         let mut curr_block = std::ptr::null_mut::<Block>();
@@ -157,24 +170,33 @@ impl<'a> Worker<'a> {
                 curr_h
             };
 
-            let eol = find_nl(p.add(35));
-            let mut q = eol.sub(1);
-            let mut lat = 0u32;
-            let mut mul = 1u32;
-            while *q != b' ' {
-                lat += (*q - b'0') as u32 * mul;
-                mul *= 10;
-                q = q.sub(1);
-            }
-            let is_err = if *q.sub(3) == b'5' { ERR_BIT } else { 0 };
-            let ee = q.sub(4);
-            let mut ep = p.add(31);
-            while *ep != b' ' {
-                ep = ep.add(1);
-            }
-            ep = ep.add(1);
+            let m = p.add(28);
+            let v0 = _mm256_loadu_si256(m as *const __m256i);
+            let v1 = _mm256_loadu_si256(m.add(32) as *const __m256i);
+            let sp0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, space_vec)) as u32;
+            let sp1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, space_vec)) as u32;
+            let nl0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, nl_vec)) as u32;
+            let nl1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, nl_vec)) as u32;
 
+            let sp = (sp0 as u64) | ((sp1 as u64) << 32);
+            let nl = (nl0 as u64) | ((nl1 as u64) << 32);
+
+            let ep = m.add(sp.trailing_zeros() as usize + 1);
+            let sp2 = sp & (sp - 1);
+            let ee = if sp2 != 0 {
+                m.add(sp2.trailing_zeros() as usize)
+            } else {
+                find(ep, b' ')
+            };
+            let eol = if nl != 0 {
+                m.add(nl.trailing_zeros() as usize)
+            } else {
+                find(ee.add(5), b'\n')
+            };
+
+            let is_err = if *ee.add(1) == b'5' { ERR_BIT } else { 0 };
             let key = self.endpoints.intern(ep, ee as usize - ep as usize) | is_err;
+            let lat = parse_lat(ee.add(5), eol as usize - ee as usize - 5);
             p = eol.add(1);
 
             if lat >= BIG {
@@ -183,22 +205,6 @@ impl<'a> Worker<'a> {
             }
 
             if curr_block.is_null() || (*curr_block).n as usize == BLOCK_CAP {
-                if self.used + std::mem::size_of::<Block>() > self.reserved {
-                    let extra = 64 * std::mem::size_of::<Block>();
-                    let p_m = mmap(
-                        std::ptr::null_mut(),
-                        extra,
-                        PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS,
-                        -1,
-                        0,
-                    );
-                    if p_m != MAP_FAILED {
-                        self.region = p_m;
-                        self.used = 0;
-                        self.reserved = extra;
-                    }
-                }
                 let fresh = self.region.add(self.used) as *mut Block;
                 self.used += std::mem::size_of::<Block>();
                 (*fresh).next = self.head[h];
@@ -214,25 +220,24 @@ impl<'a> Worker<'a> {
 }
 
 #[inline(always)]
-fn push_field(buf: &mut Vec<u8>, val: u32, sep: u8) {
+fn append_u32(buf: &mut [u8], mut val: u32, mut pos: usize) -> usize {
+    if val == 0 {
+        buf[pos] = b'0';
+        return pos + 1;
+    }
     let mut temp = [0u8; 10];
     let mut len = 0;
-    let mut v = val;
-    if v == 0 {
-        temp[0] = b'0';
-        len = 1;
-    } else {
-        while v > 0 {
-            temp[len] = b'0' + (v % 10) as u8;
-            v /= 10;
-            len += 1;
-        }
+    while val > 0 {
+        temp[len] = b'0' + (val % 10) as u8;
+        val /= 10;
+        len += 1;
     }
     while len > 0 {
         len -= 1;
-        buf.push(temp[len]);
+        buf[pos] = temp[len];
+        pos += 1;
     }
-    buf.push(sep);
+    pos
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -242,13 +247,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--data" {
-            if let Some(v) = args.next() {
-                data_dir = v;
-            }
+            if let Some(v) = args.next() { data_dir = v; }
         } else if arg == "--out" {
-            if let Some(v) = args.next() {
-                out_dir = v;
-            }
+            if let Some(v) = args.next() { out_dir = v; }
         }
     }
     let (data_path, out_path) = (PathBuf::from(data_dir), PathBuf::from(out_dir));
@@ -274,17 +275,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let fd = file.as_raw_fd();
     let data = unsafe {
-        let p = mmap(
-            std::ptr::null_mut(),
-            size + 4096,
-            PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS,
-            -1,
-            0,
-        );
-        if p == MAP_FAILED
-            || mmap(p, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED
-        {
+        let p = mmap(std::ptr::null_mut(), size + 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+        if p == MAP_FAILED {
             std::process::exit(1);
         }
         madvise(p, size, MADV_WILLNEED | MADV_SEQUENTIAL);
@@ -343,8 +335,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let ne = sorted_names.len();
 
+    unsafe {
+        madvise(data as *mut u8, size, MADV_DONTNEED);
+    }
+
     let next_hour = AtomicUsize::new(0);
-    let mut out_bufs: Vec<Vec<u8>> = (0..HOURS).map(|_| Vec::new()).collect();
+    let mut out_bufs: Vec<Vec<u8>> = (0..HOURS).map(|_| Vec::with_capacity(4096)).collect();
     let out_raw = out_bufs.as_mut_ptr() as usize;
 
     thread::scope(|s| {
@@ -356,6 +352,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let (mut count, mut errors, mut cursor) =
                     (vec![0u32; ne + 1], vec![0u32; ne], vec![0u32; ne]);
                 let mut lat: Vec<u32> = Vec::new();
+                let mut line = [0u8; 512];
 
                 loop {
                     let h = next_h.fetch_add(1, Ordering::Relaxed);
@@ -426,7 +423,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let label = &labels_ref[h];
                     let out_text = unsafe { &mut *(out_raw as *mut Vec<u8>).add(h) };
-                    out_text.reserve(ne * 64);
 
                     for e in 0..ne {
                         let (start, end) = (count[e] as usize, count[e + 1] as usize);
@@ -436,30 +432,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         let slice = &mut lat[start..end];
-                        let (p50, p95, p99) = if n == 1 {
-                            (slice[0], slice[0], slice[0])
-                        } else {
+                        let (p50, p95, p99) = if n <= 256 {
                             slice.sort_unstable();
                             (
                                 slice[(50 * n + 99) / 100 - 1],
                                 slice[(95 * n + 99) / 100 - 1],
                                 slice[(99 * n + 99) / 100 - 1],
                             )
+                        } else {
+                            let (r99, r95, r50) = (
+                                (99 * n + 99) / 100 - 1,
+                                (95 * n + 99) / 100 - 1,
+                                (50 * n + 99) / 100 - 1,
+                            );
+                            slice.select_nth_unstable(r99);
+                            let p99 = slice[r99];
+                            let p95 = if r95 == r99 {
+                                p99
+                            } else {
+                                slice[..r99].select_nth_unstable(r95);
+                                slice[r95]
+                            };
+                            let p50 = if r50 == r95 {
+                                p95
+                            } else {
+                                slice[..r95].select_nth_unstable(r50);
+                                slice[r50]
+                            };
+                            (p50, p95, p99)
                         };
 
                         let err = errors[e];
                         let ppm = ((err as u64) * 1_000_000 / (n as u64)) as u32;
 
-                        out_text.extend_from_slice(label);
-                        out_text.push(b' ');
-                        out_text.extend_from_slice(names_ref[e]);
-                        out_text.push(b' ');
-                        push_field(out_text, n as u32, b' ');
-                        push_field(out_text, p50, b' ');
-                        push_field(out_text, p95, b' ');
-                        push_field(out_text, p99, b' ');
-                        push_field(out_text, err, b' ');
-                        push_field(out_text, ppm, b'\n');
+                        let mut pos = 0;
+                        line[..20].copy_from_slice(label);
+                        pos += 20;
+                        line[pos] = b' ';
+                        pos += 1;
+                        let ep_name = names_ref[e];
+                        line[pos..pos + ep_name.len()].copy_from_slice(ep_name);
+                        pos += ep_name.len();
+                        line[pos] = b' ';
+                        pos += 1;
+                        pos = append_u32(&mut line, n as u32, pos);
+                        line[pos] = b' ';
+                        pos += 1;
+                        pos = append_u32(&mut line, p50, pos);
+                        line[pos] = b' ';
+                        pos += 1;
+                        pos = append_u32(&mut line, p95, pos);
+                        line[pos] = b' ';
+                        pos += 1;
+                        pos = append_u32(&mut line, p99, pos);
+                        line[pos] = b' ';
+                        pos += 1;
+                        pos = append_u32(&mut line, err, pos);
+                        line[pos] = b' ';
+                        pos += 1;
+                        pos = append_u32(&mut line, ppm, pos);
+                        line[pos] = b'\n';
+                        pos += 1;
+                        out_text.extend_from_slice(&line[..pos]);
                     }
                 }
             });
