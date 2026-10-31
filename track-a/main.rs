@@ -17,14 +17,12 @@ const TABLE_SLOTS: usize = 1 << 12;
 const BLOCK_CAP: usize = (16384 - 16) / 4;
 
 #[inline(always)] unsafe fn load8(p: *const u8) -> u64 { (p as *const u64).read_unaligned() }
+#[inline(always)] unsafe fn match32(p: *const u8, c: u8) -> u32 {
+    let v = _mm256_loadu_si256(p as *const __m256i);
+    _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8))) as u32
+}
 #[inline(always)] unsafe fn find(mut s: *const u8, c: u8) -> *const u8 {
-    let target = _mm256_set1_epi8(c as i8);
-    loop {
-        let v = _mm256_loadu_si256(s as *const __m256i);
-        let m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, target)) as u32;
-        if m != 0 { return s.add(m.trailing_zeros() as usize); }
-        s = s.add(32);
-    }
+    loop { let m = match32(s, c); if m != 0 { return s.add(m.trailing_zeros() as usize); } s = s.add(32); }
 }
 #[inline(always)] unsafe fn parse_digits(end: *const u8, len: u32) -> u32 {
     let v = _mm_loadu_si128(end.sub(16) as *const __m128i);
@@ -52,7 +50,7 @@ impl<'a> EndpointTable<'a> {
         let h1 = _mm_crc32_u64(len as u64, a);
         let mut i = _mm_crc32_u64(h1, b) as usize;
         loop {
-            let slot = &mut self.slots[i & (TABLE_SLOTS - 1)];
+            let slot = &mut self.slots[i % TABLE_SLOTS];
             if *slot == 0 {
                 let idx = self.names.len() as u32;
                 self.names.push(std::slice::from_raw_parts(s, len));
@@ -93,21 +91,12 @@ impl<'a> Worker<'a> {
         self.reserved = reserve;
         self.region = mmap(std::ptr::null_mut(), reserve, 3, 0x22, -1, 0);
         if self.region == !0 as *mut u8 { std::process::exit(1); }
-        let c_sp = _mm256_set1_epi8(b' ' as i8);
-        let c_nl = _mm256_set1_epi8(b'\n' as i8);
-
         while p < end {
             let day_idx = if *p.add(6) == b'0' { (*p.add(9) - b'0') as i32 } else { (*p.add(9) - b'0' + 1) as i32 };
             let hour = ((*p.add(11) - b'0') * 10 + (*p.add(12) - b'0')) as i32;
             let h = (day_idx * 24 + hour - 18) as usize;
             let m = p.add(28);
-
-            // 1-pass AVX2 load for both space and newline
-            let v0 = _mm256_loadu_si256(m as *const __m256i);
-            let v1 = _mm256_loadu_si256(m.add(32) as *const __m256i);
-            let sp = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, c_sp)) as u64) | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, c_sp)) as u64) << 32);
-            let nl = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, c_nl)) as u64) | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, c_nl)) as u64) << 32);
-
+            let (sp, nl) = ((match32(m, b' ') as u64) | ((match32(m.add(32), b' ') as u64) << 32), (match32(m, b'\n') as u64) | ((match32(m.add(32), b'\n') as u64) << 32));
             let ep = m.add(sp.trailing_zeros() as usize + 1);
             let ee = if nl != 0 { m.add((sp & (sp - 1)).trailing_zeros() as usize) } else { find(ep, b' ') };
             let eol = if nl != 0 { m.add(nl.trailing_zeros() as usize) } else { find(ee.add(5), b'\n') };
@@ -240,8 +229,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for _ in 0..NTHREADS {
             s.spawn(move || {
                 let (mut count, mut errors, mut cursor) = (vec![0u32; ne + 1], vec![0u32; ne], vec![0u32; ne]);
-                let (mut lat, mut line) = (Vec::with_capacity(32768), [0u8; 512]);
-                let mut thread_buf: Vec<u8> = Vec::with_capacity(32768);
+                let (mut lat, mut line) = (Vec::new(), [0u8; 512]);
 
                 loop {
                     let h = next_h_ref.fetch_add(1, Ordering::Relaxed);
@@ -270,7 +258,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cursor.copy_from_slice(&count[..ne]);
                     let total_lat = count[ne] as usize;
                     lat.clear();
-                    if lat.capacity() < total_lat { lat.reserve(total_lat - lat.capacity()); }
+                    lat.reserve(total_lat);
                     unsafe { lat.set_len(total_lat); }
 
                     for wt in 0..NTHREADS {
@@ -295,7 +283,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     let label = &labels_ref[h];
-                    thread_buf.clear();
+                    let mut out_text = text_ref[h].lock().unwrap();
+                    out_text.reserve(ne * 64);
 
                     for e in 0..ne {
                         let (start, end) = (count[e] as usize, count[e + 1] as usize);
@@ -321,12 +310,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         line[pos..pos + ep_name.len()].copy_from_slice(ep_name); pos += ep_name.len();
                         for v in [n as u32, p50, p95, p99, err, ppm] { line[pos] = b' '; pos += 1; pos = append_u32(&mut line, v, pos); }
                         line[pos] = b'\n'; pos += 1;
-                        thread_buf.extend_from_slice(&line[..pos]);
-                    }
-
-                    {
-                        let mut out_text = text_ref[h].lock().unwrap();
-                        out_text.extend_from_slice(&thread_buf);
+                        out_text.extend_from_slice(&line[..pos]);
                     }
                     done_ref[h].store(true, Ordering::Release);
                 }
