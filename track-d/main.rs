@@ -292,7 +292,7 @@ fn main() {
         return;
     }
 
-    let num_workers = 12.min(thread::available_parallelism().map(|n| n.get()).unwrap_or(12)).min(num_queries).max(1);
+    let num_workers = 8.min(num_queries).max(1);
     let head_arc = Arc::new(head);
     let edges_arc = Arc::new(edges);
     let has_in_arc = Arc::new(has_in_edges);
