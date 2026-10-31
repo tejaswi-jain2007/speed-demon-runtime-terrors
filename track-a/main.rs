@@ -47,13 +47,27 @@ unsafe fn parse_digits(end: *const u8, len: u32) -> u32 {
     high.wrapping_mul(100000000) + low
 }
 
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct Slot {
+    fp: u32,
+    id: u16,
+    len: u16,
+    ptr: *const u8,
+}
+
 struct EndpointTable<'a> {
-    slots: [u32; TABLE_SLOTS],
+    slots: [Slot; TABLE_SLOTS],
     names: Vec<&'a [u8]>,
 }
 
 impl<'a> EndpointTable<'a> {
-    fn new() -> Self { Self { slots: [0; TABLE_SLOTS], names: Vec::with_capacity(256) } }
+    fn new() -> Self {
+        Self {
+            slots: [Slot { fp: 0, id: 0, len: 0, ptr: std::ptr::null() }; TABLE_SLOTS],
+            names: Vec::with_capacity(256),
+        }
+    }
 
     #[inline(always)]
     unsafe fn intern(&mut self, s: *const u8, len: usize) -> u32 {
@@ -61,18 +75,26 @@ impl<'a> EndpointTable<'a> {
         let b = if len >= 8 { load8(s.add(len - 8)) } else { 0 };
         if len < 8 { a &= (1u64 << (8 * len)) - 1; }
         let h1 = _mm_crc32_u64(len as u64, a);
-        let mut i = _mm_crc32_u64(h1, b) as usize;
-        let slice = std::slice::from_raw_parts(s, len);
+        let h = _mm_crc32_u64(h1, b);
+        let fp = (h as u32) | 1;
+        let mut i = (h as usize) & (TABLE_SLOTS - 1);
         loop {
-            let slot = &mut self.slots[i & (TABLE_SLOTS - 1)];
-            if *slot == 0 {
-                let idx = self.names.len() as u32;
-                self.names.push(slice);
-                *slot = idx + 1;
-                return idx;
+            let slot = self.slots.get_unchecked_mut(i);
+            if slot.fp == 0 {
+                let idx = self.names.len() as u16;
+                slot.fp = fp;
+                slot.id = idx;
+                slot.len = len as u16;
+                slot.ptr = s;
+                self.names.push(std::slice::from_raw_parts(s, len));
+                return idx as u32;
             }
-            if self.names[(*slot - 1) as usize] == slice { return *slot - 1; }
-            i += 1;
+            if slot.fp == fp && slot.len as usize == len {
+                if std::slice::from_raw_parts(slot.ptr, len) == std::slice::from_raw_parts(s, len) {
+                    return slot.id as u32;
+                }
+            }
+            i = (i + 1) & (TABLE_SLOTS - 1);
         }
     }
 }
@@ -313,9 +335,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     lat[cursor[e] as usize] = rec >> KEY_BITS;
                                     cursor[e] += 1;
                                 }
-                                let next_b = b_ref.next;
-                                madvise(b as *mut u8, std::mem::size_of::<Block>(), MADV_DONTNEED);
-                                b = next_b;
+                                b = b_ref.next;
                             }
                         }
                         for &(l, key) in &w.big[h] {

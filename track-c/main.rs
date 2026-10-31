@@ -119,7 +119,7 @@ impl LocalCountryAgg {
 
 unsafe fn parse_csv_chunk(
     rec_ptr: *const u8, start: usize, end: usize, rlookup: &[u8],
-    local_aggs: &mut [LocalCountryAgg], local_names: &mut [Vec<u32>],
+    local_aggs: &mut [LocalCountryAgg], filter: &mut [[u64; 2]], local_names: &mut Vec<u64>,
 ) {
     let mut p = rec_ptr.add(start);
     let end_ptr = rec_ptr.add(end);
@@ -220,8 +220,14 @@ unsafe fn parse_csv_chunk(
         agg.name_bytes += name_len;
         agg.note_bytes += note_len;
 
-        let names_vec = local_names.get_unchecked_mut(cid);
-        names_vec.push(name_hash);
+        let packed = (((cid as u64) + 1) << 48) | (name_hash as u64);
+        let slot = (name_hash as usize) & 16383;
+        let row = filter.get_unchecked_mut(slot);
+        if row[0] != packed && row[1] != packed {
+            row[1] = row[0];
+            row[0] = packed;
+            local_names.push(packed);
+        }
     }
 }
 
@@ -312,7 +318,7 @@ fn main() {
 
     let num_countries = countries.len();
     let mut thread_aggs = vec![vec![LocalCountryAgg::new(); num_countries]; num_threads];
-    let mut thread_names = vec![vec![Vec::<u32>::with_capacity(32); num_countries]; num_threads];
+    let mut thread_names = vec![Vec::<u64>::new(); num_threads];
 
     thread::scope(|s| {
         let rec_slice = rec_data;
@@ -324,20 +330,40 @@ fn main() {
         for (t, (local_aggs, local_names)) in aggs_slice.iter_mut().zip(names_slice.iter_mut()).enumerate() {
             let (start, end) = (splits_ref[t], splits_ref[t + 1]);
             s.spawn(move || {
+                let mut filter = vec![[0u64; 2]; 16384];
+                local_names.reserve(32768);
                 unsafe {
-                    parse_csv_chunk(rec_slice.as_ptr(), start, end, rlookup_ref, local_aggs, local_names);
-                    madvise_dontneed(rec_slice.as_ptr().add(start), end - start);
+                    parse_csv_chunk(rec_slice.as_ptr(), start, end, rlookup_ref, local_aggs, &mut filter, local_names);
                 }
-                for v in local_names.iter_mut() {
-                    v.sort_unstable();
-                    v.dedup();
-                }
+                drop(filter);
+                local_names.sort_unstable();
+                local_names.dedup();
+                local_names.shrink_to_fit();
             });
         }
     });
 
     unsafe { madvise_dontneed(rec_data.as_ptr(), rec_size); }
     drop(rec_mmap);
+
+    let mut thread_offsets = Vec::with_capacity(num_threads);
+    for t in 0..num_threads {
+        let names = &thread_names[t];
+        let mut offsets = vec![0usize; num_countries + 1];
+        let mut curr_cid = 0usize;
+        for (idx, &packed) in names.iter().enumerate() {
+            let cid = ((packed >> 48) as usize).saturating_sub(1);
+            while curr_cid < cid {
+                curr_cid += 1;
+                offsets[curr_cid] = idx;
+            }
+        }
+        while curr_cid < num_countries {
+            curr_cid += 1;
+            offsets[curr_cid] = names.len();
+        }
+        thread_offsets.push(offsets);
+    }
 
     let mut buf = Vec::with_capacity(4096);
     for c in 0..num_countries {
@@ -359,9 +385,10 @@ fn main() {
                 dest.name_bytes += src.name_bytes;
                 dest.note_bytes += src.note_bytes;
             }
-            let t_names = &thread_names[t][c];
-            if !t_names.is_empty() {
-                buf.extend_from_slice(t_names);
+            let s_idx = thread_offsets[t][c];
+            let e_idx = thread_offsets[t][c + 1];
+            if e_idx > s_idx {
+                buf.extend_from_slice(&thread_names[t][s_idx..e_idx]);
             }
         }
         dest.distinct_names = if buf.is_empty() { 0 } else if buf.len() == 1 { 1 } else {
