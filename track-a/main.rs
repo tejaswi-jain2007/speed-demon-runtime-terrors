@@ -49,21 +49,6 @@ unsafe fn find(mut s: *const u8, c: u8) -> *const u8 {
     }
 }
 
-#[inline(always)]
-unsafe fn parse_digits(end: *const u8, len: u32) -> u32 {
-    let v = _mm_loadu_si128(end.sub(16) as *const __m128i);
-    let v = _mm_subs_epu8(v, _mm_set1_epi8(b'0' as i8));
-    let lane = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    let v = _mm_and_si128(v, _mm_cmpgt_epi8(lane, _mm_set1_epi8((15 - len) as i8)));
-    let v = _mm_maddubs_epi16(v, _mm_set1_epi16(0x010A));
-    let v = _mm_madd_epi16(v, _mm_set1_epi32(0x00010064));
-    let v = _mm_packus_epi32(v, v);
-    let v = _mm_madd_epi16(v, _mm_set1_epi32(0x00012710));
-    let high = _mm_cvtsi128_si32(v) as u32;
-    let low = _mm_extract_epi32(v, 1) as u32;
-    high.wrapping_mul(100000000) + low
-}
-
 #[derive(Copy, Clone)]
 struct SendPtr<T>(*const T);
 unsafe impl<T> Send for SendPtr<T> {}
@@ -78,15 +63,23 @@ impl<T> SendPtr<T> {
 
 const TABLE_SLOTS: usize = 1 << 13;
 
+#[derive(Copy, Clone, Default)]
+struct Slot {
+    head8: u64,
+    tail8: u64,
+    len: u16,
+    id: u16,
+}
+
 struct EndpointTable<'a> {
-    slots: [u32; TABLE_SLOTS],
+    slots: [Slot; TABLE_SLOTS],
     names: Vec<&'a [u8]>,
 }
 
 impl<'a> EndpointTable<'a> {
     fn new() -> Self {
         Self {
-            slots: [0; TABLE_SLOTS],
+            slots: [Slot::default(); TABLE_SLOTS],
             names: Vec::with_capacity(2048),
         }
     }
@@ -102,15 +95,14 @@ impl<'a> EndpointTable<'a> {
         let mut i = _mm_crc32_u64(h1, b) as usize;
         loop {
             let slot = &mut self.slots[i & (TABLE_SLOTS - 1)];
-            if *slot == 0 {
-                let idx = self.names.len() as u32;
+            if slot.len == 0 {
+                let idx = self.names.len() as u16;
                 self.names.push(std::slice::from_raw_parts(s, len));
-                *slot = idx + 1;
-                return idx;
+                *slot = Slot { head8: a, tail8: b, len: len as u16, id: idx };
+                return idx as u32;
             }
-            let n = self.names[(*slot - 1) as usize];
-            if n.len() == len && std::slice::from_raw_parts(s, len) == n {
-                return *slot - 1;
+            if slot.len == len as u16 && slot.head8 == a && slot.tail8 == b {
+                return slot.id as u32;
             }
             i += 1;
         }
@@ -168,16 +160,8 @@ impl<'a> Worker<'a> {
 
         let space_vec = _mm256_set1_epi8(b' ' as i8);
         let nl_vec = _mm256_set1_epi8(b'\n' as i8);
-        let mut madvise_ptr = p as usize & !4095;
 
         while p < end {
-            // Drop processed input pages every 1MB to keep RSS locked at minimum
-            let curr_page = p as usize & !4095;
-            if curr_page > madvise_ptr + 1048576 {
-                madvise(madvise_ptr as *mut u8, curr_page - madvise_ptr, MADV_DONTNEED);
-                madvise_ptr = curr_page;
-            }
-
             let day_idx = if *p.add(6) == b'0' {
                 (*p.add(9) - b'0') as i32
             } else {
@@ -211,7 +195,14 @@ impl<'a> Worker<'a> {
 
             let is_err = if *ee.add(1) == b'5' { ERR_BIT } else { 0 };
             let key = self.endpoints.intern(ep, ee as usize - ep as usize) | is_err;
-            let lat = parse_digits(eol, (eol as usize - ee as usize - 5) as u32);
+
+            // Fast scalar latency parsing
+            let mut lat = 0u32;
+            let mut p_d = ee.add(5);
+            while p_d < eol {
+                lat = lat * 10 + (*p_d - b'0') as u32;
+                p_d = p_d.add(1);
+            }
             p = eol.add(1);
 
             if lat >= BIG {
@@ -239,12 +230,6 @@ impl<'a> Worker<'a> {
             let b_ref = &mut *(*b);
             b_ref.rec[b_ref.n as usize] = (lat << KEY_BITS) | key;
             b_ref.n += 1;
-        }
-
-        // Drop remaining input pages
-        let ef = (end as usize) & !4095;
-        if ef > madvise_ptr {
-            madvise(madvise_ptr as *mut u8, ef - madvise_ptr, MADV_DONTNEED);
         }
     }
 }
@@ -381,6 +366,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let from = d_send.as_ptr().add(cut_ref[t]);
                 let to = d_send.as_ptr().add(cut_ref[t + 1]);
                 w.parse(from, to);
+                let sf = (from as usize + 4095) & !4095;
+                let ef = (to as usize) & !4095;
+                if ef > sf {
+                    madvise(sf as *mut u8, ef - sf, MADV_DONTNEED);
+                }
             });
         }
     });
