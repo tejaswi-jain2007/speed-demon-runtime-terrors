@@ -89,8 +89,16 @@ impl<'a> Table<'a> {
                 return idx;
             }
             let n = self.names[(*slot - 1) as usize];
-            if n.len() == len && std::slice::from_raw_parts(s, len) == n {
-                return *slot - 1;
+            if n.len() == len {
+                if len < 8 {
+                    if std::slice::from_raw_parts(s, len) == n {
+                        return *slot - 1;
+                    }
+                } else if load8(n.as_ptr()) == a && load8(n.as_ptr().add(len - 8)) == b {
+                    if len <= 16 || std::slice::from_raw_parts(s, len) == n {
+                        return *slot - 1;
+                    }
+                }
             }
             i += 1;
         }
@@ -118,9 +126,17 @@ impl<'a> Worker<'a> {
             return;
         }
 
+        let mut prev_tag = 0u32;
+        let mut cur_h = 0usize;
+
         while p < end {
-            let day = (*p.add(9) + *p.add(6) - 96) as usize;
-            let h = day * 24 + ((*p.add(11) - b'0') * 10 + *p.add(12) - b'0') as usize - 18;
+            let tag = (p.add(9) as *const u32).read_unaligned();
+            if tag != prev_tag {
+                prev_tag = tag;
+                let day = (*p.add(9) + *p.add(6) - 96) as usize;
+                cur_h = day * 24 + ((*p.add(11) - b'0') * 10 + *p.add(12) - b'0') as usize - 18;
+            }
+            let h = cur_h;
 
             let v = load8(p.add(31)) ^ 0x2020202020202020u64;
             let mask = v.wrapping_sub(0x0101010101010101u64) & !v & 0x8080808080808080u64;
@@ -128,14 +144,43 @@ impl<'a> Worker<'a> {
 
             let eol = find_nl(p.add(39));
 
-            let mut lat = 0u32;
             let mut cur = eol.sub(1);
-            let mut mul = 1u32;
-            while *cur != b' ' {
-                lat += (*cur - b'0') as u32 * mul;
-                mul *= 10;
+            let b0 = *cur;
+            let lat = if *cur.sub(1) == b' ' {
                 cur = cur.sub(1);
-            }
+                (b0 - b'0') as u32
+            } else {
+                let b1 = *cur.sub(1);
+                if *cur.sub(2) == b' ' {
+                    cur = cur.sub(2);
+                    ((b1 - b'0') as u32) * 10 + (b0 - b'0') as u32
+                } else {
+                    let b2 = *cur.sub(2);
+                    if *cur.sub(3) == b' ' {
+                        cur = cur.sub(3);
+                        ((b2 - b'0') as u32) * 100 + ((b1 - b'0') as u32) * 10 + (b0 - b'0') as u32
+                    } else {
+                        let b3 = *cur.sub(3);
+                        if *cur.sub(4) == b' ' {
+                            cur = cur.sub(4);
+                            ((b3 - b'0') as u32) * 1000
+                                + ((b2 - b'0') as u32) * 100
+                                + ((b1 - b'0') as u32) * 10
+                                + (b0 - b'0') as u32
+                        } else {
+                            let mut lat = 0u32;
+                            let mut mul = 1u32;
+                            while *cur != b' ' {
+                                lat += (*cur - b'0') as u32 * mul;
+                                mul *= 10;
+                                cur = cur.sub(1);
+                            }
+                            lat
+                        }
+                    }
+                }
+            };
+
             let is_err = ((*cur.sub(3) == b'5') as u32) << 11;
             let ee = cur.sub(4);
             let key = self.ep.intern(ep, ee as usize - ep as usize) | is_err;
