@@ -109,16 +109,8 @@ impl<'a> EndpointTable<'a> {
                 return idx;
             }
             let n = self.names[(*slot - 1) as usize];
-            if n.len() == len {
-                if len <= 16 {
-                    let na = load8(n.as_ptr());
-                    let nb = if len >= 8 { load8(n.as_ptr().add(len - 8)) } else { 0 };
-                    if na == a && nb == b {
-                        return *slot - 1;
-                    }
-                } else if std::slice::from_raw_parts(s, len) == n {
-                    return *slot - 1;
-                }
+            if n.len() == len && std::slice::from_raw_parts(s, len) == n {
+                return *slot - 1;
             }
             i += 1;
         }
