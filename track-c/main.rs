@@ -90,7 +90,7 @@ impl LocalCountryAgg {
     }
 }
 
-const B_CAP: usize = 64;
+const B_CAP: usize = 128;
 
 #[derive(Clone, Copy)]
 struct Block { next: u32, hashes: [u32; B_CAP] }
@@ -103,7 +103,7 @@ struct ThreadPool {
 
 impl ThreadPool {
     fn new() -> Self {
-        ThreadPool { heads: [!0; 242], lens: [B_CAP as u16; 242], blocks: Vec::with_capacity(5200) }
+        ThreadPool { heads: [!0; 242], lens: [B_CAP as u16; 242], blocks: Vec::with_capacity(2600) }
     }
     #[inline(always)]
     fn push(&mut self, cid: usize, hash: u32) {
@@ -128,6 +128,7 @@ unsafe fn parse_csv_chunk(
     local_aggs: &mut [LocalCountryAgg], pool: &mut ThreadPool,
 ) {
     let mut p = rec_ptr.add(start);
+    let mut last_drop = p as usize;
     let end_ptr = rec_ptr.add(end);
     let v_quote = _mm256_set1_epi8(b'"' as i8);
 
@@ -230,7 +231,16 @@ unsafe fn parse_csv_chunk(
         if cents > agg.amount_max { agg.amount_max = cents; }
         agg.name_bytes += name_len;
         agg.note_bytes += note_len;
+
         pool.push(cid, name_hash);
+
+        if (p as usize).saturating_sub(last_drop) >= 2 * 1024 * 1024 {
+            drop_pages(last_drop as *const u8, p as usize - last_drop);
+            last_drop = p as usize;
+        }
+    }
+    if (end_ptr as usize).saturating_sub(last_drop) > 0 {
+        drop_pages(last_drop as *const u8, end_ptr as usize - last_drop);
     }
 }
 
@@ -327,7 +337,6 @@ fn main() {
                 let pool = unsafe { pools_ref[t].get() };
                 unsafe {
                     parse_csv_chunk(rec_slice.as_ptr(), start, end, rlookup_ref, local_aggs, pool);
-                    drop_pages(rec_slice.as_ptr().add(start), end - start);
                 }
                 b1_ref.wait();
 
