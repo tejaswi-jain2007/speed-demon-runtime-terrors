@@ -74,8 +74,15 @@ impl LocalCountryAgg {
     }
 }
 
-unsafe fn parse_csv_chunk(rec_ptr: *const u8, start: usize, end: usize, rlookup: &[u8], local_aggs: &mut [LocalCountryAgg], local_names: &mut Vec<u64>) {
-    let mut filter = [0u64; 16384];
+unsafe fn parse_csv_chunk(
+    rec_ptr: *const u8,
+    start: usize,
+    end: usize,
+    rlookup: &[u8],
+    local_aggs: &mut [LocalCountryAgg],
+    filter: &mut [[u64; 4]],
+    local_names: &mut Vec<u64>,
+) {
     let mut p = rec_ptr.add(start);
     let end_ptr = rec_ptr.add(end);
     let mut last_evict = p as usize;
@@ -118,16 +125,28 @@ unsafe fn parse_csv_chunk(rec_ptr: *const u8, start: usize, end: usize, rlookup:
         let mut note_len = 0u64;
         if p < end_ptr && *p == b'"' {
             p = p.add(1);
+            let start_note = p;
+            let mut quote_pairs = 0u64;
             while p < end_ptr {
                 if *p == b'"' {
-                    if p.add(1) < end_ptr && *p.add(1) == b'"' { note_len += 1; p = p.add(2); }
-                    else { p = p.add(1); break; }
-                } else { note_len += 1; p = p.add(1); }
+                    if p.add(1) < end_ptr && *p.add(1) == b'"' {
+                        quote_pairs += 1;
+                        p = p.add(2);
+                    } else {
+                        note_len = (p as usize - start_note as usize) as u64 - quote_pairs;
+                        p = p.add(1);
+                        break;
+                    }
+                } else {
+                    p = p.add(1);
+                }
             }
         } else {
+            let start_note = p;
             while p < end_ptr && *p != b',' && *p != b'\r' && *p != b'\n' {
-                note_len += 1; p = p.add(1);
+                p = p.add(1);
             }
+            note_len = (p as usize - start_note as usize) as u64;
         }
         if p < end_ptr && *p == b',' { p = p.add(1); }
 
@@ -137,11 +156,16 @@ unsafe fn parse_csv_chunk(rec_ptr: *const u8, start: usize, end: usize, rlookup:
 
         let mut neg = false;
         if p < end_ptr && *p == b'-' { neg = true; p = p.add(1); }
-        let (mut whole, mut frac) = (0i64, 0i64);
+        let mut whole = 0i64;
         while p < end_ptr && *p >= b'0' && *p <= b'9' { whole = whole * 10 + (*p - b'0') as i64; p = p.add(1); }
-        if p < end_ptr && *p == b'.' { p = p.add(1); }
-        if p < end_ptr && *p >= b'0' && *p <= b'9' { frac = frac * 10 + (*p - b'0') as i64; p = p.add(1); }
-        if p < end_ptr && *p >= b'0' && *p <= b'9' { frac = frac * 10 + (*p - b'0') as i64; p = p.add(1); }
+        let mut frac = 0i64;
+        if p < end_ptr && *p == b'.' {
+            p = p.add(1);
+            if p.add(2) <= end_ptr {
+                frac = ((*p - b'0') as i64) * 10 + (*p.add(1) - b'0') as i64;
+                p = p.add(2);
+            }
+        }
         let cents = if neg { -(whole * 100 + frac) } else { whole * 100 + frac };
 
         while p < end_ptr && (*p == b'\r' || *p == b'\n') { p = p.add(1); }
@@ -156,10 +180,16 @@ unsafe fn parse_csv_chunk(rec_ptr: *const u8, start: usize, end: usize, rlookup:
         agg.name_bytes += name_len;
         agg.note_bytes += note_len;
 
-        let packed = ((cid as u64) << 48) | (name_hash & 0x0000_FFFF_FFFF_FFFF);
-        let slot = (name_hash as usize) & 0x3FFF;
-        if filter[slot] != packed {
-            filter[slot] = packed;
+        let packed = (((cid as u64) + 1) << 48) | (name_hash & 0x0000_FFFF_FFFF_FFFF);
+        let slot = (name_hash as usize) & 16383;
+        let row = filter.get_unchecked_mut(slot);
+        if row[0] == packed || row[1] == packed || row[2] == packed || row[3] == packed {
+            // Already seen in this thread, skip
+        } else {
+            row[3] = row[2];
+            row[2] = row[1];
+            row[1] = row[0];
+            row[0] = packed;
             local_names.push(packed);
         }
     }
@@ -258,61 +288,113 @@ fn main() {
     for t in 0..num_threads {
         let (rec_ref, rlookup_ref, start, end) = (Arc::clone(&rec_mmap), Arc::clone(&rlookup_arc), splits[t], splits[t + 1]);
         handles.push(thread::spawn(move || {
-            let (mut local_aggs, mut local_names) = (vec![LocalCountryAgg::new(); num_countries], Vec::with_capacity(16384));
+            let mut filter = vec![[0u64; 4]; 16384];
+            let mut local_names = Vec::with_capacity(65536);
+            let mut local_aggs = vec![LocalCountryAgg::new(); num_countries];
             let d = rec_ref.as_slice();
             unsafe {
-                parse_csv_chunk(d.as_ptr(), start, end, &rlookup_ref, &mut local_aggs, &mut local_names);
+                parse_csv_chunk(d.as_ptr(), start, end, &rlookup_ref, &mut local_aggs, &mut filter, &mut local_names);
                 madvise_dontneed(d.as_ptr().add(start), end - start);
             }
+            drop(filter);
+            local_names.sort_unstable();
+            local_names.dedup();
+            local_names.shrink_to_fit();
             (local_aggs, local_names)
         }));
     }
 
-    let mut thread_results = Vec::with_capacity(num_threads);
-    let mut country_names: Vec<Vec<u64>> = vec![Vec::with_capacity(2048); num_countries];
+    let mut thread_aggs = Vec::with_capacity(num_threads);
+    let mut thread_names = Vec::with_capacity(num_threads);
     for h in handles {
         let (aggs, names) = h.join().unwrap();
-        thread_results.push(aggs);
-        for packed in names {
-            country_names[(packed >> 48) as usize].push(packed & 0x0000_FFFF_FFFF_FFFF);
-        }
+        thread_aggs.push(aggs);
+        thread_names.push(names);
     }
     drop(rec_mmap);
 
-    let country_names_ptr = country_names.as_mut_ptr() as usize;
+    let mut thread_offsets = Vec::with_capacity(num_threads);
+    for t in 0..num_threads {
+        let names = &thread_names[t];
+        let mut offsets = vec![0usize; num_countries + 1];
+        let mut curr_cid = 0usize;
+        for (idx, &packed) in names.iter().enumerate() {
+            let cid = ((packed >> 48) as usize) - 1;
+            while curr_cid < cid {
+                curr_cid += 1;
+                offsets[curr_cid] = idx;
+            }
+        }
+        while curr_cid < num_countries {
+            curr_cid += 1;
+            offsets[curr_cid] = names.len();
+        }
+        thread_offsets.push(offsets);
+    }
+
+    let thread_names_arc = Arc::new(thread_names);
+    let thread_offsets_arc = Arc::new(thread_offsets);
     let mut dedup_handles = Vec::with_capacity(num_threads);
     let c_per_thread = (num_countries + num_threads - 1) / num_threads;
     for t in 0..num_threads {
+        let (t_names, t_offsets) = (Arc::clone(&thread_names_arc), Arc::clone(&thread_offsets_arc));
         let (start_c, end_c) = (t * c_per_thread, (t * c_per_thread + c_per_thread).min(num_countries));
         dedup_handles.push(thread::spawn(move || {
-            let c_ptr = country_names_ptr as *mut Vec<u64>;
-            let mut counts = Vec::with_capacity(end_c - start_c);
+            let mut results = Vec::with_capacity(end_c - start_c);
+            let mut buf = Vec::with_capacity(4096);
             for c in start_c..end_c {
-                let list = unsafe { &mut *c_ptr.add(c) };
-                if list.is_empty() { counts.push((c, 0)); }
-                else { list.sort_unstable(); list.dedup(); counts.push((c, list.len())); }
+                buf.clear();
+                for th in 0..t_names.len() {
+                    let s = t_offsets[th][c];
+                    let e = t_offsets[th][c + 1];
+                    if e > s {
+                        buf.extend_from_slice(&t_names[th][s..e]);
+                    }
+                }
+                if buf.is_empty() {
+                    results.push((c, 0));
+                } else if buf.len() == 1 {
+                    results.push((c, 1));
+                } else {
+                    buf.sort_unstable();
+                    buf.dedup();
+                    results.push((c, buf.len()));
+                }
             }
-            counts
+            results
         }));
     }
     for dh in dedup_handles {
-        for (c, distinct) in dh.join().unwrap() { countries[c].distinct_names = distinct; }
+        for (c, distinct) in dh.join().unwrap() {
+            countries[c].distinct_names = distinct;
+        }
     }
-    drop(country_names);
+    drop(thread_names_arc);
+    drop(thread_offsets_arc);
 
     for c in 0..num_countries {
         let dest = &mut countries[c];
-        for local_aggs in &thread_results {
+        let mut first = true;
+        for local_aggs in &thread_aggs {
             let src = &local_aggs[c];
             if src.count > 0 {
-                dest.count += src.count; dest.id_sum += src.id_sum; dest.amount_sum += src.amount_sum;
-                if src.amount_min < dest.amount_min || dest.count == src.count { dest.amount_min = src.amount_min; }
-                if src.amount_max > dest.amount_max || dest.count == src.count { dest.amount_max = src.amount_max; }
-                dest.name_bytes += src.name_bytes; dest.note_bytes += src.note_bytes;
+                dest.count += src.count;
+                dest.id_sum += src.id_sum;
+                dest.amount_sum += src.amount_sum;
+                if first {
+                    dest.amount_min = src.amount_min;
+                    dest.amount_max = src.amount_max;
+                    first = false;
+                } else {
+                    if src.amount_min < dest.amount_min { dest.amount_min = src.amount_min; }
+                    if src.amount_max > dest.amount_max { dest.amount_max = src.amount_max; }
+                }
+                dest.name_bytes += src.name_bytes;
+                dest.note_bytes += src.note_bytes;
             }
         }
     }
-    drop(thread_results);
+    drop(thread_aggs);
 
     countries.sort_unstable_by(|a, b| a.key.cmp(&b.key));
 

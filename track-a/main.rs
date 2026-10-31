@@ -123,7 +123,7 @@ impl<'a> EndpointTable<'a> {
     }
 }
 
-const BLOCK_CAP: usize = (8192 - 16) / 4;
+const BLOCK_CAP: usize = (16384 - 16) / 4;
 
 #[repr(C)]
 struct Block {
