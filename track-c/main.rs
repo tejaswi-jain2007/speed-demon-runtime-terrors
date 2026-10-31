@@ -3,6 +3,7 @@ use std::arch::x86_64::*;
 use std::cell::UnsafeCell;
 use std::fs::File;
 use std::io::Write;
+use std::mem::MaybeUninit;
 use std::os::unix::io::AsRawFd;
 use std::sync::Barrier;
 use std::thread;
@@ -93,7 +94,7 @@ impl LocalCountryAgg {
 const B_CAP: usize = 128;
 
 #[derive(Clone, Copy)]
-struct Block { next: u32, hashes: [u32; B_CAP] }
+struct Block { next: u32, hashes: [MaybeUninit<u32>; B_CAP] }
 
 struct ThreadPool {
     heads: [u32; 242],
@@ -110,12 +111,12 @@ impl ThreadPool {
         let cur_len = self.lens[cid];
         if cur_len < B_CAP as u16 {
             let h = self.heads[cid] as usize;
-            self.blocks[h].hashes[cur_len as usize] = hash;
+            self.blocks[h].hashes[cur_len as usize].write(hash);
             self.lens[cid] = cur_len + 1;
         } else {
             let new_idx = self.blocks.len() as u32;
-            let mut blk = Block { next: self.heads[cid], hashes: [0; B_CAP] };
-            blk.hashes[0] = hash;
+            let mut blk = Block { next: self.heads[cid], hashes: unsafe { MaybeUninit::uninit().assume_init() } };
+            blk.hashes[0].write(hash);
             self.blocks.push(blk);
             self.heads[cid] = new_idx;
             self.lens[cid] = 1;
@@ -217,18 +218,17 @@ unsafe fn parse_csv_chunk(
         while *p != b'.' { whole = whole * 10 + (*p - b'0') as i64; p = p.add(1); }
         p = p.add(1);
         let cents_abs = whole * 100 + ((*p - b'0') as i64) * 10 + (*p.add(1) - b'0') as i64;
-        p = p.add(2);
         let cents = if neg { -cents_abs } else { cents_abs };
-        if *p == b'\r' { p = p.add(1); }
-        if *p == b'\n' { p = p.add(1); }
+        p = p.add(2);
+        if *p == b'\r' { p = p.add(2); } else if *p == b'\n' { p = p.add(1); }
 
         let cid = if (region_id as usize) < rlookup.len() { *rlookup.get_unchecked(region_id as usize) as usize } else { 0 };
         let agg = local_aggs.get_unchecked_mut(cid);
         agg.count += 1;
         agg.id_sum += record_id;
         agg.amount_sum += cents;
-        if cents < agg.amount_min { agg.amount_min = cents; }
-        if cents > agg.amount_max { agg.amount_max = cents; }
+        agg.amount_min = agg.amount_min.min(cents);
+        agg.amount_max = agg.amount_max.max(cents);
         agg.name_bytes += name_len;
         agg.note_bytes += note_len;
 
@@ -354,7 +354,8 @@ fn main() {
                         while cur != !0 {
                             let blk = &pool.blocks[cur as usize];
                             let len = if first_block { first_block = false; pool.lens[c] as usize } else { B_CAP };
-                            buf.extend_from_slice(&blk.hashes[..len]);
+                            let slice: &[u32] = unsafe { std::slice::from_raw_parts(blk.hashes.as_ptr() as *const u32, len) };
+                            buf.extend_from_slice(slice);
                             cur = blk.next;
                         }
                     }
@@ -379,8 +380,8 @@ fn main() {
                 dest.count += src.count; dest.id_sum += src.id_sum; dest.amount_sum += src.amount_sum;
                 if first { dest.amount_min = src.amount_min; dest.amount_max = src.amount_max; first = false; }
                 else {
-                    if src.amount_min < dest.amount_min { dest.amount_min = src.amount_min; }
-                    if src.amount_max > dest.amount_max { dest.amount_max = src.amount_max; }
+                    dest.amount_min = dest.amount_min.min(src.amount_min);
+                    dest.amount_max = dest.amount_max.max(src.amount_max);
                 }
                 dest.name_bytes += src.name_bytes; dest.note_bytes += src.note_bytes;
             }
