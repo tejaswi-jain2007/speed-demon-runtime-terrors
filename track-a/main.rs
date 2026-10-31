@@ -123,7 +123,7 @@ impl<'a> EndpointTable<'a> {
     }
 }
 
-const BLOCK_CAP: usize = (16384 - 16) / 4;
+const BLOCK_CAP: usize = (8192 - 16) / 4;
 
 #[repr(C)]
 struct Block {
@@ -369,6 +369,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let from = d_send.as_ptr().add(cut_ref[t]);
                 let to = d_send.as_ptr().add(cut_ref[t + 1]);
                 w.parse(from, to);
+                let sf = (from as usize + 4095) & !4095;
+                let ef = (to as usize) & !4095;
+                if ef > sf {
+                    madvise(sf as *mut u8, ef - sf, MADV_DONTNEED);
+                }
                 barrier_ref.wait();
             });
         }

@@ -74,77 +74,80 @@ impl LocalCountryAgg {
     }
 }
 
-fn parse_csv_chunk(rec_data: &[u8], start: usize, end: usize, rlookup: &[u8], local_aggs: &mut [LocalCountryAgg], local_names: &mut Vec<u64>) {
+unsafe fn parse_csv_chunk(rec_ptr: *const u8, start: usize, end: usize, rlookup: &[u8], local_aggs: &mut [LocalCountryAgg], local_names: &mut Vec<u64>) {
     let mut filter = [0u64; 16384];
-    let mut p = start;
-    let mut last_evict = start;
-    while p < end {
-        if p - last_evict >= 1024 * 1024 {
-            unsafe { madvise_dontneed(rec_data.as_ptr().add(last_evict), p - last_evict); }
-            last_evict = p;
+    let mut p = rec_ptr.add(start);
+    let end_ptr = rec_ptr.add(end);
+    let mut last_evict = p as usize;
+    while p < end_ptr {
+        if (p as usize) - last_evict >= 1024 * 1024 {
+            let s = (last_evict + 4095) & !4095;
+            let e = (p as usize) & !4095;
+            if e > s { madvise(s as *mut u8, e - s, 4); }
+            last_evict = p as usize;
         }
-        if p + 3 <= end && rec_data[p] == 0xEF && rec_data[p + 1] == 0xBB && rec_data[p + 2] == 0xBF { p += 3; }
-        if p >= end { break; }
+        if p.add(3) <= end_ptr && *p == 0xEF && *p.add(1) == 0xBB && *p.add(2) == 0xBF { p = p.add(3); }
+        if p >= end_ptr { break; }
 
         let mut record_id = 0u64;
-        while p < end && rec_data[p] >= b'0' && rec_data[p] <= b'9' { record_id = record_id * 10 + (rec_data[p] - b'0') as u64; p += 1; }
-        if p < end && rec_data[p] == b',' { p += 1; }
+        while p < end_ptr && *p >= b'0' && *p <= b'9' { record_id = record_id * 10 + (*p - b'0') as u64; p = p.add(1); }
+        if p < end_ptr && *p == b',' { p = p.add(1); }
 
         let (mut name_hash, mut name_len) = (14695981039346656037u64, 0u64);
-        if p < end && rec_data[p] == b'"' {
-            p += 1;
-            while p < end {
-                if rec_data[p] == b'"' {
-                    if p + 1 < end && rec_data[p + 1] == b'"' {
+        if p < end_ptr && *p == b'"' {
+            p = p.add(1);
+            while p < end_ptr {
+                if *p == b'"' {
+                    if p.add(1) < end_ptr && *p.add(1) == b'"' {
                         name_hash = (name_hash ^ (b'"' as u64)).wrapping_mul(1099511628211);
-                        name_len += 1; p += 2;
-                    } else { p += 1; break; }
+                        name_len += 1; p = p.add(2);
+                    } else { p = p.add(1); break; }
                 } else {
-                    name_hash = (name_hash ^ (rec_data[p] as u64)).wrapping_mul(1099511628211);
-                    name_len += 1; p += 1;
+                    name_hash = (name_hash ^ (*p as u64)).wrapping_mul(1099511628211);
+                    name_len += 1; p = p.add(1);
                 }
             }
         } else {
-            while p < end && rec_data[p] != b',' && rec_data[p] != b'\r' && rec_data[p] != b'\n' {
-                name_hash = (name_hash ^ (rec_data[p] as u64)).wrapping_mul(1099511628211);
-                name_len += 1; p += 1;
+            while p < end_ptr && *p != b',' && *p != b'\r' && *p != b'\n' {
+                name_hash = (name_hash ^ (*p as u64)).wrapping_mul(1099511628211);
+                name_len += 1; p = p.add(1);
             }
         }
-        if p < end && rec_data[p] == b',' { p += 1; }
+        if p < end_ptr && *p == b',' { p = p.add(1); }
 
         let mut note_len = 0u64;
-        if p < end && rec_data[p] == b'"' {
-            p += 1;
-            while p < end {
-                if rec_data[p] == b'"' {
-                    if p + 1 < end && rec_data[p + 1] == b'"' { note_len += 1; p += 2; }
-                    else { p += 1; break; }
-                } else { note_len += 1; p += 1; }
+        if p < end_ptr && *p == b'"' {
+            p = p.add(1);
+            while p < end_ptr {
+                if *p == b'"' {
+                    if p.add(1) < end_ptr && *p.add(1) == b'"' { note_len += 1; p = p.add(2); }
+                    else { p = p.add(1); break; }
+                } else { note_len += 1; p = p.add(1); }
             }
         } else {
-            while p < end && rec_data[p] != b',' && rec_data[p] != b'\r' && rec_data[p] != b'\n' {
-                note_len += 1; p += 1;
+            while p < end_ptr && *p != b',' && *p != b'\r' && *p != b'\n' {
+                note_len += 1; p = p.add(1);
             }
         }
-        if p < end && rec_data[p] == b',' { p += 1; }
+        if p < end_ptr && *p == b',' { p = p.add(1); }
 
         let mut region_id = 0u32;
-        while p < end && rec_data[p] >= b'0' && rec_data[p] <= b'9' { region_id = region_id * 10 + (rec_data[p] - b'0') as u32; p += 1; }
-        if p < end && rec_data[p] == b',' { p += 1; }
+        while p < end_ptr && *p >= b'0' && *p <= b'9' { region_id = region_id * 10 + (*p - b'0') as u32; p = p.add(1); }
+        if p < end_ptr && *p == b',' { p = p.add(1); }
 
         let mut neg = false;
-        if p < end && rec_data[p] == b'-' { neg = true; p += 1; }
+        if p < end_ptr && *p == b'-' { neg = true; p = p.add(1); }
         let (mut whole, mut frac) = (0i64, 0i64);
-        while p < end && rec_data[p] >= b'0' && rec_data[p] <= b'9' { whole = whole * 10 + (rec_data[p] - b'0') as i64; p += 1; }
-        if p < end && rec_data[p] == b'.' { p += 1; }
-        if p < end && rec_data[p] >= b'0' && rec_data[p] <= b'9' { frac = frac * 10 + (rec_data[p] - b'0') as i64; p += 1; }
-        if p < end && rec_data[p] >= b'0' && rec_data[p] <= b'9' { frac = frac * 10 + (rec_data[p] - b'0') as i64; p += 1; }
+        while p < end_ptr && *p >= b'0' && *p <= b'9' { whole = whole * 10 + (*p - b'0') as i64; p = p.add(1); }
+        if p < end_ptr && *p == b'.' { p = p.add(1); }
+        if p < end_ptr && *p >= b'0' && *p <= b'9' { frac = frac * 10 + (*p - b'0') as i64; p = p.add(1); }
+        if p < end_ptr && *p >= b'0' && *p <= b'9' { frac = frac * 10 + (*p - b'0') as i64; p = p.add(1); }
         let cents = if neg { -(whole * 100 + frac) } else { whole * 100 + frac };
 
-        while p < end && (rec_data[p] == b'\r' || rec_data[p] == b'\n') { p += 1; }
+        while p < end_ptr && (*p == b'\r' || *p == b'\n') { p = p.add(1); }
 
-        let cid = if (region_id as usize) < rlookup.len() { unsafe { *rlookup.get_unchecked(region_id as usize) } } else { 0 };
-        let agg = unsafe { local_aggs.get_unchecked_mut(cid as usize) };
+        let cid = if (region_id as usize) < rlookup.len() { *rlookup.get_unchecked(region_id as usize) } else { 0 };
+        let agg = local_aggs.get_unchecked_mut(cid as usize);
         agg.count += 1;
         agg.id_sum += record_id;
         agg.amount_sum += cents;
@@ -160,7 +163,9 @@ fn parse_csv_chunk(rec_data: &[u8], start: usize, end: usize, rlookup: &[u8], lo
             local_names.push(packed);
         }
     }
-    if end > last_evict { unsafe { madvise_dontneed(rec_data.as_ptr().add(last_evict), end - last_evict); } }
+    let s = (last_evict + 4095) & !4095;
+    let e = (end_ptr as usize) & !4095;
+    if e > s { madvise(s as *mut u8, e - s, 4); }
 }
 
 fn main() {
@@ -215,7 +220,7 @@ fn main() {
     if hdr_p < rec_size && rec_data[hdr_p] == b'\n' { hdr_p += 1; }
     let data_start = hdr_p;
 
-    let num_threads = 6.min(thread::available_parallelism().map(|n| n.get()).unwrap_or(6)).max(1);
+    let num_threads = 12.min(thread::available_parallelism().map(|n| n.get()).unwrap_or(12)).max(1);
     let payload_len = rec_size - data_start;
     let mut splits = vec![data_start; num_threads + 1];
     splits[num_threads] = rec_size;
@@ -255,8 +260,10 @@ fn main() {
         handles.push(thread::spawn(move || {
             let (mut local_aggs, mut local_names) = (vec![LocalCountryAgg::new(); num_countries], Vec::with_capacity(16384));
             let d = rec_ref.as_slice();
-            parse_csv_chunk(d, start, end, &rlookup_ref, &mut local_aggs, &mut local_names);
-            unsafe { madvise_dontneed(d.as_ptr().add(start), end - start); }
+            unsafe {
+                parse_csv_chunk(d.as_ptr(), start, end, &rlookup_ref, &mut local_aggs, &mut local_names);
+                madvise_dontneed(d.as_ptr().add(start), end - start);
+            }
             (local_aggs, local_names)
         }));
     }
