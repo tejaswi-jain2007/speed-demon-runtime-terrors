@@ -1,10 +1,11 @@
-// Speed Demon 2026 - Track A (Ingest) - Ultra High-Performance Runtime Terrors
+// Speed Demon 2026 - Track A (Ingest) - Runtime Terrors
 use std::arch::x86_64::*;
+use std::cell::UnsafeCell;
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 extern "C" {
@@ -53,9 +54,7 @@ unsafe fn parse_digits(end: *const u8, len: u32) -> u32 {
     let v = _mm_madd_epi16(v, _mm_set1_epi32(0x00010064));
     let v = _mm_packus_epi32(v, v);
     let v = _mm_madd_epi16(v, _mm_set1_epi32(0x00012710));
-    let high = _mm_cvtsi128_si32(v) as u32;
-    let low = _mm_extract_epi32(v, 1) as u32;
-    high.wrapping_mul(100000000) + low
+    (_mm_cvtsi128_si32(v) as u32).wrapping_mul(100000000) + (_mm_extract_epi32(v, 1) as u32)
 }
 
 #[inline(always)]
@@ -64,8 +63,7 @@ fn append_u32(buf: &mut [u8], mut val: u32, mut pos: usize) -> usize {
         buf[pos] = b'0';
         return pos + 1;
     }
-    let mut temp = [0u8; 10];
-    let mut len = 0;
+    let (mut temp, mut len) = ([0u8; 10], 0);
     while val > 0 {
         temp[len] = b'0' + (val % 10) as u8;
         val /= 10;
@@ -92,6 +90,7 @@ struct Table<'a> {
     slots: [Slot; SLOTS],
     names: Vec<&'a [u8]>,
 }
+
 impl<'a> Table<'a> {
     fn new() -> Self {
         Self {
@@ -176,9 +175,8 @@ impl<'a> Worker<'a> {
         if p >= end {
             return;
         }
-        let reserve = 32 * std::mem::size_of::<Block>();
-        self.reserved = reserve;
-        self.region = mmap(std::ptr::null_mut(), reserve, 3, 0x22, -1, 0);
+        self.reserved = 32 * std::mem::size_of::<Block>();
+        self.region = mmap(std::ptr::null_mut(), self.reserved, 3, 0x22, -1, 0);
         if self.region == !0 as *mut u8 {
             _exit(1);
         }
@@ -243,6 +241,9 @@ impl<'a> Worker<'a> {
         }
     }
 }
+
+struct SyncBox<T>(UnsafeCell<T>);
+unsafe impl<T> Sync for SyncBox<T> {}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
@@ -360,39 +361,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let next_hour = AtomicUsize::new(0);
-    let done: Vec<AtomicBool> = (0..HOURS).map(|_| AtomicBool::new(false)).collect();
-    let text_boxes: Vec<std::sync::Mutex<Vec<u8>>> = (0..HOURS)
-        .map(|_| std::sync::Mutex::new(Vec::new()))
+    let out_boxes: Vec<SyncBox<Vec<u8>>> = (0..HOURS)
+        .map(|_| SyncBox(UnsafeCell::new(Vec::new())))
         .collect();
 
     thread::scope(|s| {
-        let (done_r, text_r, out_file_p) = (&done, &text_boxes, out_p.clone());
-        s.spawn(move || {
-            let out_f = match File::create(&out_file_p) {
-                Ok(f) => f,
-                Err(_) => return,
-            };
-            let mut writer = std::io::BufWriter::with_capacity(512 * 1024, out_f);
-            for h in 0..HOURS {
-                while !done_r[h].load(Ordering::Acquire) {
-                    std::hint::spin_loop();
-                }
-                let mut buf = text_r[h].lock().unwrap();
-                writer.write_all(&buf).ok();
-                *buf = Vec::new();
-            }
-            writer.flush().ok();
-        });
-
-        let (next_h, done_r, text_r, wrk_r, rk_r, lbl_r, nm_r) = (
-            &next_hour,
-            &done,
-            &text_boxes,
-            &workers,
-            &rank,
-            &labels,
-            &sorted,
-        );
+        let (next_h, wrk_r, rk_r, lbl_r, nm_r, out_r) =
+            (&next_hour, &workers, &rank, &labels, &sorted, &out_boxes);
 
         for _ in 0..NTHREADS {
             s.spawn(move || {
@@ -467,7 +442,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     let label = &lbl_r[h];
-                    let mut out_text = text_r[h].lock().unwrap();
+                    let out_text = unsafe { &mut *out_r[h].0.get() };
                     out_text.reserve(ne * 64);
 
                     for e in 0..ne {
@@ -535,13 +510,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         pos += 1;
                         out_text.extend_from_slice(&line[..pos]);
                     }
-
-                    done_r[h].store(true, Ordering::Release);
                 }
             });
         }
     });
 
+    let mut writer = std::io::BufWriter::with_capacity(512 * 1024, File::create(&out_p)?);
+    for h in 0..HOURS {
+        writer.write_all(unsafe { &*out_boxes[h].0.get() }).ok();
+    }
+    writer.flush().ok();
     unsafe {
         _exit(0);
     }
