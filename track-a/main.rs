@@ -1,18 +1,9 @@
-// Speed Demon 2026 - Track A (Ingest)
-// Team: Runtime Terrors
-// Ultra-optimized 1-pass AVX2 SIMD architecture: 19.0MB RSS, sub-0.023s execution, targeting 85+ points
-
-use std::arch::x86_64::*;
-use std::fs::File;
-use std::io::Write;
-use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::thread;
+// Speed Demon 2026 - Track A (Ingest) - Team: Runtime Terrors
+use std::{arch::x86_64::*, fs::File, io::Write, os::unix::io::AsRawFd, path::PathBuf, sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, Mutex}, thread};
 
 extern "C" {
-    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
-    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
+    fn madvise(a: *mut u8, l: usize, adv: i32) -> i32;
     fn _exit(status: i32) -> !;
 }
 
@@ -44,20 +35,14 @@ const BLOCK_CAP: usize = (16384 - 16) / 4;
     let v = _mm_madd_epi16(v, _mm_set1_epi32(0x00010064));
     let v = _mm_packus_epi32(v, v);
     let v = _mm_madd_epi16(v, _mm_set1_epi32(0x00012710));
-    let high = _mm_cvtsi128_si32(v) as u32;
-    let low = _mm_extract_epi32(v, 1) as u32;
-    high.wrapping_mul(100000000) + low
+    (_mm_cvtsi128_si32(v) as u32).wrapping_mul(100000000) + (_mm_extract_epi32(v, 1) as u32)
 }
 
-#[derive(Copy, Clone)]
-struct SendPtr<T>(*const T);
+#[derive(Copy, Clone)] struct SendPtr<T>(*const T);
 unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
 
-struct EndpointTable<'a> {
-    slots: [u32; TABLE_SLOTS],
-    names: Vec<&'a [u8]>,
-}
+struct EndpointTable<'a> { slots: [u32; TABLE_SLOTS], names: Vec<&'a [u8]> }
 impl<'a> EndpointTable<'a> {
     fn new() -> Self { Self { slots: [0; TABLE_SLOTS], names: Vec::with_capacity(512) } }
     #[inline(always)] unsafe fn intern(&mut self, s: *const u8, len: usize) -> u32 {
@@ -67,7 +52,7 @@ impl<'a> EndpointTable<'a> {
         let h1 = _mm_crc32_u64(len as u64, a);
         let mut i = _mm_crc32_u64(h1, b) as usize;
         loop {
-            let slot = &mut self.slots[i % TABLE_SLOTS];
+            let slot = &mut self.slots[i & (TABLE_SLOTS - 1)];
             if *slot == 0 {
                 let idx = self.names.len() as u32;
                 self.names.push(std::slice::from_raw_parts(s, len));
@@ -81,16 +66,12 @@ impl<'a> EndpointTable<'a> {
     }
 }
 
-#[repr(C)]
-struct Block { next: *mut Block, n: u32, rec: [u32; BLOCK_CAP] }
-
+#[repr(C)] struct Block { next: *mut Block, n: u32, rec: [u32; BLOCK_CAP] }
 struct Worker<'a> {
     endpoints: EndpointTable<'a>,
     head: [*mut Block; HOURS],
     big: Vec<Vec<(u32, u32)>>,
-    region: *mut u8,
-    used: usize,
-    reserved: usize,
+    region: *mut u8, used: usize, reserved: usize,
 }
 unsafe impl<'a> Send for Worker<'a> {}
 unsafe impl<'a> Sync for Worker<'a> {}
@@ -101,9 +82,7 @@ impl<'a> Worker<'a> {
             endpoints: EndpointTable::new(),
             head: [std::ptr::null_mut(); HOURS],
             big: (0..HOURS).map(|_| Vec::new()).collect(),
-            region: std::ptr::null_mut(),
-            used: 0,
-            reserved: 0,
+            region: std::ptr::null_mut(), used: 0, reserved: 0,
         }
     }
     unsafe fn parse(&mut self, mut p: *const u8, end: *const u8) {
@@ -121,7 +100,6 @@ impl<'a> Worker<'a> {
             let h = (day_idx * 24 + hour - 18) as usize;
             let m = p.add(28);
 
-            // 1-pass AVX2 load for both space and newline
             let v0 = _mm256_loadu_si256(m as *const __m256i);
             let v1 = _mm256_loadu_si256(m.add(32) as *const __m256i);
             let sp = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, c_sp)) as u64) | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, c_sp)) as u64) << 32);
@@ -130,28 +108,24 @@ impl<'a> Worker<'a> {
             let ep = m.add(sp.trailing_zeros() as usize + 1);
             let ee = if nl != 0 { m.add((sp & (sp - 1)).trailing_zeros() as usize) } else { find(ep, b' ') };
             let eol = if nl != 0 { m.add(nl.trailing_zeros() as usize) } else { find(ee.add(5), b'\n') };
-
-            let is_err = if *ee.add(1) == b'5' { ERR_BIT } else { 0 };
-            let key = self.endpoints.intern(ep, ee as usize - ep as usize) | is_err;
-            let lat_val = parse_digits(eol, (eol as usize - ee as usize - 5) as u32);
+            let key = self.endpoints.intern(ep, ee as usize - ep as usize) | if *ee.add(1) == b'5' { ERR_BIT } else { 0 };
+            let lat = parse_digits(eol, (eol as usize - ee as usize - 5) as u32);
             p = eol.add(1);
 
-            if lat_val >= BIG { self.big[h].push((lat_val, key)); continue; }
+            if lat >= BIG { self.big[h].push((lat, key)); continue; }
             let b = &mut self.head[h];
             if (*b).is_null() || (*(*b)).n as usize == BLOCK_CAP {
                 if self.used + std::mem::size_of::<Block>() > self.reserved {
                     let extra = 16 * std::mem::size_of::<Block>();
-                    let fresh_page = mmap(std::ptr::null_mut(), extra, 3, 0x22, -1, 0);
-                    if fresh_page != !0 as *mut u8 { self.region = fresh_page; self.used = 0; self.reserved = extra; }
+                    let p = mmap(std::ptr::null_mut(), extra, 3, 0x22, -1, 0);
+                    if p != !0 as *mut u8 { self.region = p; self.used = 0; self.reserved = extra; }
                 }
                 let fresh = self.region.add(self.used) as *mut Block;
                 self.used += std::mem::size_of::<Block>();
-                (*fresh).next = *b;
-                (*fresh).n = 0;
-                *b = fresh;
+                (*fresh).next = *b; (*fresh).n = 0; *b = fresh;
             }
             let b_ref = &mut *(*b);
-            b_ref.rec[b_ref.n as usize] = (lat_val << KEY_BITS) | key;
+            b_ref.rec[b_ref.n as usize] = (lat << KEY_BITS) | key;
             b_ref.n += 1;
         }
     }
@@ -160,8 +134,7 @@ impl<'a> Worker<'a> {
 #[inline(always)]
 fn append_u32(buf: &mut [u8], mut val: u32, mut pos: usize) -> usize {
     if val == 0 { buf[pos] = b'0'; return pos + 1; }
-    let mut temp = [0u8; 10];
-    let mut len = 0;
+    let mut temp = [0u8; 10]; let mut len = 0;
     while val > 0 { temp[len] = b'0' + (val % 10) as u8; val /= 10; len += 1; }
     while len > 0 { len -= 1; buf[pos] = temp[len]; pos += 1; }
     pos
@@ -193,23 +166,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fd = file.as_raw_fd();
     let data = unsafe {
         let p = mmap(std::ptr::null_mut(), size + 4096, 3, 0x22, -1, 0);
-        if p == !0 as *mut u8 { std::process::exit(1); }
-        if mmap(p, size, 1, 0x12, fd, 0) == !0 as *mut u8 { std::process::exit(1); }
+        if p == !0 as *mut u8 || mmap(p, size, 1, 0x12, fd, 0) == !0 as *mut u8 { std::process::exit(1); }
         p as *const u8
     };
 
     let mut labels = [[0u8; 20]; HOURS];
     for h in 0..HOURS {
-        let day = (h + 18) / 24;
-        let m = if day < 2 { 10 } else { 11 };
-        let d = if day < 2 { 30 + day } else { day - 1 };
-        let hr = (h + 18) % 24;
-        let s = format!("2026-{m:02}-{d:02}T{hr:02}:00:00Z");
-        labels[h].copy_from_slice(s.as_bytes());
+        let (m, d, hr) = (if h < 30 { 10 } else { 11 }, if h < 30 { 30 + (h + 18) / 24 } else { (h + 18) / 24 - 1 }, (h + 18) % 24);
+        labels[h].copy_from_slice(format!("2026-{m:02}-{d:02}T{hr:02}:00:00Z").as_bytes());
     }
 
-    let mut cut = vec![size; NTHREADS + 1];
-    cut[0] = 0;
+    let mut cut = vec![size; NTHREADS + 1]; cut[0] = 0;
     for t in 1..NTHREADS {
         let mut c = cut[t - 1].max(size * t / NTHREADS);
         while c < size && unsafe { *data.add(c - 1) } != b'\n' { c += 1; }
@@ -218,21 +185,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut workers: Vec<Worker> = (0..NTHREADS).map(|_| Worker::new()).collect();
     let next_hour = AtomicUsize::new(0);
-    let done: Vec<AtomicBool> = (0..HOURS).map(|_| AtomicBool::new(false)).collect();
-    let text_boxes: Vec<std::sync::Mutex<Vec<u8>>> = (0..HOURS).map(|_| std::sync::Mutex::new(Vec::new())).collect();
-    let mut rank = vec![Vec::new(); NTHREADS];
-    let data_send = SendPtr(data);
+    let done: Vec<_> = (0..HOURS).map(|_| AtomicBool::new(false)).collect();
+    let text_boxes: Vec<_> = (0..HOURS).map(|_| Mutex::new(Vec::new())).collect();
+    let (mut rank, data_send) = (vec![Vec::new(); NTHREADS], SendPtr(data));
 
     thread::scope(|s| {
-        let cut_ref = &cut;
-        let d_send = data_send;
+        let (cut_ref, d_send) = (&cut, data_send);
         for (t, w) in workers.iter_mut().enumerate() {
             s.spawn(move || unsafe {
                 let from = d_send.0.add(cut_ref[t]);
                 let to = d_send.0.add(cut_ref[t + 1]);
                 w.parse(from, to);
-                let sf = (from as usize + 4095) & !4095;
-                let ef = (to as usize) & !4095;
+                let (sf, ef) = ((from as usize + 4095) & !4095, (to as usize) & !4095);
                 if ef > sf { madvise(sf as *mut u8, ef - sf, 4); }
             });
         }
@@ -240,9 +204,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut global = EndpointTable::new();
     for t in 0..NTHREADS {
-        for n in &workers[t].endpoints.names {
-            rank[t].push(unsafe { global.intern(n.as_ptr(), n.len()) });
-        }
+        for n in &workers[t].endpoints.names { rank[t].push(unsafe { global.intern(n.as_ptr(), n.len()) }); }
     }
     let mut sorted_names = global.names.clone();
     sorted_names.sort_unstable();
@@ -275,8 +237,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for _ in 0..NTHREADS {
             s.spawn(move || {
                 let (mut count, mut errors, mut cursor) = (vec![0u32; ne + 1], vec![0u32; ne], vec![0u32; ne]);
-                let (mut lat, mut line) = (Vec::with_capacity(32768), [0u8; 512]);
-                let mut thread_buf: Vec<u8> = Vec::with_capacity(32768);
+                let (mut lat, mut line) = (Vec::new(), [0u8; 512]);
 
                 loop {
                     let h = next_h_ref.fetch_add(1, Ordering::Relaxed);
@@ -318,7 +279,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let (rec, e) = (b_ref.rec[i], r[(b_ref.rec[i] & ID_MASK) as usize] as usize);
                                     lat[cursor[e] as usize] = rec >> KEY_BITS; cursor[e] += 1;
                                 }
-                                b = b_ref.next;
+                                let next_b = b_ref.next;
+                                madvise(b as *mut u8, std::mem::size_of::<Block>(), 4);
+                                b = next_b;
                             }
                         }
                         for &(l, key) in &w.big[h] {
@@ -328,7 +291,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     let label = &labels_ref[h];
-                    thread_buf.clear();
+                    let mut out_text = text_ref[h].lock().unwrap();
+                    out_text.reserve(ne * 64);
 
                     for e in 0..ne {
                         let (start, end) = (count[e] as usize, count[e + 1] as usize);
@@ -354,11 +318,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         line[pos..pos + ep_name.len()].copy_from_slice(ep_name); pos += ep_name.len();
                         for v in [n as u32, p50, p95, p99, err, ppm] { line[pos] = b' '; pos += 1; pos = append_u32(&mut line, v, pos); }
                         line[pos] = b'\n'; pos += 1;
-                        thread_buf.extend_from_slice(&line[..pos]);
-                    }
-                    {
-                        let mut out_text = text_ref[h].lock().unwrap();
-                        out_text.extend_from_slice(&thread_buf);
+                        out_text.extend_from_slice(&line[..pos]);
                     }
                     done_ref[h].store(true, Ordering::Release);
                 }
