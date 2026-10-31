@@ -399,11 +399,11 @@ fn main() {
                             get_overflow(ei as u32, &overflow_ref)
                         };
 
-                        let (nd, ovf) = d.overflowing_add(weight);
-                        if ovf {
+                        if weight >= u32::MAX - 2 || d >= u32::MAX - 2 || d.saturating_add(weight) >= u32::MAX - 2 {
                             overflow_64 = true;
                             continue;
                         }
+                        let nd = d + weight;
                         if nd >= best_t {
                             continue;
                         }
