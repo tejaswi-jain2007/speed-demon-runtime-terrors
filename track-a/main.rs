@@ -17,7 +17,7 @@ extern "C" {
 const PROT_READ: i32 = 1; const PROT_WRITE: i32 = 2; const MAP_PRIVATE: i32 = 0x02; const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_FIXED: i32 = 0x10; const MAP_FAILED: *mut u8 = !0 as *mut u8; const MADV_DONTNEED: i32 = 4; const MADV_SEQUENTIAL: i32 = 2;
 const HOURS: usize = 72; const KEY_BITS: u32 = 12; const ID_MASK: u32 = (1 << 11) - 1; const ERR_BIT: u32 = 1 << 11;
-const BIG: u32 = 1 << 20; const NTHREADS: usize = 12; const BLOCK_CAP: usize = (16384 - 16) / 4; const TABLE_SLOTS: usize = 2048;
+const BIG: u32 = 1 << 20; const NTHREADS: usize = 12; const BLOCK_CAP: usize = (16384 - 16) / 4; const TABLE_SLOTS: usize = 4096;
 
 #[inline(always)] unsafe fn load8(p: *const u8) -> u64 { (p as *const u64).read_unaligned() }
 
@@ -53,14 +53,16 @@ struct EndpointTable<'a> {
 }
 
 impl<'a> EndpointTable<'a> {
-    fn new() -> Self { Self { slots: [0; TABLE_SLOTS], names: Vec::with_capacity(128) } }
+    fn new() -> Self { Self { slots: [0; TABLE_SLOTS], names: Vec::with_capacity(256) } }
 
     #[inline(always)]
     unsafe fn intern(&mut self, s: *const u8, len: usize) -> u32 {
-        let slice = std::slice::from_raw_parts(s, len);
-        let a = load8(s);
+        let mut a = load8(s);
         let b = if len >= 8 { load8(s.add(len - 8)) } else { 0 };
-        let mut i = ((len as u64) ^ a ^ (b.rotate_left(13))) as usize;
+        if len < 8 { a &= (1u64 << (8 * len)) - 1; }
+        let h1 = _mm_crc32_u64(len as u64, a);
+        let mut i = _mm_crc32_u64(h1, b) as usize;
+        let slice = std::slice::from_raw_parts(s, len);
         loop {
             let slot = &mut self.slots[i & (TABLE_SLOTS - 1)];
             if *slot == 0 {
@@ -215,8 +217,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cut_ref = &cut;
         for (t, w) in workers.iter_mut().enumerate() {
             s.spawn(move || unsafe {
-                let d_ptr = data_addr as *const u8;
-                w.parse(d_ptr.add(cut_ref[t]), d_ptr.add(cut_ref[t + 1]));
+                let from = data_addr + cut_ref[t];
+                let to = data_addr + cut_ref[t + 1];
+                w.parse(from as *const u8, to as *const u8);
+                let sf = (from + 4095) & !4095;
+                let ef = to & !4095;
+                if ef > sf { madvise(sf as *mut u8, ef - sf, MADV_DONTNEED); }
             });
         }
     });
@@ -237,7 +243,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let ne = sorted_names.len();
 
-    unsafe { madvise(data as *mut u8, size, MADV_DONTNEED); }
+    unsafe { madvise(data as *mut u8, size + 4096, MADV_DONTNEED); }
 
     let next_hour = AtomicUsize::new(0);
 
