@@ -1,4 +1,4 @@
-// Speed Demon 2026 - Track C (Join) - Runtime Terrors
+// Speed Demon 2026 - Track C (Join) - Ultra High Performance
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
@@ -21,46 +21,19 @@ unsafe fn madvise_dontneed(ptr: *const u8, len: usize) {
 }
 
 #[inline(always)]
-unsafe fn find_comma(mut p: *const u8, end_ptr: *const u8) -> *const u8 {
-    let v = _mm256_set1_epi8(b',' as i8);
-    while p.add(32) <= end_ptr {
-        let chunk = _mm256_loadu_si256(p as *const __m256i);
-        let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v)) as u32;
-        if mask != 0 { return p.add(mask.trailing_zeros() as usize); }
-        p = p.add(32);
-    }
-    while p < end_ptr && *p != b',' { p = p.add(1); }
-    p
-}
-
-#[inline(always)]
-unsafe fn find_quote(mut p: *const u8, end_ptr: *const u8) -> *const u8 {
-    let v = _mm256_set1_epi8(b'"' as i8);
-    while p.add(32) <= end_ptr {
-        let chunk = _mm256_loadu_si256(p as *const __m256i);
-        let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v)) as u32;
-        if mask != 0 { return p.add(mask.trailing_zeros() as usize); }
-        p = p.add(32);
-    }
-    while p < end_ptr && *p != b'"' { p = p.add(1); }
-    p
-}
-
-#[inline(always)]
-unsafe fn hash_slice(mut p: *const u8, len: usize) -> u32 {
+unsafe fn hash_slice(mut p: *const u8, mut len: usize) -> u32 {
     let mut h = len as u64;
-    let mut rem = len;
-    while rem >= 8 {
+    while len >= 8 {
         h = _mm_crc32_u64(h, (p as *const u64).read_unaligned());
-        p = p.add(8); rem -= 8;
+        p = p.add(8); len -= 8;
     }
-    if rem >= 4 {
+    if len >= 4 {
         h = _mm_crc32_u32(h as u32, (p as *const u32).read_unaligned()) as u64;
-        p = p.add(4); rem -= 4;
+        p = p.add(4); len -= 4;
     }
-    while rem > 0 {
+    while len > 0 {
         h = _mm_crc32_u8(h as u32, *p) as u64;
-        p = p.add(1); rem -= 1;
+        p = p.add(1); len -= 1;
     }
     h as u32
 }
@@ -69,13 +42,13 @@ struct FastMmap { ptr: *const u8, len: usize }
 unsafe impl Send for FastMmap {}
 unsafe impl Sync for FastMmap {}
 impl FastMmap {
-    fn open(path: &str) -> Option<Self> {
+    fn open(path: &str, sequential: bool) -> Option<Self> {
         let f = File::open(path).ok()?;
         let len = f.metadata().ok()?.len() as usize;
         if len == 0 { return None; }
         let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0) };
         if ptr.is_null() || ptr as isize == -1 { return None; }
-        unsafe { madvise(ptr, len, 3 | 2); }
+        if sequential { unsafe { madvise(ptr, len, 2); } } // MADV_SEQUENTIAL
         Some(FastMmap { ptr, len })
     }
     #[inline(always)] fn as_slice(&self) -> &[u8] { unsafe { std::slice::from_raw_parts(self.ptr, self.len) } }
@@ -119,24 +92,38 @@ impl LocalCountryAgg {
 
 unsafe fn parse_csv_chunk(
     rec_ptr: *const u8, start: usize, end: usize, rlookup: &[u8],
-    local_aggs: &mut [LocalCountryAgg], filter: &mut [[u64; 2]], local_names: &mut Vec<u64>,
+    local_aggs: &mut [LocalCountryAgg], filter: &mut [u64], local_names: &mut Vec<u64>,
 ) {
     let mut p = rec_ptr.add(start);
     let end_ptr = rec_ptr.add(end);
+    let v_quote = _mm256_set1_epi8(b'"' as i8);
+
     while p < end_ptr {
-        if p.add(3) <= end_ptr && *p == 0xEF && *p.add(1) == 0xBB && *p.add(2) == 0xBF { p = p.add(3); }
+        if *p == 0xEF && p.add(3) <= end_ptr && *p.add(1) == 0xBB && *p.add(2) == 0xBF { p = p.add(3); }
         if p >= end_ptr { break; }
 
-        let mut record_id = 0u64;
-        while p < end_ptr && *p >= b'0' && *p <= b'9' { record_id = record_id * 10 + (*p - b'0') as u64; p = p.add(1); }
-        if p < end_ptr && *p == b',' { p = p.add(1); }
+        let mut record_id = (*p - b'0') as u64;
+        p = p.add(1);
+        while *p != b',' { record_id = record_id * 10 + (*p - b'0') as u64; p = p.add(1); }
+        p = p.add(1);
 
-        let (name_hash, name_len);
-        if p < end_ptr && *p == b'"' {
+        let (name_hash, name_len) = if *p == b',' {
+            p = p.add(1);
+            (0u32, 0u64)
+        } else if *p == b'"' {
             p = p.add(1);
             let start_name = p;
-            p = find_quote(p, end_ptr);
-            if p.add(1) < end_ptr && *p.add(1) == b'"' {
+            let mut q = p;
+            while q.add(32) <= end_ptr {
+                let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(q as *const __m256i), v_quote)) as u32;
+                if mask != 0 { q = q.add(mask.trailing_zeros() as usize); break; }
+                q = q.add(32);
+            }
+            if q.add(32) > end_ptr {
+                while q < end_ptr && *q != b'"' { q = q.add(1); }
+            }
+            if q.add(1) < end_ptr && *q.add(1) == b'"' {
+                // Escaped quote path
                 let mut ptr = start_name;
                 let (mut h, mut nlen) = (0u64, 0u64);
                 while ptr < end_ptr {
@@ -144,71 +131,77 @@ unsafe fn parse_csv_chunk(
                         if ptr.add(1) < end_ptr && *ptr.add(1) == b'"' {
                             h = _mm_crc32_u8(h as u32, b'"') as u64;
                             nlen += 1; ptr = ptr.add(2);
-                        } else { p = ptr.add(1); break; }
+                        } else { p = ptr.add(2); break; }
                     } else {
                         h = _mm_crc32_u8(h as u32, *ptr) as u64;
                         nlen += 1; ptr = ptr.add(1);
                     }
                 }
-                name_hash = h as u32; name_len = nlen;
+                (h as u32, nlen)
             } else {
-                let len = p as usize - start_name as usize;
-                name_hash = hash_slice(start_name, len);
-                name_len = len as u64;
-                if p < end_ptr { p = p.add(1); }
+                let len = q as usize - start_name as usize;
+                p = q.add(2);
+                (hash_slice(start_name, len), len as u64)
             }
         } else {
             let start_name = p;
-            p = find_comma(p, end_ptr);
+            while *p != b',' { p = p.add(1); }
             let len = p as usize - start_name as usize;
-            name_hash = hash_slice(start_name, len);
-            name_len = len as u64;
-        }
-        if p < end_ptr && *p == b',' { p = p.add(1); }
+            p = p.add(1);
+            (hash_slice(start_name, len), len as u64)
+        };
 
-        let mut note_len = 0u64;
-        if p < end_ptr && *p == b'"' {
+        let note_len = if *p == b',' {
+            p = p.add(1);
+            0u64
+        } else if *p == b'"' {
             p = p.add(1);
             let start_note = p;
-            p = find_quote(p, end_ptr);
-            if p.add(1) < end_ptr && *p.add(1) == b'"' {
-                let mut ptr = start_note;
-                let mut quote_pairs = 0u64;
-                while ptr < end_ptr {
-                    if *ptr == b'"' {
-                        if ptr.add(1) < end_ptr && *ptr.add(1) == b'"' { quote_pairs += 1; ptr = ptr.add(2); }
-                        else { note_len = (ptr as usize - start_note as usize) as u64 - quote_pairs; p = ptr.add(1); break; }
-                    } else { ptr = ptr.add(1); }
+            let mut q = p;
+            let mut quote_pairs = 0u64;
+            loop {
+                while q.add(32) <= end_ptr {
+                    let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(q as *const __m256i), v_quote)) as u32;
+                    if mask != 0 { q = q.add(mask.trailing_zeros() as usize); break; }
+                    q = q.add(32);
                 }
-            } else {
-                note_len = (p as usize - start_note as usize) as u64;
-                if p < end_ptr { p = p.add(1); }
+                if q.add(32) > end_ptr {
+                    while q < end_ptr && *q != b'"' { q = q.add(1); }
+                }
+                if q >= end_ptr { p = q; break 0; }
+                if q.add(1) < end_ptr && *q.add(1) == b'"' {
+                    quote_pairs += 1;
+                    q = q.add(2);
+                } else {
+                    let nlen = (q as usize - start_note as usize) as u64 - quote_pairs;
+                    p = q.add(2); // skip " and ,
+                    break nlen;
+                }
             }
         } else {
             let start_note = p;
-            p = find_comma(p, end_ptr);
-            note_len = (p as usize - start_note as usize) as u64;
-        }
-        if p < end_ptr && *p == b',' { p = p.add(1); }
-
-        let mut region_id = 0u32;
-        while p < end_ptr && *p >= b'0' && *p <= b'9' { region_id = region_id * 10 + (*p - b'0') as u32; p = p.add(1); }
-        if p < end_ptr && *p == b',' { p = p.add(1); }
-
-        let mut neg = false;
-        if p < end_ptr && *p == b'-' { neg = true; p = p.add(1); }
-        let mut whole = 0i64;
-        while p < end_ptr && *p >= b'0' && *p <= b'9' { whole = whole * 10 + (*p - b'0') as i64; p = p.add(1); }
-        let mut frac = 0i64;
-        if p < end_ptr && *p == b'.' {
+            while *p != b',' { p = p.add(1); }
+            let nlen = (p as usize - start_note as usize) as u64;
             p = p.add(1);
-            if p.add(2) <= end_ptr {
-                frac = ((*p - b'0') as i64) * 10 + (*p.add(1) - b'0') as i64;
-                p = p.add(2);
-            }
-        }
-        let cents = if neg { -(whole * 100 + frac) } else { whole * 100 + frac };
-        while p < end_ptr && (*p == b'\r' || *p == b'\n') { p = p.add(1); }
+            nlen
+        };
+
+        let mut region_id = (*p - b'0') as u32;
+        p = p.add(1);
+        while *p != b',' { region_id = region_id * 10 + (*p - b'0') as u32; p = p.add(1); }
+        p = p.add(1);
+
+        let neg = *p == b'-';
+        if neg { p = p.add(1); }
+        let mut whole = (*p - b'0') as i64;
+        p = p.add(1);
+        while *p != b'.' { whole = whole * 10 + (*p - b'0') as i64; p = p.add(1); }
+        p = p.add(1);
+        let cents_abs = whole * 100 + ((*p - b'0') as i64) * 10 + (*p.add(1) - b'0') as i64;
+        p = p.add(2);
+        let cents = if neg { -cents_abs } else { cents_abs };
+        if *p == b'\r' { p = p.add(1); }
+        if *p == b'\n' { p = p.add(1); }
 
         let cid = if (region_id as usize) < rlookup.len() { *rlookup.get_unchecked(region_id as usize) as usize } else { 0 };
         let agg = local_aggs.get_unchecked_mut(cid);
@@ -220,12 +213,11 @@ unsafe fn parse_csv_chunk(
         agg.name_bytes += name_len;
         agg.note_bytes += note_len;
 
-        let packed = (((cid as u64) + 1) << 48) | (name_hash as u64);
-        let slot = (name_hash as usize) & 16383;
-        let row = filter.get_unchecked_mut(slot);
-        if row[0] != packed && row[1] != packed {
-            row[1] = row[0];
-            row[0] = packed;
+        let packed = (((cid as u64) + 1) << 32) | (name_hash as u64);
+        let slot = (name_hash as usize) & 65535;
+        let entry = filter.get_unchecked_mut(slot);
+        if *entry != packed {
+            *entry = packed;
             local_names.push(packed);
         }
     }
@@ -243,10 +235,10 @@ fn main() {
     }
     let (rec_path, reg_path, out_path) = (format!("{}/records.csv", data_dir), format!("{}/regions.csv", data_dir), format!("{}/aggregates.txt", out_dir));
 
-    let r_mmap = match FastMmap::open(&reg_path) { Some(m) => m, None => return };
+    let r_mmap = match FastMmap::open(&reg_path, false) { Some(m) => m, None => return };
     let r_data = r_mmap.as_slice();
     let mut countries = vec![CountryAgg { key: b"_UNMATCHED".to_vec(), count: 0, id_sum: 0, amount_sum: 0, amount_min: 0, amount_max: 0, name_bytes: 0, note_bytes: 0, distinct_names: 0 }];
-    let mut country_map: std::collections::HashMap<Vec<u8>, u8> = std::collections::HashMap::with_capacity(300);
+    let mut country_lut = [0u8; 17576]; // 26 * 26 * 26
     let (mut rp, rend) = (0, r_data.len());
     while rp < rend && r_data[rp] != b'\n' { rp += 1; }
     if rp < rend && r_data[rp] == b'\n' { rp += 1; }
@@ -260,21 +252,21 @@ fn main() {
         let c_start = rp;
         while rp < rend && r_data[rp] != b'\r' && r_data[rp] != b'\n' { rp += 1; }
         let c_code = &r_data[c_start..rp];
-        let cid = match country_map.get(c_code) {
-            Some(&id) => id,
-            None => {
-                let id = countries.len() as u8;
-                country_map.insert(c_code.to_vec(), id);
+        if c_code.len() == 3 {
+            let l_idx = ((c_code[0] - b'A') as usize) * 676 + ((c_code[1] - b'A') as usize) * 26 + ((c_code[2] - b'A') as usize);
+            let mut cid = country_lut[l_idx];
+            if cid == 0 {
+                cid = countries.len() as u8;
+                country_lut[l_idx] = cid;
                 countries.push(CountryAgg { key: c_code.to_vec(), count: 0, id_sum: 0, amount_sum: 0, amount_min: 0, amount_max: 0, name_bytes: 0, note_bytes: 0, distinct_names: 0 });
-                id
             }
-        };
-        if (rid as usize) < flat.len() { flat[rid as usize] = cid; }
+            if (rid as usize) < flat.len() { flat[rid as usize] = cid; }
+        }
         while rp < rend && (r_data[rp] == b'\r' || r_data[rp] == b'\n') { rp += 1; }
     }
     drop(r_mmap);
 
-    let rec_mmap = match FastMmap::open(&rec_path) { Some(m) => m, None => return };
+    let rec_mmap = match FastMmap::open(&rec_path, true) { Some(m) => m, None => return };
     let rec_data = rec_mmap.as_slice();
     let rec_size = rec_data.len();
 
@@ -288,32 +280,25 @@ fn main() {
     let mut splits = vec![data_start; num_threads + 1];
     splits[num_threads] = rec_size;
 
+    // Fast SIMD split finding using the invariant: \r occurs only in \r\n record terminators
+    let v_cr = unsafe { _mm256_set1_epi8(b'\r' as i8) };
     for t in 1..num_threads {
         let mut pt = data_start + t * (payload_len / num_threads);
-        while pt < rec_size {
-            if rec_data[pt] == b'\n' {
-                let mut probe = pt + 1;
-                if probe + 3 <= rec_size && rec_data[probe] == 0xEF && rec_data[probe + 1] == 0xBB && rec_data[probe + 2] == 0xBF { probe += 3; }
-                let (mut cur, mut commas) = (probe, 0);
-                while cur < rec_size && rec_data[cur] != b'\n' && rec_data[cur] != b'\r' {
-                    if rec_data[cur] == b'"' {
-                        cur += 1;
-                        while cur < rec_size {
-                            if rec_data[cur] == b'"' {
-                                if cur + 1 < rec_size && rec_data[cur + 1] == b'"' { cur += 2; }
-                                else { cur += 1; break; }
-                            } else { cur += 1; }
-                        }
-                    } else {
-                        if rec_data[cur] == b',' { commas += 1; }
-                        cur += 1;
-                    }
-                }
-                if commas == 4 { pt = probe; break; }
+        while pt + 32 <= rec_size {
+            let chunk = unsafe { _mm256_loadu_si256(rec_data.as_ptr().add(pt) as *const __m256i) };
+            let mask = unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v_cr)) } as u32;
+            if mask != 0 {
+                pt += mask.trailing_zeros() as usize;
+                break;
             }
-            pt += 1;
+            pt += 32;
         }
-        splits[t] = pt.min(rec_size);
+        while pt < rec_size && rec_data[pt] != b'\r' { pt += 1; }
+        let mut next_rec = (pt + 2).min(rec_size);
+        if next_rec + 3 <= rec_size && rec_data[next_rec] == 0xEF && rec_data[next_rec + 1] == 0xBB && rec_data[next_rec + 2] == 0xBF {
+            next_rec += 3;
+        }
+        splits[t] = next_rec;
     }
 
     let num_countries = countries.len();
@@ -330,10 +315,11 @@ fn main() {
         for (t, (local_aggs, local_names)) in aggs_slice.iter_mut().zip(names_slice.iter_mut()).enumerate() {
             let (start, end) = (splits_ref[t], splits_ref[t + 1]);
             s.spawn(move || {
-                let mut filter = vec![[0u64; 2]; 16384];
-                local_names.reserve(32768);
+                let mut filter = vec![0u64; 65536];
+                local_names.reserve(16384);
                 unsafe {
                     parse_csv_chunk(rec_slice.as_ptr(), start, end, rlookup_ref, local_aggs, &mut filter, local_names);
+                    madvise_dontneed(rec_slice.as_ptr().add(start), end - start);
                 }
                 drop(filter);
                 local_names.sort_unstable();
@@ -343,7 +329,6 @@ fn main() {
         }
     });
 
-    unsafe { madvise_dontneed(rec_data.as_ptr(), rec_size); }
     drop(rec_mmap);
 
     let mut thread_offsets = Vec::with_capacity(num_threads);
@@ -352,7 +337,7 @@ fn main() {
         let mut offsets = vec![0usize; num_countries + 1];
         let mut curr_cid = 0usize;
         for (idx, &packed) in names.iter().enumerate() {
-            let cid = ((packed >> 48) as usize).saturating_sub(1);
+            let cid = ((packed >> 32) as usize).saturating_sub(1);
             while curr_cid < cid {
                 curr_cid += 1;
                 offsets[curr_cid] = idx;
@@ -365,11 +350,41 @@ fn main() {
         thread_offsets.push(offsets);
     }
 
-    let mut buf = Vec::with_capacity(4096);
+    // Parallel country aggregation across 12 threads!
+    let mut country_distinct = vec![0usize; num_countries];
+    thread::scope(|s| {
+        let offsets_ref = &thread_offsets;
+        let names_ref = &thread_names;
+        let distinct_ref = &mut country_distinct[..];
+        let chunk_size = (num_countries + num_threads - 1) / num_threads;
+
+        for (t, chunk) in distinct_ref.chunks_mut(chunk_size).enumerate() {
+            let start_c = t * chunk_size;
+            s.spawn(move || {
+                let mut buf = Vec::with_capacity(4096);
+                for (i, dest_distinct) in chunk.iter_mut().enumerate() {
+                    let c = start_c + i;
+                    buf.clear();
+                    for th in 0..num_threads {
+                        let s_idx = offsets_ref[th][c];
+                        let e_idx = offsets_ref[th][c + 1];
+                        if e_idx > s_idx {
+                            buf.extend_from_slice(&names_ref[th][s_idx..e_idx]);
+                        }
+                    }
+                    *dest_distinct = if buf.is_empty() { 0 } else if buf.len() == 1 { 1 } else {
+                        buf.sort_unstable();
+                        buf.dedup();
+                        buf.len()
+                    };
+                }
+            });
+        }
+    });
+
     for c in 0..num_countries {
         let dest = &mut countries[c];
         let mut first = true;
-        buf.clear();
         for t in 0..num_threads {
             let src = &thread_aggs[t][c];
             if src.count > 0 {
@@ -385,17 +400,8 @@ fn main() {
                 dest.name_bytes += src.name_bytes;
                 dest.note_bytes += src.note_bytes;
             }
-            let s_idx = thread_offsets[t][c];
-            let e_idx = thread_offsets[t][c + 1];
-            if e_idx > s_idx {
-                buf.extend_from_slice(&thread_names[t][s_idx..e_idx]);
-            }
         }
-        dest.distinct_names = if buf.is_empty() { 0 } else if buf.len() == 1 { 1 } else {
-            buf.sort_unstable();
-            buf.dedup();
-            buf.len()
-        };
+        dest.distinct_names = country_distinct[c];
     }
     drop(thread_aggs);
     drop(thread_names);

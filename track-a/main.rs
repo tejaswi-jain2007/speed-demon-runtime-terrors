@@ -1,12 +1,9 @@
-// Speed Demon 2026 - Track A (Ingest) - Runtime Terrors
+// Speed Demon 2026 - Track A (Ingest) - Clean & Fast
 use std::arch::x86_64::*;
-use std::cell::UnsafeCell;
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 extern "C" {
@@ -25,32 +22,15 @@ const NTHREADS: usize = 12;
 const BLOCK_CAP: usize = (16384 - 16) / 4;
 const TABLE_SLOTS: usize = 4096;
 
-static DIGITS: &[u8; 200] = b"\
-00010203040506070809\
-10111213141516171819\
-20212223242526272829\
-30313233343536373839\
-40414243444546474849\
-50515253545556575859\
-60616263646566676869\
-70717273747576777879\
-80818283848586878889\
-90919293949596979899";
-
 #[inline(always)]
-unsafe fn load8(p: *const u8) -> u64 {
-    (p as *const u64).read_unaligned()
-}
+unsafe fn load8(p: *const u8) -> u64 { (p as *const u64).read_unaligned() }
 
 #[inline(always)]
 unsafe fn find_nl(mut s: *const u8) -> *const u8 {
     let t = _mm256_set1_epi8(b'\n' as i8);
     loop {
-        let m =
-            _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(s as *const _), t)) as u32;
-        if m != 0 {
-            return s.add(m.trailing_zeros() as usize);
-        }
+        let m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(s as *const _), t)) as u32;
+        if m != 0 { return s.add(m.trailing_zeros() as usize); }
         s = s.add(32);
     }
 }
@@ -68,32 +48,12 @@ unsafe fn parse_digits_simd(chunk: __m128i, len: u32) -> u32 {
 }
 
 #[inline(always)]
-fn append_u32(buf: &mut [u8], mut val: u32, pos: usize) -> usize {
-    if val < 10 {
-        buf[pos] = b'0' + val as u8;
-        return pos + 1;
-    }
-    let mut temp = [0u8; 10];
-    let mut i = 10;
-    while val >= 100 {
-        let q = val / 100;
-        let r = ((val - q * 100) * 2) as usize;
-        val = q;
-        i -= 2;
-        temp[i] = DIGITS[r];
-        temp[i + 1] = DIGITS[r + 1];
-    }
-    if val >= 10 {
-        let r = (val * 2) as usize;
-        i -= 2;
-        temp[i] = DIGITS[r];
-        temp[i + 1] = DIGITS[r + 1];
-    } else {
-        i -= 1;
-        temp[i] = b'0' + val as u8;
-    }
+fn append_u32(buf: &mut [u8], mut v: u32, pos: usize) -> usize {
+    if v == 0 { buf[pos] = b'0'; return pos + 1; }
+    let mut t = [0u8; 10]; let mut i = 10;
+    while v > 0 { i -= 1; t[i] = b'0' + (v % 10) as u8; v /= 10; }
     let len = 10 - i;
-    buf[pos..pos + len].copy_from_slice(&temp[i..10]);
+    buf[pos..pos + len].copy_from_slice(&t[i..]);
     pos + len
 }
 
@@ -103,19 +63,12 @@ struct Table<'a> {
 }
 
 impl<'a> Table<'a> {
-    fn new() -> Self {
-        Self {
-            slots: [0; TABLE_SLOTS],
-            names: Vec::with_capacity(512),
-        }
-    }
+    fn new() -> Self { Self { slots: [0; TABLE_SLOTS], names: Vec::with_capacity(512) } }
     #[inline(always)]
     unsafe fn intern(&mut self, s: *const u8, len: usize) -> u32 {
         let mut a = load8(s);
         let b = if len >= 8 { load8(s.add(len - 8)) } else { 0 };
-        if len < 8 {
-            a &= (1u64 << (8 * len)) - 1;
-        }
+        if len < 8 { a &= (1u64 << (8 * len)) - 1; }
         let h1 = _mm_crc32_u64(len as u64, a);
         let mut i = _mm_crc32_u64(h1, b) as usize;
         loop {
@@ -127,20 +80,14 @@ impl<'a> Table<'a> {
                 return idx;
             }
             let n = self.names[(*slot - 1) as usize];
-            if n.len() == len && std::slice::from_raw_parts(s, len) == n {
-                return *slot - 1;
-            }
+            if n.len() == len && std::slice::from_raw_parts(s, len) == n { return *slot - 1; }
             i += 1;
         }
     }
 }
 
 #[repr(C)]
-struct Block {
-    next: *mut Block,
-    n: u32,
-    rec: [u32; BLOCK_CAP],
-}
+struct Block { next: *mut Block, n: u32, rec: [u32; BLOCK_CAP] }
 
 struct Worker<'a> {
     ep: Table<'a>,
@@ -165,14 +112,10 @@ impl<'a> Worker<'a> {
         }
     }
     unsafe fn parse(&mut self, mut p: *const u8, end: *const u8) {
-        if p >= end {
-            return;
-        }
+        if p >= end { return; }
         self.reserved = 32 * std::mem::size_of::<Block>();
         self.region = mmap(std::ptr::null_mut(), self.reserved, 3, 0x22, -1, 0);
-        if self.region == !0 as *mut u8 {
-            _exit(1);
-        }
+        if self.region == !0 as *mut u8 { _exit(1); }
 
         let sp_vec128 = _mm_set1_epi8(b' ' as i8);
         let mut cur_b: [*mut Block; HOURS] = [std::ptr::null_mut(); HOURS];
@@ -208,11 +151,7 @@ impl<'a> Worker<'a> {
                 if self.used + std::mem::size_of::<Block>() > self.reserved {
                     let extra = 16 * std::mem::size_of::<Block>();
                     let p = mmap(std::ptr::null_mut(), extra, 3, 0x22, -1, 0);
-                    if p != !0 as *mut u8 {
-                        self.region = p;
-                        self.used = 0;
-                        self.reserved = extra;
-                    }
+                    if p != !0 as *mut u8 { self.region = p; self.used = 0; self.reserved = extra; }
                 }
                 let fresh = self.region.add(self.used) as *mut Block;
                 self.used += std::mem::size_of::<Block>();
@@ -228,60 +167,28 @@ impl<'a> Worker<'a> {
     }
 }
 
-struct SyncBox<T>(UnsafeCell<T>);
-unsafe impl<T> Sync for SyncBox<T> {}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    unsafe {
-        prctl(14, 1, 0, 0, 0);
-    }
-    let (mut d_dir, mut o_dir) = (PathBuf::from("/data"), PathBuf::from("/out"));
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "--data" {
-            if let Some(v) = args.next() {
-                d_dir = PathBuf::from(v);
-            }
-        } else if arg == "--out" {
-            if let Some(v) = args.next() {
-                o_dir = PathBuf::from(v);
-            }
-        }
-    }
-    if let Ok(e) = std::env::var("DATA_DIR") {
-        if !e.is_empty() {
-            d_dir = PathBuf::from(e);
-        }
-    }
-    if let Ok(e) = std::env::var("OUT_DIR") {
-        if !e.is_empty() {
-            o_dir = PathBuf::from(e);
+    unsafe { prctl(14, 1, 0, 0, 0); }
+    let (mut d_dir, mut o_dir) = (String::from("/data"), String::from("/out"));
+    let args: Vec<String> = std::env::args().collect();
+    let mut ai = 1;
+    while ai < args.len() {
+        match args[ai].as_str() {
+            "--data" => { d_dir = args[ai + 1].clone(); ai += 2; }
+            "--out" => { o_dir = args[ai + 1].clone(); ai += 2; }
+            _ => ai += 1,
         }
     }
     std::fs::create_dir_all(&o_dir).ok();
-
-    let in_p = if d_dir.is_file() {
-        d_dir
-    } else {
-        d_dir.join("requests.log")
-    };
-    let out_p = o_dir.join("summary.txt");
-    if !in_p.exists() {
-        File::create(&out_p)?;
-        return Ok(());
-    }
-    let file = File::open(&in_p)?;
+    let in_p = format!("{}/requests.log", d_dir);
+    let out_p = format!("{}/summary.txt", o_dir);
+    let file = match File::open(&in_p) { Ok(f) => f, Err(_) => { File::create(&out_p)?; return Ok(()); } };
     let size = file.metadata()?.len() as usize;
-    if size == 0 {
-        File::create(&out_p)?;
-        return Ok(());
-    }
+    if size == 0 { File::create(&out_p)?; return Ok(()); }
 
     let data = unsafe {
         let p = mmap(std::ptr::null_mut(), size + 4096, 1, 2, file.as_raw_fd(), 0);
-        if p == !0 as *mut u8 {
-            _exit(1);
-        }
+        if p == !0 as *mut u8 { _exit(1); }
         madvise(p, size, 2);
         p as *const u8
     };
@@ -289,28 +196,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut labels = [[0u8; 20]; HOURS];
     for h in 0..HOURS {
         let day = (h + 18) / 24;
-        let (m, d) = if day < 2 {
-            (10, 30 + day)
-        } else {
-            (11, day - 1)
-        };
-        labels[h]
-            .copy_from_slice(format!("2026-{m:02}-{d:02}T{:02}:00:00Z", (h + 18) % 24).as_bytes());
+        let (m, d) = if day < 2 { (10, 30 + day) } else { (11, day - 1) };
+        labels[h].copy_from_slice(format!("2026-{m:02}-{d:02}T{:02}:00:00Z", (h + 18) % 24).as_bytes());
     }
 
     let mut cut = vec![size; NTHREADS + 1];
     cut[0] = 0;
     for t in 1..NTHREADS {
         let mut c = cut[t - 1].max(size * t / NTHREADS);
-        while c < size && unsafe { *data.add(c - 1) } != b'\n' {
-            c += 1;
-        }
+        while c < size && unsafe { *data.add(c - 1) } != b'\n' { c += 1; }
         cut[t] = c;
     }
 
     let mut workers: Vec<Worker> = (0..NTHREADS).map(|_| Worker::new()).collect();
     let data_addr = data as usize;
-
     thread::scope(|s| {
         let cuts = &cut;
         for (t, w) in workers.iter_mut().enumerate() {
@@ -320,9 +219,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 w.parse(from, to);
                 let sf = (from as usize + 4095) & !4095;
                 let ef = (to as usize) & !4095;
-                if ef > sf {
-                    madvise(sf as *mut u8, ef - sf, 4);
-                }
+                if ef > sf { madvise(sf as *mut u8, ef - sf, 4); }
             });
         }
     });
@@ -334,64 +231,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rank[wt].push(unsafe { global.intern(n.as_ptr(), n.len()) });
         }
     }
-    let mut sorted_with_id: Vec<(u16, &[u8])> = global
-        .names
-        .iter()
-        .enumerate()
-        .map(|(i, &n)| (i as u16, n))
-        .collect();
+    let mut sorted_with_id: Vec<(u16, &[u8])> = global.names.iter().enumerate().map(|(i, &n)| (i as u16, n)).collect();
     sorted_with_id.sort_unstable_by_key(|&(_, n)| n);
     let mut rank_of = vec![0u32; sorted_with_id.len()];
     for (new_rank, &(orig_id, _)) in sorted_with_id.iter().enumerate() {
         rank_of[orig_id as usize] = new_rank as u32;
     }
     for wt in 0..NTHREADS {
-        for id in &mut rank[wt] {
-            *id = rank_of[*id as usize];
-        }
+        for id in &mut rank[wt] { *id = rank_of[*id as usize]; }
     }
     let sorted: Vec<&[u8]> = sorted_with_id.iter().map(|&(_, n)| n).collect();
     let ne = sorted.len();
-    unsafe {
-        madvise(data as *mut u8, size + 4096, 4);
-    }
+    unsafe { madvise(data as *mut u8, size + 4096, 4); }
 
     let next_hour = AtomicUsize::new(0);
-    let out_boxes: Vec<SyncBox<Vec<u8>>> = (0..HOURS)
-        .map(|_| SyncBox(UnsafeCell::new(Vec::new())))
-        .collect();
-    let ready: Vec<AtomicBool> = (0..HOURS).map(|_| AtomicBool::new(false)).collect();
-    let next_to_write = AtomicUsize::new(0);
-    let out_file = Mutex::new(std::io::BufWriter::with_capacity(
-        512 * 1024,
-        File::create(&out_p)?,
-    ));
-
+    let mut hour_outputs: Vec<Vec<u8>> = (0..HOURS).map(|_| Vec::new()).collect();
     thread::scope(|s| {
-        let (next_h, wrk_r, rk_r, lbl_r, nm_r, out_r, rdy_r, next_w, file_m) = (
-            &next_hour,
-            &workers,
-            &rank,
-            &labels,
-            &sorted,
-            &out_boxes,
-            &ready,
-            &next_to_write,
-            &out_file,
-        );
+        let (next_h, wrk_r, rk_r, lbl_r, nm_r) = (&next_hour, &workers, &rank, &labels, &sorted);
+        let out_ptr = hour_outputs.as_mut_ptr() as usize;
 
         for _ in 0..NTHREADS {
             s.spawn(move || {
-                let (mut count, mut errors, mut cursor) =
-                    (vec![0u32; ne + 1], vec![0u32; ne], vec![0u32; ne]);
+                let (mut count, mut errors, mut cursor) = (vec![0u32; ne + 1], vec![0u32; ne], vec![0u32; ne]);
                 let mut lat: Vec<u32> = Vec::new();
                 let mut line = [0u8; 512];
 
                 loop {
                     let h = next_h.fetch_add(1, Ordering::Relaxed);
-                    if h >= HOURS {
-                        break;
-                    }
+                    if h >= HOURS { break; }
 
                     count.fill(0);
                     errors.fill(0);
@@ -417,16 +284,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    for e in 0..ne {
-                        count[e + 1] += count[e];
-                    }
+                    for e in 0..ne { count[e + 1] += count[e]; }
                     cursor.copy_from_slice(&count[..ne]);
                     let total_lat = count[ne] as usize;
                     lat.clear();
                     lat.reserve(total_lat);
-                    unsafe {
-                        lat.set_len(total_lat);
-                    }
+                    unsafe { lat.set_len(total_lat); }
 
                     for wt in 0..NTHREADS {
                         let (w, r) = (&wrk_r[wt], &rk_r[wt]);
@@ -453,53 +316,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     let label = &lbl_r[h];
-                    let out_text = unsafe { &mut *out_r[h].0.get() };
+                    let out_text = unsafe { &mut *((out_ptr as *mut Vec<u8>).add(h)) };
                     out_text.reserve(ne * 64);
 
                     for e in 0..ne {
                         let (start, end) = (count[e] as usize, count[e + 1] as usize);
                         let n = end - start;
-                        if n == 0 {
-                            continue;
-                        }
+                        if n == 0 { continue; }
                         let slice = &mut lat[start..end];
                         let (p50, p95, p99) = if n <= 2 {
-                            if n == 1 {
-                                (slice[0], slice[0], slice[0])
-                            } else {
-                                (
-                                    slice[0].min(slice[1]),
-                                    slice[0].max(slice[1]),
-                                    slice[0].max(slice[1]),
-                                )
-                            }
+                            if n == 1 { (slice[0], slice[0], slice[0]) }
+                            else { (slice[0].min(slice[1]), slice[0].max(slice[1]), slice[0].max(slice[1])) }
                         } else if n <= 256 {
                             slice.sort_unstable();
-                            (
-                                slice[(50 * n + 99) / 100 - 1],
-                                slice[(95 * n + 99) / 100 - 1],
-                                slice[(99 * n + 99) / 100 - 1],
-                            )
+                            (slice[(50 * n + 99) / 100 - 1], slice[(95 * n + 99) / 100 - 1], slice[(99 * n + 99) / 100 - 1])
                         } else {
-                            let (r99, r95, r50) = (
-                                (99 * n + 99) / 100 - 1,
-                                (95 * n + 99) / 100 - 1,
-                                (50 * n + 99) / 100 - 1,
-                            );
+                            let (r99, r95, r50) = ((99 * n + 99) / 100 - 1, (95 * n + 99) / 100 - 1, (50 * n + 99) / 100 - 1);
                             slice.select_nth_unstable(r99);
                             let p99 = slice[r99];
-                            let p95 = if r95 == r99 {
-                                p99
-                            } else {
-                                slice[..r99].select_nth_unstable(r95);
-                                slice[r95]
-                            };
-                            let p50 = if r50 == r95 {
-                                p95
-                            } else {
-                                slice[..r95].select_nth_unstable(r50);
-                                slice[r50]
-                            };
+                            let p95 = if r95 == r99 { p99 } else { slice[..r99].select_nth_unstable(r95); slice[r95] };
+                            let p50 = if r50 == r95 { p95 } else { slice[..r95].select_nth_unstable(r50); slice[r50] };
                             (p50, p95, p99)
                         };
 
@@ -507,50 +343,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let ppm = ((err as u64) * 1_000_000 / (n as u64)) as u32;
                         line[..20].copy_from_slice(label);
                         pos += 20;
-                        line[pos] = b' ';
-                        pos += 1;
+                        line[pos] = b' '; pos += 1;
                         let ep_name = nm_r[e];
                         line[pos..pos + ep_name.len()].copy_from_slice(ep_name);
                         pos += ep_name.len();
                         for v in [n as u32, p50, p95, p99, err, ppm] {
-                            line[pos] = b' ';
-                            pos += 1;
+                            line[pos] = b' '; pos += 1;
                             pos = append_u32(&mut line, v, pos);
                         }
-                        line[pos] = b'\n';
-                        pos += 1;
+                        line[pos] = b'\n'; pos += 1;
                         out_text.extend_from_slice(&line[..pos]);
-                    }
-
-                    rdy_r[h].store(true, Ordering::Release);
-
-                    // Cooperative progressive writer: flush ready hours to disk immediately
-                    if let Ok(mut writer) = file_m.try_lock() {
-                        let mut cur = next_w.load(Ordering::Relaxed);
-                        while cur < HOURS && rdy_r[cur].load(Ordering::Acquire) {
-                            let out_bytes = unsafe { &mut *out_r[cur].0.get() };
-                            let _ = writer.write_all(out_bytes);
-                            out_bytes.clear();
-                            out_bytes.shrink_to_fit();
-                            cur += 1;
-                        }
-                        next_w.store(cur, Ordering::Relaxed);
                     }
                 }
             });
         }
     });
 
-    // Final flush of any remaining hours
-    let mut writer = out_file.lock().unwrap();
-    let mut cur = next_to_write.load(Ordering::Relaxed);
-    while cur < HOURS {
-        let out_bytes = unsafe { &*out_boxes[cur].0.get() };
-        let _ = writer.write_all(out_bytes);
-        cur += 1;
+    let mut out_file = std::io::BufWriter::with_capacity(512 * 1024, File::create(&out_p)?);
+    for h in 0..HOURS {
+        out_file.write_all(&hour_outputs[h])?;
     }
-    writer.flush().ok();
-    unsafe {
-        _exit(0);
-    }
+    out_file.flush()?;
+    unsafe { _exit(0); }
 }
