@@ -106,7 +106,10 @@ impl<'a> EndpointTable<'a> {
                 return idx;
             }
             if self.hashes[i & (TABLE_SLOTS - 1)] == key_fp {
-                return slot - 1;
+                let n = self.names[(slot - 1) as usize];
+                if std::slice::from_raw_parts(s, len) == n {
+                    return slot - 1;
+                }
             }
             i += 1;
         }

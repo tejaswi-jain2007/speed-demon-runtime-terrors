@@ -170,9 +170,21 @@ unsafe fn parse_csv_chunk(
             }
         } else {
             let start_name = p;
-            while *p != b',' { p = p.add(1); }
-            let len = p as usize - start_name as usize;
-            p = p.add(1);
+            let len = if p.add(16) <= end_ptr {
+                let v_comma = _mm_set1_epi8(b',' as i8);
+                let mask = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(p as *const __m128i), v_comma)) as u32;
+                if mask != 0 {
+                    mask.trailing_zeros() as usize
+                } else {
+                    let mut q = p.add(16);
+                    while *q != b',' { q = q.add(1); }
+                    q as usize - start_name as usize
+                }
+            } else {
+                while *p != b',' { p = p.add(1); }
+                p as usize - start_name as usize
+            };
+            p = start_name.add(len + 1);
             (hash_slice(start_name, len), len as u64)
         };
 
@@ -200,9 +212,22 @@ unsafe fn parse_csv_chunk(
             }
         } else {
             let start_note = p;
-            while *p != b',' { p = p.add(1); }
-            let nlen = (p as usize - start_note as usize) as u64;
-            p = p.add(1); nlen
+            let nlen = if p.add(16) <= end_ptr {
+                let v_comma = _mm_set1_epi8(b',' as i8);
+                let mask = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(p as *const __m128i), v_comma)) as u32;
+                if mask != 0 {
+                    mask.trailing_zeros() as usize
+                } else {
+                    let mut q = p.add(16);
+                    while *q != b',' { q = q.add(1); }
+                    q as usize - start_note as usize
+                }
+            } else {
+                while *p != b',' { p = p.add(1); }
+                p as usize - start_note as usize
+            };
+            p = start_note.add(nlen + 1);
+            nlen as u64
         };
 
         let mut region_id = (*p - b'0') as u32;
