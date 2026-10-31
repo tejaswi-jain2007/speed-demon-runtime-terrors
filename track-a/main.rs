@@ -32,6 +32,21 @@ unsafe fn find(mut s: *const u8, c: u8) -> *const u8 {
     }
 }
 
+#[inline(always)]
+unsafe fn parse_digits(end: *const u8, len: u32) -> u32 {
+    let v = _mm_loadu_si128(end.sub(16) as *const __m128i);
+    let v = _mm_subs_epu8(v, _mm_set1_epi8(b'0' as i8));
+    let lane = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let v = _mm_and_si128(v, _mm_cmpgt_epi8(lane, _mm_set1_epi8((15 - len) as i8)));
+    let v = _mm_maddubs_epi16(v, _mm_set1_epi16(0x010A));
+    let v = _mm_madd_epi16(v, _mm_set1_epi32(0x00010064));
+    let v = _mm_packus_epi32(v, v);
+    let v = _mm_madd_epi16(v, _mm_set1_epi32(0x00012710));
+    let high = _mm_cvtsi128_si32(v) as u32;
+    let low = _mm_extract_epi32(v, 1) as u32;
+    high.wrapping_mul(100000000) + low
+}
+
 struct EndpointTable<'a> {
     slots: [u32; TABLE_SLOTS],
     names: Vec<&'a [u8]>,
@@ -95,11 +110,11 @@ impl<'a> Worker<'a> {
         let mut curr_block: [*mut Block; HOURS] = [std::ptr::null_mut(); HOURS];
 
         while p < end {
-            let day_idx = (*p.add(9) - b'0') as i32 + (*p.add(6) & 1) as i32;
-            let hour = (*p.add(11) - b'0') as i32 * 10 + (*p.add(12) - b'0') as i32;
+            let day_idx = if *p.add(6) == b'0' { (*p.add(9) - b'0') as i32 } else { (*p.add(9) - b'0' + 1) as i32 };
+            let hour = ((*p.add(11) - b'0') * 10 + (*p.add(12) - b'0')) as i32;
             let h = (day_idx * 24 + hour - 18) as usize;
 
-            let m = p.add(25);
+            let m = p.add(28);
             let v0 = _mm256_loadu_si256(m as *const __m256i);
             let v1 = _mm256_loadu_si256(m.add(32) as *const __m256i);
             let sp0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, space_vec)) as u32;
@@ -110,33 +125,14 @@ impl<'a> Worker<'a> {
             let sp = (sp0 as u64) | ((sp1 as u64) << 32);
             let nl = (nl0 as u64) | ((nl1 as u64) << 32);
 
-            let sp1_pos = sp.trailing_zeros() as usize;
-            let ep = m.add(sp1_pos + 1);
-            let sp_rem1 = sp & (sp - 1);
-            let sp2_pos = sp_rem1.trailing_zeros() as usize;
-            let ee = m.add(sp2_pos);
+            let ep = m.add(sp.trailing_zeros() as usize + 1);
+            let sp_rem = sp & (sp - 1);
+            let ee = if sp_rem != 0 { m.add(sp_rem.trailing_zeros() as usize) } else { find(ep, b' ') };
+            let eol = if nl != 0 { m.add(nl.trailing_zeros() as usize) } else { find(ee.add(5), b'\n') };
 
             let is_err = if *ee.add(1) == b'5' { ERR_BIT } else { 0 };
             let key = self.endpoints.intern(ep, ee as usize - ep as usize) | is_err;
-
-            let sp_rem2 = sp_rem1 & (sp_rem1 - 1);
-            let sp3_pos = sp_rem2.trailing_zeros() as usize;
-            let lat_start = m.add(sp3_pos + 1);
-
-            let (lat, eol) = if nl != 0 && sp_rem2 != 0 {
-                let eol_ptr = m.add(nl.trailing_zeros() as usize);
-                let mut v = 0u32;
-                let mut cur = lat_start;
-                while cur < eol_ptr { v = v * 10 + (*cur - b'0') as u32; cur = cur.add(1); }
-                (v, eol_ptr)
-            } else {
-                let cur_sp3 = if sp_rem2 != 0 { lat_start } else { find(ee.add(1), b' ').add(1) };
-                let eol_ptr = find(cur_sp3, b'\n');
-                let mut v = 0u32;
-                let mut cur = cur_sp3;
-                while cur < eol_ptr { v = v * 10 + (*cur - b'0') as u32; cur = cur.add(1); }
-                (v, eol_ptr)
-            };
+            let lat = parse_digits(eol, (eol as usize - ee as usize - 5) as u32);
             p = eol.add(1);
 
             if lat >= BIG { self.big[h].push((lat, key)); continue; }
