@@ -1,4 +1,4 @@
-// Speed Demon 2026 - Track D (Traverse) - Ultra Packed Bidirectional Dijkstra & 4-ary Heap
+// Speed Demon 2026 - Track D (Traverse) - Turbo Packed Bidirectional Dijkstra & 4-ary Heap
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
@@ -6,6 +6,9 @@ use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+const PROT_READ: i32 = 1;
+const MAP_PRIVATE: i32 = 2;
 
 extern "C" {
     fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
@@ -16,56 +19,22 @@ extern "C" {
 
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
-struct Edge { to: u32, weight: u16 }
-
-struct FastMmap { ptr: *const u8, len: usize, _file: File }
-unsafe impl Send for FastMmap {}
-unsafe impl Sync for FastMmap {}
-
-impl FastMmap {
-    fn open(path: &str) -> Option<Self> {
-        let file = File::open(path).ok()?;
-        let len = file.metadata().ok()?.len() as usize;
-        if len == 0 { return None; }
-        let fd = file.as_raw_fd();
-        let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, fd, 0) };
-        if ptr.is_null() || ptr as isize == -1 { return None; }
-        unsafe { madvise(ptr, len, 2); }
-        Some(FastMmap { ptr, len, _file: file })
-    }
-    #[inline(always)] fn as_slice(&self) -> &[u8] { unsafe { std::slice::from_raw_parts(self.ptr, self.len) } }
-}
-impl Drop for FastMmap { fn drop(&mut self) { unsafe { munmap(self.ptr as *mut u8, self.len); } } }
-
-#[inline(always)]
-unsafe fn discard_file_pages(ptr: *const u8, len: usize) {
-    let p = ptr as usize;
-    let (s, e) = ((p + 4095) & !4095, (p + len) & !4095);
-    if e > s { madvise(s as *mut u8, e - s, 4); }
+struct Edge {
+    to: u32,
+    weight: u16,
 }
 
-#[inline(always)]
-fn parse_u32(d: &[u8], mut p: usize, val: &mut u32) -> usize {
-    while p < d.len() && unsafe { *d.get_unchecked(p) } <= b' ' { p += 1; }
-    let mut v = 0u32;
-    while p < d.len() && unsafe { *d.get_unchecked(p) } >= b'0' {
-        v = v * 10 + (unsafe { *d.get_unchecked(p) } - b'0') as u32;
-        p += 1;
-    }
-    *val = v;
-    p
+struct Heap4 {
+    data: Vec<u64>,
 }
 
-#[derive(Clone, Copy)]
-struct SyncEdges(*mut Edge);
-unsafe impl Send for SyncEdges {}
-unsafe impl Sync for SyncEdges {}
-
-struct Heap4 { data: Vec<u64> }
 impl Heap4 {
-    fn new() -> Self { Heap4 { data: Vec::with_capacity(8192) } }
+    fn new() -> Self {
+        Heap4 { data: Vec::with_capacity(4096) }
+    }
     #[inline(always)] fn clear(&mut self) { self.data.clear(); }
     #[inline(always)] fn is_empty(&self) -> bool { self.data.is_empty() }
+
     #[inline(always)]
     fn push(&mut self, dist: u32, u: u32) {
         let val = ((dist as u64) << 32) | (u as u64);
@@ -81,25 +50,36 @@ impl Heap4 {
         }
         unsafe { *self.data.get_unchecked_mut(idx) = val; }
     }
+
     #[inline(always)]
     fn pop(&mut self) -> (u32, u32) {
         let min = unsafe { *self.data.get_unchecked(0) };
         let last = self.data.pop().unwrap();
-        if !self.data.is_empty() {
+        let len = self.data.len();
+        if len > 0 {
             let mut idx = 0;
-            let len = self.data.len();
             loop {
                 let first_child = (idx << 2) + 1;
                 if first_child >= len { break; }
                 let mut best_child = first_child;
                 let mut best_val = unsafe { *self.data.get_unchecked(first_child) };
-                for offset in 1..4 {
-                    let c = first_child + offset;
-                    if c < len {
-                        let v = unsafe { *self.data.get_unchecked(c) };
-                        if v < best_val { best_val = v; best_child = c; }
-                    }
+
+                let c2 = first_child + 1;
+                if c2 < len {
+                    let v2 = unsafe { *self.data.get_unchecked(c2) };
+                    if v2 < best_val { best_val = v2; best_child = c2; }
                 }
+                let c3 = first_child + 2;
+                if c3 < len {
+                    let v3 = unsafe { *self.data.get_unchecked(c3) };
+                    if v3 < best_val { best_val = v3; best_child = c3; }
+                }
+                let c4 = first_child + 3;
+                if c4 < len {
+                    let v4 = unsafe { *self.data.get_unchecked(c4) };
+                    if v4 < best_val { best_val = v4; best_child = c4; }
+                }
+
                 if best_val < last {
                     unsafe { *self.data.get_unchecked_mut(idx) = best_val; }
                     idx = best_child;
@@ -122,9 +102,13 @@ fn dijkstra64(head: &[u32], edges: &[Edge], large_map: &HashMap<(u32, u32), u64>
         let start = head[u as usize] as usize;
         let end = head[(u + 1) as usize] as usize;
         for ei in start..end {
-            let e = unsafe { edges.get_unchecked(ei) };
-            let (to, w16) = (e.to, e.weight);
-            let w = if w16 == 65535 { *large_map.get(&(u, to)).unwrap_or(&65535) } else { w16 as u64 };
+            let e = unsafe { *edges.get_unchecked(ei) };
+            let (to, ew16) = (e.to, e.weight);
+            let w = if ew16 == 65535 {
+                *large_map.get(&(u, to)).unwrap_or(&(ew16 as u64))
+            } else {
+                ew16 as u64
+            };
             let nd = d.saturating_add(w);
             let cur = *d64.get(&to).unwrap_or(&u64::MAX);
             if nd < cur {
@@ -134,6 +118,18 @@ fn dijkstra64(head: &[u32], edges: &[Edge], large_map: &HashMap<(u32, u32), u64>
         }
     }
     -1
+}
+
+#[inline(always)]
+fn parse_u32(d: &[u8], mut p: usize, val: &mut u32) -> usize {
+    while p < d.len() && unsafe { *d.get_unchecked(p) } <= b' ' { p += 1; }
+    let mut v = 0u32;
+    while p < d.len() && unsafe { *d.get_unchecked(p) } >= b'0' {
+        v = v * 10 + (unsafe { *d.get_unchecked(p) } - b'0') as u32;
+        p += 1;
+    }
+    *val = v;
+    p
 }
 
 fn main() {
@@ -151,30 +147,37 @@ fn main() {
     let queries_path = format!("{}/queries.txt", data_dir);
     let out_path = format!("{}/distances.txt", out_dir);
 
-    let g_mmap = match FastMmap::open(&graph_path) { Some(m) => m, None => return };
-    let g_data = g_mmap.as_slice();
+    let g_file = match File::open(&graph_path) { Ok(f) => f, Err(_) => return };
+    let g_len = match g_file.metadata() { Ok(m) => m.len() as usize, Err(_) => return };
+    if g_len == 0 { return; }
+    let fd = g_file.as_raw_fd();
 
-    let mut n = 0u32;
-    let mut m = 0u32;
+    let g_ptr = unsafe { mmap(std::ptr::null_mut(), g_len, PROT_READ, MAP_PRIVATE, fd, 0) };
+    if g_ptr.is_null() || g_ptr as isize == -1 { return; }
+    let g_data = unsafe { std::slice::from_raw_parts(g_ptr, g_len) };
+    let g_ptr_val = g_data.as_ptr() as usize;
+
+    let mut n = 0u32; let mut m = 0u32;
     let mut gp = 0;
     gp = parse_u32(g_data, gp, &mut n);
     gp = parse_u32(g_data, gp, &mut m);
     let edges_start = gp;
 
     let num_load_threads = 16;
-    let edges_len = g_data.len() - edges_start;
+    let edges_len = g_len - edges_start;
     let chunk_size = edges_len / num_load_threads;
     let mut bounds = vec![edges_start; num_load_threads + 1];
     for t in 1..num_load_threads {
         let mut target = edges_start + t * chunk_size;
-        while target < g_data.len() && g_data[target - 1] != b'\n' { target += 1; }
+        while target < g_len && g_data[target - 1] != b'\n' { target += 1; }
         bounds[t] = target;
     }
-    bounds[num_load_threads] = g_data.len();
+    bounds[num_load_threads] = g_len;
 
     let head = (0..=(n + 1)).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
     let rev_head = (0..=(n + 1)).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
 
+    // Pass 1: count out-degrees and in-degrees
     std::thread::scope(|s| {
         for t in 0..num_load_threads {
             let start = bounds[t];
@@ -182,8 +185,8 @@ fn main() {
             let h_ref = &head;
             let rh_ref = &rev_head;
             s.spawn(move || {
-                let mut p = unsafe { g_data.as_ptr().add(start) };
-                let end_p = unsafe { g_data.as_ptr().add(end) };
+                let mut p = (g_ptr_val + start) as *const u8;
+                let end_p = (g_ptr_val + end) as *const u8;
                 while p < end_p {
                     while unsafe { *p } <= b' ' { p = unsafe { p.add(1) }; }
                     if p >= end_p { break; }
@@ -194,7 +197,6 @@ fn main() {
                     while unsafe { *p } >= b'0' { v = v * 10 + unsafe { (*p - b'0') as u32 }; p = unsafe { p.add(1) }; }
                     while unsafe { *p } != b'\n' { p = unsafe { p.add(1) }; }
                     p = unsafe { p.add(1) };
-
                     h_ref[(u + 1) as usize].fetch_add(1, Ordering::Relaxed);
                     rh_ref[(v + 1) as usize].fetch_add(1, Ordering::Relaxed);
                 }
@@ -217,18 +219,25 @@ fn main() {
 
     let mut edges = vec![Edge { to: 0, weight: 0 }; m as usize];
     let mut rev_edges = vec![Edge { to: 0, weight: 0 }; m as usize];
-    let ep = SyncEdges(edges.as_mut_ptr());
-    let rep = SyncEdges(rev_edges.as_mut_ptr());
+    let ep_raw = edges.as_mut_ptr() as usize;
+    let rep_raw = rev_edges.as_mut_ptr() as usize;
 
+    let large_mutex = std::sync::Mutex::new(HashMap::<(u32, u32), u64>::with_capacity(64));
+
+    // Pass 2: populate both forward and reverse edges and capture large edges in-flight
     std::thread::scope(|s| {
         for t in 0..num_load_threads {
             let start = bounds[t];
             let end = bounds[t + 1];
             let h_ref = &head;
             let rh_ref = &rev_head;
+            let lm = &large_mutex;
             s.spawn(move || {
-                let mut p = unsafe { g_data.as_ptr().add(start) };
-                let end_p = unsafe { g_data.as_ptr().add(end) };
+                let ep = ep_raw as *mut Edge;
+                let rep = rep_raw as *mut Edge;
+                let mut local_large = Vec::with_capacity(8);
+                let mut p = (g_ptr_val + start) as *const u8;
+                let end_p = (g_ptr_val + end) as *const u8;
                 while p < end_p {
                     while unsafe { *p } <= b' ' { p = unsafe { p.add(1) }; }
                     if p >= end_p { break; }
@@ -245,15 +254,33 @@ fn main() {
 
                     let slot = h_ref[u as usize].fetch_add(1, Ordering::Relaxed) as usize;
                     let rslot = rh_ref[v as usize].fetch_add(1, Ordering::Relaxed) as usize;
-                    let w16 = if w >= 65534 { 65535 } else { w as u16 };
+                    let w16 = if w >= 65534 {
+                        local_large.push((u, v, w));
+                        65535
+                    } else {
+                        w as u16
+                    };
                     unsafe {
-                        *ep.0.add(slot) = Edge { to: v, weight: w16 };
-                        *rep.0.add(rslot) = Edge { to: u, weight: w16 };
+                        *ep.add(slot) = Edge { to: v, weight: w16 };
+                        *rep.add(rslot) = Edge { to: u, weight: w16 };
                     }
+                }
+                if !local_large.is_empty() {
+                    let mut guard = lm.lock().unwrap();
+                    for (u, v, w) in local_large { guard.insert((u, v), w); }
                 }
             });
         }
     });
+
+    let large_map = large_mutex.into_inner().unwrap();
+
+    // Immediately discard mmap physical pages
+    unsafe {
+        madvise(g_ptr, g_len, 4); // MADV_DONTNEED
+        munmap(g_ptr, g_len);
+    }
+    drop(g_file);
 
     let mut final_head = vec![0u32; (n + 2) as usize];
     let mut final_rev_head = vec![0u32; (n + 2) as usize];
@@ -266,35 +293,31 @@ fn main() {
     final_rev_head[(n + 1) as usize] = cur_rev;
     drop(head); drop(rev_head);
 
-    let mut large_map: HashMap<(u32, u32), u64> = HashMap::new();
-    let mut p = edges_start;
-    while p < g_data.len() {
-        while p < g_data.len() && g_data[p] <= b' ' { p += 1; }
-        if p >= g_data.len() { break; }
-        let mut u = 0u32; let mut v = 0u32;
-        p = parse_u32(g_data, p, &mut u);
-        p = parse_u32(g_data, p, &mut v);
-        while p < g_data.len() && g_data[p] <= b' ' { p += 1; }
-        let mut w = 0u64;
-        while p < g_data.len() && g_data[p] >= b'0' { w = w * 10 + (g_data[p] - b'0') as u64; p += 1; }
-        while p < g_data.len() && g_data[p] != b'\n' { p += 1; }
-        if w >= 65534 { large_map.insert((u, v), w); }
-    }
-    unsafe { discard_file_pages(g_data.as_ptr(), g_data.len()); }
-    drop(g_mmap);
+    let q_mmap = match File::open(&queries_path) {
+        Ok(f) => {
+            let len = f.metadata().map(|m| m.len() as usize).unwrap_or(0);
+            if len > 0 {
+                let ptr = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, f.as_raw_fd(), 0) };
+                if !ptr.is_null() && ptr as isize != -1 {
+                    Some((ptr, len, f))
+                } else { None }
+            } else { None }
+        }
+        Err(_) => None,
+    };
+    let (q_ptr, q_len, _q_file) = match q_mmap { Some(t) => t, None => return };
+    let q_data = unsafe { std::slice::from_raw_parts(q_ptr, q_len) };
 
-    let q_mmap = match FastMmap::open(&queries_path) { Some(m) => m, None => return };
-    let q_data = q_mmap.as_slice();
-    let mut queries = Vec::new();
+    let mut queries = Vec::with_capacity(2048);
     let mut qp = 0;
-    while qp < q_data.len() {
+    while qp < q_len {
         let mut s = 0u32; let mut t = 0u32;
         qp = parse_u32(q_data, qp, &mut s);
-        if qp >= q_data.len() { break; }
+        if qp >= q_len { break; }
         qp = parse_u32(q_data, qp, &mut t);
         queries.push((s, t));
     }
-    drop(q_mmap);
+    unsafe { munmap(q_ptr, q_len); }
 
     let num_queries = queries.len();
     if num_queries == 0 {
@@ -303,7 +326,7 @@ fn main() {
         return;
     }
 
-    let num_workers = 8.min(num_queries).max(1);
+    let num_workers = 10.min(num_queries).max(1);
     let head_arc = Arc::new(final_head);
     let rhead_arc = Arc::new(final_rev_head);
     let edges_arc = Arc::new(edges);
@@ -325,11 +348,12 @@ fn main() {
         let queries_ref = Arc::clone(&queries_arc);
         let next_q = Arc::clone(&next_q_arc);
 
+        let total_nodes = head_ref.len() - 1;
         let builder = std::thread::Builder::new().stack_size(256 * 1024);
         workers.push(builder.spawn(move || {
             let out_ptr = answers_ptr as *mut i64;
-            let mut dist = vec![!0u32; head_ref.len() - 1];
-            let mut touched: Vec<u32> = Vec::with_capacity(8192);
+            let mut dist: Vec<u32> = vec![!0u32; total_nodes];
+            let mut touched: Vec<u32> = Vec::with_capacity(4096);
             let mut pq_fwd = Heap4::new();
             let mut pq_bwd = Heap4::new();
 
@@ -344,26 +368,28 @@ fn main() {
                 if !s_out || !t_in { unsafe { *out_ptr.add(qi) = -1; } continue; }
 
                 dist[s as usize] = 0x0000_FFFF;
+                dist[t as usize] = 0xFFFF_0000;
                 touched.push(s);
-                pq_fwd.push(0, s);
+                touched.push(t);
 
-                dist[t as usize] = (dist[t as usize] & 0xFFFF_0000) | 0x0000;
-                if dist[t as usize] == 0xFFFF_0000 { touched.push(t); }
+                pq_fwd.clear();
+                pq_bwd.clear();
+                pq_fwd.push(0, s);
                 pq_bwd.push(0, t);
 
                 let mut best = u32::MAX;
                 let mut had_large = false;
 
                 while !pq_fwd.is_empty() && !pq_bwd.is_empty() {
-                    let top_f = (unsafe { *pq_fwd.data.get_unchecked(0) } >> 32) as u32;
-                    let top_b = (unsafe { *pq_bwd.data.get_unchecked(0) } >> 32) as u32;
-                    if top_f.saturating_add(top_b) >= best { break; }
+                    let min_fwd = unsafe { *pq_fwd.data.get_unchecked(0) } >> 32;
+                    let min_bwd = unsafe { *pq_bwd.data.get_unchecked(0) } >> 32;
+                    if (min_fwd + min_bwd) as u32 >= best { break; }
 
-                    if pq_fwd.data.len() <= pq_bwd.data.len() {
+                    if min_fwd <= min_bwd {
                         let (d, u) = pq_fwd.pop();
-                        if d >= best { break; }
-                        let cur = (dist[u as usize] >> 16) as u32;
-                        if d > cur { continue; }
+                        let cur_packed = unsafe { *dist.get_unchecked(u as usize) };
+                        let fwd_d = (cur_packed >> 16) as u16;
+                        if (d as u16) > fwd_d { continue; }
 
                         let start = unsafe { *head_ref.get_unchecked(u as usize) as usize };
                         let end = unsafe { *head_ref.get_unchecked((u + 1) as usize) as usize };
@@ -374,26 +400,28 @@ fn main() {
                             let nd = d + ew;
                             if nd >= best || nd >= 65534 { continue; }
 
-                            let packed = dist[to as usize];
+                            let to_idx = to as usize;
+                            let packed = unsafe { *dist.get_unchecked(to_idx) };
                             let cur_fwd = (packed >> 16) as u16;
                             let nd16 = nd as u16;
                             if nd16 < cur_fwd {
                                 if packed == !0u32 { touched.push(to); }
-                                dist[to as usize] = ((nd16 as u32) << 16) | (packed & 0xFFFF);
+                                let new_packed = ((nd16 as u32) << 16) | (packed & 0xFFFF);
+                                unsafe { *dist.get_unchecked_mut(to_idx) = new_packed; }
                                 pq_fwd.push(nd, to);
 
                                 let bwd_d = packed as u16;
                                 if bwd_d != u16::MAX {
-                                    let total = nd + bwd_d as u32;
+                                    let total = nd + (bwd_d as u32);
                                     if total < best { best = total; }
                                 }
                             }
                         }
                     } else {
                         let (d, u) = pq_bwd.pop();
-                        if d >= best { break; }
-                        let cur = (dist[u as usize] & 0xFFFF) as u32;
-                        if d > cur { continue; }
+                        let cur_packed = unsafe { *dist.get_unchecked(u as usize) };
+                        let bwd_d = cur_packed as u16;
+                        if (d as u16) > bwd_d { continue; }
 
                         let start = unsafe { *rhead_ref.get_unchecked(u as usize) as usize };
                         let end = unsafe { *rhead_ref.get_unchecked((u + 1) as usize) as usize };
@@ -404,17 +432,19 @@ fn main() {
                             let nd = d + ew;
                             if nd >= best || nd >= 65534 { continue; }
 
-                            let packed = dist[to as usize];
+                            let to_idx = to as usize;
+                            let packed = unsafe { *dist.get_unchecked(to_idx) };
                             let cur_bwd = packed as u16;
                             let nd16 = nd as u16;
                             if nd16 < cur_bwd {
                                 if packed == !0u32 { touched.push(to); }
-                                dist[to as usize] = (packed & 0xFFFF_0000) | (nd16 as u32);
+                                let new_packed = (packed & 0xFFFF_0000) | (nd16 as u32);
+                                unsafe { *dist.get_unchecked_mut(to_idx) = new_packed; }
                                 pq_bwd.push(nd, to);
 
                                 let fwd_d = (packed >> 16) as u16;
                                 if fwd_d != u16::MAX {
-                                    let total = nd + fwd_d as u32;
+                                    let total = nd + (fwd_d as u32);
                                     if total < best { best = total; }
                                 }
                             }
@@ -422,10 +452,8 @@ fn main() {
                     }
                 }
 
-                for &u in &touched { dist[u as usize] = !0u32; }
+                for &u in &touched { unsafe { *dist.get_unchecked_mut(u as usize) = !0u32; } }
                 touched.clear();
-                pq_fwd.clear();
-                pq_bwd.clear();
 
                 let ans = if best != u32::MAX {
                     best as i64
