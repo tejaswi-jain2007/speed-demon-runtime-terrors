@@ -161,7 +161,7 @@ impl<'a> Worker<'a> {
             return;
         }
         let chunk_bytes = end as usize - p as usize;
-        let reserve = (chunk_bytes / 72 / BLOCK_CAP + 18) * std::mem::size_of::<Block>();
+        let reserve = 72 * std::mem::size_of::<Block>();
         self.reserved = reserve;
         self.region = mmap(
             std::ptr::null_mut(),
@@ -175,17 +175,7 @@ impl<'a> Worker<'a> {
             std::process::exit(1);
         }
 
-        let mut last_evict = p as usize;
         while p < end {
-            if (p as usize) - last_evict >= 1024 * 1024 {
-                let s = (last_evict + 4095) & !4095;
-                let e = (p as usize) & !4095;
-                if e > s {
-                    madvise(s as *mut u8, e - s, MADV_DONTNEED);
-                }
-                last_evict = p as usize;
-            }
-
             let day_idx = if *p.add(6) == b'0' {
                 (*p.add(9) - b'0') as i32
             } else {
@@ -222,7 +212,7 @@ impl<'a> Worker<'a> {
             let b = &mut self.head[h];
             if (*b).is_null() || (*(*b)).n as usize == BLOCK_CAP {
                 if self.used + std::mem::size_of::<Block>() > self.reserved {
-                    let extra = 32 * std::mem::size_of::<Block>();
+                    let extra = 16 * std::mem::size_of::<Block>();
                     let p = mmap(std::ptr::null_mut(), extra, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
                     if p != MAP_FAILED {
                         self.region = p;
@@ -239,11 +229,6 @@ impl<'a> Worker<'a> {
             let b_ref = &mut *(*b);
             b_ref.rec[b_ref.n as usize] = (lat << KEY_BITS) | key;
             b_ref.n += 1;
-        }
-        let s = (last_evict + 4095) & !4095;
-        let e = (end as usize) & !4095;
-        if e > s {
-            madvise(s as *mut u8, e - s, MADV_DONTNEED);
         }
     }
 }
@@ -516,7 +501,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     lat[dst] = rec >> KEY_BITS;
                                     cursor[e] += 1;
                                 }
-                                b = b_ref.next;
+                                let next_b = b_ref.next;
+                                madvise(b as *mut u8, std::mem::size_of::<Block>(), MADV_DONTNEED);
+                                b = next_b;
                             }
                         }
                         for &(l, key) in &w.big[h] {
@@ -530,6 +517,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Format lines
                     let label = &labels_ref[h];
                     let mut out_text = text_ref[h].lock().unwrap();
+                    out_text.reserve(ne * 64);
 
                     for e in 0..ne {
                         let start = count[e] as usize;
