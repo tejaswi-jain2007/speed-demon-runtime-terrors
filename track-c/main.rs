@@ -76,7 +76,7 @@ impl LocalCountryAgg {
 fn parse_csv_chunk(rec_data: &[u8], start: usize, end: usize, rlookup: &[u8], local_aggs: &mut [LocalCountryAgg], local_names: &mut Vec<u64>) {
     let (mut p, mut filter, mut last_evict) = (start, vec![0u64; 65536], start);
     while p < end {
-        if p - last_evict >= 256 * 1024 {
+        if p - last_evict >= 2 * 1024 * 1024 {
             unsafe { madvise_dontneed(rec_data.as_ptr().add(last_evict), p - last_evict); }
             last_evict = p;
         }

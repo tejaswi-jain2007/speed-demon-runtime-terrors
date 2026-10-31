@@ -137,7 +137,7 @@ fn main() {
             let (mut ep_table, mut records, mut errors) = (EpTable::new(4096), Vec::with_capacity((end - start) / 40), vec![0u32; 72 * 2048]);
             let (mut p, mut last_evict) = (start, start);
             while p < end {
-                if p - last_evict >= 256 * 1024 {
+                if p - last_evict >= 2 * 1024 * 1024 {
                     unsafe { madvise_dontneed(d.as_ptr().add(last_evict), p - last_evict); }
                     last_evict = p;
                 }

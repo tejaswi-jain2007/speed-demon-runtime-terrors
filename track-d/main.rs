@@ -1,8 +1,7 @@
 use std::fs::File;
 use std::io::Write;
-use std::mem::ManuallyDrop;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -38,9 +37,6 @@ impl FastMmap {
 impl Drop for FastMmap {
     fn drop(&mut self) { unsafe { munmap(self.ptr as *mut u8, self.len); } }
 }
-
-#[derive(Clone, Copy)]
-struct RawEdge { u: u32, v: u32, w: u32 }
 
 #[derive(Clone, Copy)]
 struct Edge { to: u32, weight: u32 }
@@ -124,7 +120,7 @@ fn main() {
     gp = parse_u32(g_data, gp, g_size, &mut m);
     let edges_start = gp;
 
-    let num_parse_threads = 12.min(thread::available_parallelism().map(|n| n.get()).unwrap_or(12)).max(1);
+    let num_parse_threads = 4;
     let total_edge_bytes = g_size - edges_start;
     let mut splits = vec![edges_start; num_parse_threads + 1];
     splits[num_parse_threads] = g_size;
@@ -135,18 +131,85 @@ fn main() {
         splits[t] = pt.min(g_size);
     }
 
-    let head_atomic: Arc<Vec<AtomicU32>> = Arc::new((0..=(n + 1)).map(|_| AtomicU32::new(0)).collect());
     let has_in_words = (n as usize + 63) / 64;
-    let has_in_atomic: Arc<Vec<AtomicU64>> = Arc::new((0..has_in_words).map(|_| AtomicU64::new(0)).collect());
 
-    // Single Pass: Parse text to binary RawEdge in memory AND count degrees + in-edges
-    let mut parse_handles = Vec::with_capacity(num_parse_threads);
+    // Pass 1: 4 threads, ZERO ATOMICS. Each counts out-degree and in-edges locally in L1/L2 cache.
+    let mut p1_handles = Vec::with_capacity(num_parse_threads);
     for t in 0..num_parse_threads {
-        let (mmap_ref, head_ref, has_in_ref, start, end) =
-            (Arc::clone(&g_mmap), Arc::clone(&head_atomic), Arc::clone(&has_in_atomic), splits[t], splits[t + 1]);
-        parse_handles.push(thread::spawn(move || {
+        let (mmap_ref, start, end) = (Arc::clone(&g_mmap), splits[t], splits[t + 1]);
+        p1_handles.push(thread::spawn(move || {
             let d = mmap_ref.as_slice();
-            let mut thread_edges = Vec::with_capacity((end - start) / 20);
+            let mut local_counts = vec![0u16; (n + 1) as usize];
+            let mut local_in = vec![0u64; has_in_words];
+            let mut p = start;
+            while p < end {
+                while p < end && unsafe { *d.get_unchecked(p) } <= b' ' { p += 1; }
+                if p >= end { break; }
+                let mut u = (unsafe { *d.get_unchecked(p) } - b'0') as u32; p += 1;
+                while p < end && unsafe { *d.get_unchecked(p) } >= b'0' {
+                    u = u * 10 + (unsafe { *d.get_unchecked(p) } - b'0') as u32; p += 1;
+                }
+                while p < end && unsafe { *d.get_unchecked(p) } <= b' ' { p += 1; }
+                let mut v = (unsafe { *d.get_unchecked(p) } - b'0') as u32; p += 1;
+                while p < end && unsafe { *d.get_unchecked(p) } >= b'0' {
+                    v = v * 10 + (unsafe { *d.get_unchecked(p) } - b'0') as u32; p += 1;
+                }
+                while p < end && unsafe { *d.get_unchecked(p) } <= b' ' { p += 1; }
+                while p < end && unsafe { *d.get_unchecked(p) } >= b'0' { p += 1; }
+
+                unsafe {
+                    *local_counts.get_unchecked_mut(u as usize) += 1;
+                    *local_in.get_unchecked_mut((v >> 6) as usize) |= 1u64 << (v & 63);
+                }
+            }
+            (local_counts, local_in)
+        }));
+    }
+
+    let mut thread_counts = Vec::with_capacity(num_parse_threads);
+    let mut has_in = vec![0u64; has_in_words];
+    for h in p1_handles {
+        let (counts, in_bits) = h.join().unwrap();
+        for (w, &b) in in_bits.iter().enumerate() { has_in[w] |= b; }
+        thread_counts.push(counts);
+    }
+
+    // Prefix sum across the 4 thread count arrays to compute:
+    // 1) CSR `head`
+    // 2) Thread-specific private start offsets for Pass 2 (zero atomics)
+    let mut head = vec![0u32; (n + 2) as usize];
+    let mut thread_offsets: Vec<Vec<u32>> = (0..num_parse_threads)
+        .map(|_| vec![0u32; (n + 1) as usize])
+        .collect();
+
+    let mut running_sum = 0u32;
+    for u in 0..=n as usize {
+        head[u] = running_sum;
+        let c0 = thread_counts[0][u] as u32;
+        let c1 = thread_counts[1][u] as u32;
+        let c2 = thread_counts[2][u] as u32;
+        let c3 = thread_counts[3][u] as u32;
+
+        thread_offsets[0][u] = running_sum;
+        thread_offsets[1][u] = running_sum + c0;
+        thread_offsets[2][u] = running_sum + c0 + c1;
+        thread_offsets[3][u] = running_sum + c0 + c1 + c2;
+
+        running_sum += c0 + c1 + c2 + c3;
+    }
+    head[(n + 1) as usize] = running_sum;
+    drop(thread_counts);
+
+    // Pass 2: 4 threads populate CSR edges in parallel with ZERO ATOMICS!
+    let mut edges = vec![Edge { to: 0, weight: 0 }; m as usize];
+    let edges_ptr = edges.as_mut_ptr() as usize;
+
+    let mut p2_handles = Vec::with_capacity(num_parse_threads);
+    for (t, mut offsets) in thread_offsets.into_iter().enumerate() {
+        let (mmap_ref, start, end) = (Arc::clone(&g_mmap), splits[t], splits[t + 1]);
+        p2_handles.push(thread::spawn(move || {
+            let d = mmap_ref.as_slice();
+            let e_ptr = edges_ptr as *mut Edge;
             let mut p = start;
             while p < end {
                 while p < end && unsafe { *d.get_unchecked(p) } <= b' ' { p += 1; }
@@ -165,71 +228,23 @@ fn main() {
                 while p < end && unsafe { *d.get_unchecked(p) } >= b'0' {
                     w = w * 10 + (unsafe { *d.get_unchecked(p) } - b'0') as u32; p += 1;
                 }
-                while p < end && unsafe { *d.get_unchecked(p) } != b'\n' { p += 1; }
-                if p < end { p += 1; }
 
-                thread_edges.push(RawEdge { u, v, w });
-                unsafe { head_ref.get_unchecked((u + 1) as usize).fetch_add(1, Ordering::Relaxed); }
-                unsafe { has_in_ref.get_unchecked((v >> 6) as usize).fetch_or(1 << (v & 63), Ordering::Relaxed); }
+                let idx = unsafe {
+                    let off_ref = offsets.get_unchecked_mut(u as usize);
+                    let cur = *off_ref;
+                    *off_ref += 1;
+                    cur
+                };
+                unsafe { *e_ptr.add(idx as usize) = Edge { to: v, weight: w }; }
             }
-            thread_edges
         }));
     }
-
-    let mut thread_edge_lists = Vec::with_capacity(num_parse_threads);
-    for h in parse_handles { thread_edge_lists.push(h.join().unwrap()); }
+    for h in p2_handles { h.join().unwrap(); }
 
     // Evict and drop graph input mmap immediately to minimize RSS
     unsafe { madvise_dontneed(g_data.as_ptr(), g_size); }
     drop(g_mmap);
-
-    // Prefix sum in-place
-    let mut sum = 0u32;
-    for j in 0..=n as usize {
-        let cnt = head_atomic[j + 1].load(Ordering::Relaxed);
-        head_atomic[j].store(sum, Ordering::Relaxed);
-        sum += cnt;
-    }
-    head_atomic[(n + 1) as usize].store(sum, Ordering::Relaxed);
-
-    // Scatter RawEdge from in-memory buffers into CSR edges array
-    let mut edges = vec![Edge { to: 0, weight: 0 }; m as usize];
-    let edges_ptr = edges.as_mut_ptr() as usize;
-
-    let mut scatter_handles = Vec::with_capacity(num_parse_threads);
-    for thread_edges in thread_edge_lists {
-        let head_ref = Arc::clone(&head_atomic);
-        scatter_handles.push(thread::spawn(move || {
-            let e_ptr = edges_ptr as *mut Edge;
-            for edge in thread_edges {
-                let idx = unsafe { head_ref.get_unchecked(edge.u as usize).fetch_add(1, Ordering::Relaxed) };
-                unsafe { *e_ptr.add(idx as usize) = Edge { to: edge.v, weight: edge.w }; }
-            }
-        }));
-    }
-    for sh in scatter_handles { sh.join().unwrap(); }
-
-    // Shift head back by 1 to get standard CSR [head[u]..head[u+1]]
-    for j in (0..n as usize).rev() {
-        let val = head_atomic[j].load(Ordering::Relaxed);
-        head_atomic[j + 1].store(val, Ordering::Relaxed);
-    }
-    head_atomic[0].store(0, Ordering::Relaxed);
-
-    // Convert AtomicU32 vector to plain Vec<u32> with zero-cost
-    let head_arc = Arc::try_unwrap(head_atomic).unwrap();
-    let mut head = {
-        let mut md = ManuallyDrop::new(head_arc);
-        unsafe { Vec::from_raw_parts(md.as_mut_ptr() as *mut u32, md.len(), md.capacity()) }
-    };
     head.truncate((n + 1) as usize);
-
-    // Convert AtomicU64 has_in to plain Vec<u64>
-    let has_in_arc = Arc::try_unwrap(has_in_atomic).unwrap();
-    let has_in = {
-        let mut md = ManuallyDrop::new(has_in_arc);
-        unsafe { Vec::from_raw_parts(md.as_mut_ptr() as *mut u64, md.len(), md.capacity()) }
-    };
 
     let q_mmap = match FastMmap::open(&q_path) { Some(m) => m, None => return };
     let (q_data, q_size) = (q_mmap.as_slice(), q_mmap.len);
