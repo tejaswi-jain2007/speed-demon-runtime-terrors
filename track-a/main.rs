@@ -49,15 +49,10 @@ unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
 impl<T> SendPtr<T> { #[inline(always)] fn as_ptr(&self) -> *const T { self.0 } }
 
-struct Entry { len: u32, a: u64, b: u64 }
-
 struct EndpointTable<'a> {
     slots: [u32; TABLE_SLOTS],
-    entries: Vec<Entry>,
     names: Vec<&'a [u8]>,
-    last_len: usize,
-    last_a: u64,
-    last_b: u64,
+    last: &'a [u8],
     last_idx: u32,
 }
 
@@ -65,24 +60,22 @@ impl<'a> EndpointTable<'a> {
     fn new() -> Self {
         Self {
             slots: [0; TABLE_SLOTS],
-            entries: Vec::with_capacity(512),
             names: Vec::with_capacity(512),
-            last_len: 0,
-            last_a: 0,
-            last_b: 0,
+            last: &[],
             last_idx: 0,
         }
     }
 
     #[inline(always)]
     unsafe fn intern(&mut self, s: *const u8, len: usize) -> u32 {
+        let slice = std::slice::from_raw_parts(s, len);
+        if slice == self.last {
+            return self.last_idx;
+        }
+
         let mut a = load8(s);
         let b = if len >= 8 { load8(s.add(len - 8)) } else { 0 };
         if len < 8 { a &= (1u64 << (8 * len)) - 1; }
-
-        if len == self.last_len && a == self.last_a && b == self.last_b {
-            return self.last_idx;
-        }
 
         let h1 = _mm_crc32_u64(len as u64, a);
         let mut i = _mm_crc32_u64(h1, b) as usize;
@@ -90,16 +83,16 @@ impl<'a> EndpointTable<'a> {
             let slot = &mut self.slots[i & (TABLE_SLOTS - 1)];
             if *slot == 0 {
                 let idx = self.names.len() as u32;
-                let slice = std::slice::from_raw_parts(s, len);
                 self.names.push(slice);
-                self.entries.push(Entry { len: len as u32, a, b });
                 *slot = idx + 1;
-                self.last_len = len; self.last_a = a; self.last_b = b; self.last_idx = idx;
+                self.last = slice;
+                self.last_idx = idx;
                 return idx;
             }
-            let e = &self.entries[(*slot - 1) as usize];
-            if e.len as usize == len && e.a == a && e.b == b {
-                self.last_len = len; self.last_a = a; self.last_b = b; self.last_idx = *slot - 1;
+            let n = self.names[(*slot - 1) as usize];
+            if n.len() == len && slice == n {
+                self.last = n;
+                self.last_idx = *slot - 1;
                 return *slot - 1;
             }
             i += 1;
