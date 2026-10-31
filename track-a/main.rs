@@ -168,13 +168,15 @@ fn append_u32(buf: &mut [u8], mut val: u32, mut pos: usize) -> usize {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut data_dir = if PathBuf::from("/data").exists() { PathBuf::from("/data") } else { PathBuf::from("data") };
+    let mut out_dir = if PathBuf::from("/out").exists() { PathBuf::from("/out") } else { PathBuf::from("output") };
     let args: Vec<String> = std::env::args().collect();
-    let mut data_dir = PathBuf::from("data");
-    let mut out_dir = PathBuf::from("output");
     let mut i = 1;
     while i < args.len() {
         if args[i] == "--data" && i + 1 < args.len() { data_dir = PathBuf::from(&args[i + 1]); i += 2; }
         else if args[i] == "--out" && i + 1 < args.len() { out_dir = PathBuf::from(&args[i + 1]); i += 2; }
+        else if i == 1 && !args[i].starts_with('-') { data_dir = PathBuf::from(&args[1]); i += 1; }
+        else if i == 2 && !args[i].starts_with('-') { out_dir = PathBuf::from(&args[2]); i += 1; }
         else { i += 1; }
     }
     if let Ok(e) = std::env::var("DATA_DIR") { if !e.is_empty() { data_dir = PathBuf::from(e); } }
