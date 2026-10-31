@@ -22,7 +22,7 @@ const ERR_BIT: u32 = 1 << 11;
 const BIG: u32 = 1 << 20;
 const NTHREADS: usize = 12;
 const BLOCK_CAP: usize = (16384 - 16) / 4;
-const SLOTS: usize = 8192;
+const TABLE_SLOTS: usize = 4096;
 
 #[inline(always)]
 unsafe fn load8(p: *const u8) -> u64 {
@@ -77,67 +77,40 @@ fn append_u32(buf: &mut [u8], mut val: u32, mut pos: usize) -> usize {
     pos
 }
 
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct Slot {
-    fp: u64,
-    id: u16,
-    len: u16,
-    ptr: *const u8,
-}
-
 struct Table<'a> {
-    slots: [Slot; SLOTS],
+    slots: [u32; TABLE_SLOTS],
     names: Vec<&'a [u8]>,
 }
 
 impl<'a> Table<'a> {
     fn new() -> Self {
         Self {
-            slots: [Slot {
-                fp: 0,
-                id: 0,
-                len: 0,
-                ptr: std::ptr::null(),
-            }; SLOTS],
-            names: Vec::with_capacity(256),
+            slots: [0; TABLE_SLOTS],
+            names: Vec::with_capacity(512),
         }
     }
     #[inline(always)]
     unsafe fn intern(&mut self, s: *const u8, len: usize) -> u32 {
         let mut a = load8(s);
         let b = if len >= 8 { load8(s.add(len - 8)) } else { 0 };
-        let c = if len >= 16 {
-            load8(s.add((len - 8) / 2))
-        } else {
-            0
-        };
         if len < 8 {
             a &= (1u64 << (8 * len)) - 1;
         }
-        let h = _mm_crc32_u64(_mm_crc32_u64(_mm_crc32_u64(len as u64, a), c), b);
-        let fp = h | 1;
-        let mut i = (h as usize) & (SLOTS - 1);
+        let h1 = _mm_crc32_u64(len as u64, a);
+        let mut i = _mm_crc32_u64(h1, b) as usize;
         loop {
-            let slot = self.slots.get_unchecked_mut(i);
-            if slot.fp == 0 {
-                let idx = self.names.len() as u16;
-                *slot = Slot {
-                    fp,
-                    id: idx,
-                    len: len as u16,
-                    ptr: s,
-                };
+            let slot = self.slots.get_unchecked_mut(i & (TABLE_SLOTS - 1));
+            if *slot == 0 {
+                let idx = self.names.len() as u32;
                 self.names.push(std::slice::from_raw_parts(s, len));
-                return idx as u32;
+                *slot = idx + 1;
+                return idx;
             }
-            if slot.fp == fp
-                && slot.len as usize == len
-                && std::slice::from_raw_parts(slot.ptr, len) == std::slice::from_raw_parts(s, len)
-            {
-                return slot.id as u32;
+            let n = self.names[(*slot - 1) as usize];
+            if n.len() == len && std::slice::from_raw_parts(s, len) == n {
+                return *slot - 1;
             }
-            i = (i + 1) & (SLOTS - 1);
+            i += 1;
         }
     }
 }
@@ -322,10 +295,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cuts = &cut;
         for (t, w) in workers.iter_mut().enumerate() {
             s.spawn(move || unsafe {
-                w.parse(
-                    (data_addr + cuts[t]) as *const u8,
-                    (data_addr + cuts[t + 1]) as *const u8,
-                );
+                let from = (data_addr + cuts[t]) as *const u8;
+                let to = (data_addr + cuts[t + 1]) as *const u8;
+                w.parse(from, to);
+                let sf = (from as usize + 4095) & !4095;
+                let ef = (to as usize) & !4095;
+                if ef > sf {
+                    madvise(sf as *mut u8, ef - sf, 4);
+                }
             });
         }
     });
@@ -355,6 +332,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let sorted: Vec<&[u8]> = sorted_with_id.iter().map(|&(_, n)| n).collect();
     let ne = sorted.len();
+    unsafe {
+        madvise(data as *mut u8, size + 4096, 4);
+    }
 
     let next_hour = AtomicUsize::new(0);
     let out_boxes: Vec<SyncBox<Vec<u8>>> = (0..HOURS)
@@ -425,7 +405,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     lat[cursor[e] as usize] = rec >> KEY_BITS;
                                     cursor[e] += 1;
                                 }
-                                b = br.next;
+                                let next_b = br.next;
+                                madvise(b as *mut u8, std::mem::size_of::<Block>(), 4);
+                                b = next_b;
                             }
                         }
                         for &(l, key) in &w.big[h] {
