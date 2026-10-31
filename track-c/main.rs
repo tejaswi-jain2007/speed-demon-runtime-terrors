@@ -103,7 +103,7 @@ struct ThreadPool {
 
 impl ThreadPool {
     fn new() -> Self {
-        ThreadPool { heads: [!0; 242], lens: [B_CAP as u16; 242], blocks: Vec::with_capacity(2600) }
+        ThreadPool { heads: [!0; 242], lens: [B_CAP as u16; 242], blocks: Vec::with_capacity(800) }
     }
     #[inline(always)]
     fn push(&mut self, cid: usize, hash: u32) {
@@ -234,7 +234,7 @@ unsafe fn parse_csv_chunk(
 
         pool.push(cid, name_hash);
 
-        if (p as usize).saturating_sub(last_drop) >= 2 * 1024 * 1024 {
+        if (p as usize).saturating_sub(last_drop) >= 8 * 1024 * 1024 {
             drop_pages(last_drop as *const u8, p as usize - last_drop);
             last_drop = p as usize;
         }
