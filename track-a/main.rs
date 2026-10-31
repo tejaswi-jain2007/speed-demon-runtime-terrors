@@ -13,12 +13,6 @@ extern "C" {
     fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
 }
 
-#[inline(always)]
-unsafe fn libc_exit(code: i32) -> ! {
-    extern "C" { fn _exit(status: i32) -> !; }
-    _exit(code);
-}
-
 const PROT_READ: i32 = 1; const PROT_WRITE: i32 = 2; const MAP_PRIVATE: i32 = 0x02; const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_FIXED: i32 = 0x10; const MAP_FAILED: *mut u8 = !0 as *mut u8; const MADV_DONTNEED: i32 = 4; const MADV_SEQUENTIAL: i32 = 2;
 const HOURS: usize = 72; const KEY_BITS: u32 = 12; const ID_MASK: u32 = (1 << 11) - 1; const ERR_BIT: u32 = 1 << 11;
@@ -108,7 +102,7 @@ impl<'a> Worker<'a> {
         let reserve = 16 * std::mem::size_of::<Block>();
         self.reserved = reserve;
         self.region = mmap(std::ptr::null_mut(), reserve, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if self.region == MAP_FAILED { libc_exit(1); }
+        if self.region == MAP_FAILED { std::process::exit(1); }
 
         let space_vec = _mm256_set1_epi8(b' ' as i8);
         let nl_vec = _mm256_set1_epi8(b'\n' as i8);
@@ -210,7 +204,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fd = file.as_raw_fd();
     let data = unsafe {
         let p = mmap(std::ptr::null_mut(), size + 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if p == MAP_FAILED || mmap(p, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED { libc_exit(1); }
+        if p == MAP_FAILED || mmap(p, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED { std::process::exit(1); }
         madvise(p, size, MADV_SEQUENTIAL);
         p as *const u8
     };
@@ -247,7 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for t in 0..NTHREADS {
         for n in &workers[t].endpoints.names { rank[t].push(unsafe { global.intern(n.as_ptr(), n.len()) }); }
     }
-    let mut sorted_names: Vec<Vec<u8>> = global.names.iter().map(|s| s.to_vec()).collect();
+    let mut sorted_names = global.names.clone();
     sorted_names.sort_unstable();
 
     let mut rank_of = vec![0u32; sorted_names.len()];
@@ -258,8 +252,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for id in r { *id = rank_of[*id as usize]; }
     }
     let num_endpoints = sorted_names.len();
-
-    unsafe { madvise(data as *mut u8, size + 4096, MADV_DONTNEED); }
 
     let next_hour = AtomicUsize::new(0);
 
@@ -371,7 +363,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut pos = 0;
                         line[..20].copy_from_slice(label); pos += 20;
                         line[pos] = b' '; pos += 1;
-                        let ep_name = &names_ref[e];
+                        let ep_name = names_ref[e];
                         line[pos..pos + ep_name.len()].copy_from_slice(ep_name); pos += ep_name.len();
                         line[pos] = b' '; pos += 1; pos = append_u32(&mut line, n as u32, pos);
                         line[pos] = b' '; pos += 1; pos = append_u32(&mut line, p50, pos);
@@ -390,4 +382,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     unsafe { libc_exit(0); }
+}
+
+unsafe fn libc_exit(code: i32) -> ! {
+    extern "C" { fn _exit(status: i32) -> !; }
+    _exit(code);
 }
