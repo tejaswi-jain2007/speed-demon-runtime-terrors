@@ -28,7 +28,7 @@ const ID_MASK: u32 = (1 << 11) - 1;
 const ERR_BIT: u32 = 1 << 11;
 const BIG: u32 = 1 << 20;
 const NTHREADS: usize = 12;
-const BLOCK_CAP: usize = (8192 - 16) / 4;
+const BLOCK_CAP: usize = (16384 - 16) / 4;
 
 #[inline(always)]
 unsafe fn load8(p: *const u8) -> u64 {
@@ -475,9 +475,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     lat[dst] = rec >> KEY_BITS;
                                     cursor[e] += 1;
                                 }
-                                let next_b = b_ref.next;
-                                madvise(b as *mut u8, std::mem::size_of::<Block>(), MADV_DONTNEED);
-                                b = next_b;
+                                b = b_ref.next;
                             }
                         }
                         for &(l, key) in &w.big[h] {
