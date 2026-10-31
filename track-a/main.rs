@@ -33,8 +33,14 @@ unsafe fn find(mut s: *const u8, c: u8) -> *const u8 {
 
 #[inline(always)]
 unsafe fn parse_lat(p: *const u8, len: usize) -> u32 {
-    let mut v = 0u32;
-    for i in 0..len { v = v * 10 + (*p.add(i) - b'0') as u32; }
+    let mut v = (*p - b'0') as u32;
+    if len > 1 { v = v * 10 + (*p.add(1) - b'0') as u32; }
+    if len > 2 { v = v * 10 + (*p.add(2) - b'0') as u32; }
+    if len > 3 { v = v * 10 + (*p.add(3) - b'0') as u32; }
+    if len > 4 { v = v * 10 + (*p.add(4) - b'0') as u32; }
+    if len > 5 {
+        for i in 5..len { v = v * 10 + (*p.add(i) - b'0') as u32; }
+    }
     v
 }
 
@@ -43,28 +49,59 @@ unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
 impl<T> SendPtr<T> { #[inline(always)] fn as_ptr(&self) -> *const T { self.0 } }
 
-struct EndpointTable<'a> { slots: [u32; TABLE_SLOTS], names: Vec<&'a [u8]> }
+struct Entry { len: u32, a: u64, b: u64 }
+
+struct EndpointTable<'a> {
+    slots: [u32; TABLE_SLOTS],
+    entries: Vec<Entry>,
+    names: Vec<&'a [u8]>,
+    last_len: usize,
+    last_a: u64,
+    last_b: u64,
+    last_idx: u32,
+}
 
 impl<'a> EndpointTable<'a> {
-    fn new() -> Self { Self { slots: [0; TABLE_SLOTS], names: Vec::with_capacity(2048) } }
+    fn new() -> Self {
+        Self {
+            slots: [0; TABLE_SLOTS],
+            entries: Vec::with_capacity(512),
+            names: Vec::with_capacity(512),
+            last_len: 0,
+            last_a: 0,
+            last_b: 0,
+            last_idx: 0,
+        }
+    }
 
     #[inline(always)]
     unsafe fn intern(&mut self, s: *const u8, len: usize) -> u32 {
         let mut a = load8(s);
         let b = if len >= 8 { load8(s.add(len - 8)) } else { 0 };
         if len < 8 { a &= (1u64 << (8 * len)) - 1; }
+
+        if len == self.last_len && a == self.last_a && b == self.last_b {
+            return self.last_idx;
+        }
+
         let h1 = _mm_crc32_u64(len as u64, a);
         let mut i = _mm_crc32_u64(h1, b) as usize;
         loop {
             let slot = &mut self.slots[i & (TABLE_SLOTS - 1)];
             if *slot == 0 {
                 let idx = self.names.len() as u32;
-                self.names.push(std::slice::from_raw_parts(s, len));
+                let slice = std::slice::from_raw_parts(s, len);
+                self.names.push(slice);
+                self.entries.push(Entry { len: len as u32, a, b });
                 *slot = idx + 1;
+                self.last_len = len; self.last_a = a; self.last_b = b; self.last_idx = idx;
                 return idx;
             }
-            let n = self.names[(*slot - 1) as usize];
-            if n.len() == len && std::slice::from_raw_parts(s, len) == n { return *slot - 1; }
+            let e = &self.entries[(*slot - 1) as usize];
+            if e.len as usize == len && e.a == a && e.b == b {
+                self.last_len = len; self.last_a = a; self.last_b = b; self.last_idx = *slot - 1;
+                return *slot - 1;
+            }
             i += 1;
         }
     }
@@ -98,8 +135,7 @@ impl<'a> Worker<'a> {
 
     unsafe fn parse(&mut self, mut p: *const u8, end: *const u8) {
         if p >= end { return; }
-        let start_p = p;
-        let reserve = 16 * std::mem::size_of::<Block>();
+        let reserve = 72 * std::mem::size_of::<Block>();
         self.reserved = reserve;
         self.region = mmap(std::ptr::null_mut(), reserve, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if self.region == MAP_FAILED { std::process::exit(1); }
@@ -148,7 +184,7 @@ impl<'a> Worker<'a> {
 
             if curr_block.is_null() || (*curr_block).n as usize == BLOCK_CAP {
                 if self.used + std::mem::size_of::<Block>() > self.reserved {
-                    let extra = 16 * std::mem::size_of::<Block>();
+                    let extra = 64 * std::mem::size_of::<Block>();
                     let p_m = mmap(std::ptr::null_mut(), extra, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
                     if p_m != MAP_FAILED { self.region = p_m; self.used = 0; self.reserved = extra; }
                 }
@@ -163,10 +199,6 @@ impl<'a> Worker<'a> {
             b_ref.rec[b_ref.n as usize] = (lat << KEY_BITS) | key;
             b_ref.n += 1;
         }
-
-        let sf = (start_p as usize + 4095) & !4095;
-        let ef = (end as usize) & !4095;
-        if ef > sf { madvise(sf as *mut u8, ef - sf, MADV_DONTNEED); }
     }
 }
 
@@ -252,6 +284,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for id in r { *id = rank_of[*id as usize]; }
     }
     let num_endpoints = sorted_names.len();
+
+    unsafe { madvise(data as *mut u8, size, MADV_DONTNEED); }
 
     let next_hour = AtomicUsize::new(0);
 
