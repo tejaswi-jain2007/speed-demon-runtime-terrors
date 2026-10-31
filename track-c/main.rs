@@ -1,3 +1,4 @@
+use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
@@ -16,6 +17,23 @@ unsafe fn madvise_dontneed(ptr: *const u8, len: usize) {
     let p = ptr as usize;
     let (s, e) = ((p + 4095) & !4095, (p + len) & !4095);
     if e > s { madvise(s as *mut u8, e - s, 4); }
+}
+
+#[inline(always)]
+unsafe fn find_quote(mut p: *const u8, end_ptr: *const u8) -> *const u8 {
+    let v = _mm256_set1_epi8(b'"' as i8);
+    while p.add(32) <= end_ptr {
+        let chunk = _mm256_loadu_si256(p as *const __m256i);
+        let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v)) as u32;
+        if mask != 0 {
+            return p.add(mask.trailing_zeros() as usize);
+        }
+        p = p.add(32);
+    }
+    while p < end_ptr && *p != b'"' {
+        p = p.add(1);
+    }
+    p
 }
 
 struct FastMmap { ptr: *const u8, len: usize }
@@ -79,7 +97,14 @@ unsafe fn parse_csv_chunk(
 ) {
     let mut p = rec_ptr.add(start);
     let end_ptr = rec_ptr.add(end);
+    let mut last_evict = p as usize;
     while p < end_ptr {
+        if (p as usize) - last_evict >= 1024 * 1024 {
+            let s = (last_evict + 4095) & !4095;
+            let e = (p as usize) & !4095;
+            if e > s { madvise(s as *mut u8, e - s, 4); }
+            last_evict = p as usize;
+        }
         if p.add(3) <= end_ptr && *p == 0xEF && *p.add(1) == 0xBB && *p.add(2) == 0xBF { p = p.add(3); }
         if p >= end_ptr { break; }
 
@@ -91,7 +116,7 @@ unsafe fn parse_csv_chunk(
         if p < end_ptr && *p == b'"' {
             p = p.add(1);
             let start_name = p;
-            while p < end_ptr && *p != b'"' { p = p.add(1); }
+            p = find_quote(p, end_ptr);
             if p.add(1) < end_ptr && *p.add(1) == b'"' {
                 // Escaped quote in name (rare fallback)
                 let mut ptr = start_name;
@@ -107,7 +132,7 @@ unsafe fn parse_csv_chunk(
                     }
                 }
             } else {
-                // Common fast path: unroll name hashing, zero inner branches
+                // Fast AVX2 path: unroll name hashing, zero inner branches
                 name_len = (p as usize - start_name as usize) as u64;
                 let mut ptr = start_name;
                 while ptr < p {
@@ -128,7 +153,7 @@ unsafe fn parse_csv_chunk(
         if p < end_ptr && *p == b'"' {
             p = p.add(1);
             let start_note = p;
-            while p < end_ptr && *p != b'"' { p = p.add(1); }
+            p = find_quote(p, end_ptr);
             if p.add(1) < end_ptr && *p.add(1) == b'"' {
                 // Escaped quote in note (rare fallback)
                 let mut ptr = start_note;
@@ -145,7 +170,7 @@ unsafe fn parse_csv_chunk(
                     } else { ptr = ptr.add(1); }
                 }
             } else {
-                // Common fast path: note has no escaped quotes!
+                // Fast AVX2 path: note has no escaped quotes!
                 note_len = (p as usize - start_note as usize) as u64;
                 if p < end_ptr { p = p.add(1); }
             }
@@ -197,6 +222,9 @@ unsafe fn parse_csv_chunk(
             local_names.push(packed);
         }
     }
+    let s = (last_evict + 4095) & !4095;
+    let e = (end_ptr as usize) & !4095;
+    if e > s { madvise(s as *mut u8, e - s, 4); }
 }
 
 fn main() {
