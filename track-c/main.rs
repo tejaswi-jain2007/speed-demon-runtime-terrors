@@ -74,7 +74,9 @@ impl LocalCountryAgg {
 }
 
 fn parse_csv_chunk(rec_data: &[u8], start: usize, end: usize, rlookup: &[u8], local_aggs: &mut [LocalCountryAgg], local_names: &mut Vec<u64>) {
-    let (mut p, mut filter, mut last_evict) = (start, vec![0u64; 65536], start);
+    let mut filter = [0u64; 16384];
+    let mut p = start;
+    let mut last_evict = start;
     while p < end {
         if p - last_evict >= 2 * 1024 * 1024 {
             unsafe { madvise_dontneed(rec_data.as_ptr().add(last_evict), p - last_evict); }
@@ -102,19 +104,9 @@ fn parse_csv_chunk(rec_data: &[u8], start: usize, end: usize, rlookup: &[u8], lo
                 }
             }
         } else {
-            let nstart = p;
-            while p < end && rec_data[p] != b',' { p += 1; }
-            let name_slice = &rec_data[nstart..p];
-            name_len = name_slice.len() as u64;
-            let mut i = 0;
-            while i + 8 <= name_slice.len() {
-                let chunk = unsafe { std::ptr::read_unaligned(name_slice.as_ptr().add(i) as *const u64) };
-                name_hash = (name_hash ^ chunk).wrapping_mul(1099511628211);
-                i += 8;
-            }
-            while i < name_slice.len() {
-                name_hash = (name_hash ^ (name_slice[i] as u64)).wrapping_mul(1099511628211);
-                i += 1;
+            while p < end && rec_data[p] != b',' && rec_data[p] != b'\r' && rec_data[p] != b'\n' {
+                name_hash = (name_hash ^ (rec_data[p] as u64)).wrapping_mul(1099511628211);
+                name_len += 1; p += 1;
             }
         }
         if p < end && rec_data[p] == b',' { p += 1; }
@@ -129,9 +121,9 @@ fn parse_csv_chunk(rec_data: &[u8], start: usize, end: usize, rlookup: &[u8], lo
                 } else { note_len += 1; p += 1; }
             }
         } else {
-            let ntstart = p;
-            while p < end && rec_data[p] != b',' { p += 1; }
-            note_len = (p - ntstart) as u64;
+            while p < end && rec_data[p] != b',' && rec_data[p] != b'\r' && rec_data[p] != b'\n' {
+                note_len += 1; p += 1;
+            }
         }
         if p < end && rec_data[p] == b',' { p += 1; }
 
@@ -161,7 +153,7 @@ fn parse_csv_chunk(rec_data: &[u8], start: usize, end: usize, rlookup: &[u8], lo
         agg.note_bytes += note_len;
 
         let packed = ((cid as u64) << 48) | (name_hash & 0x0000_FFFF_FFFF_FFFF);
-        let slot = (name_hash as usize) & 0xFFFF;
+        let slot = (name_hash as usize) & 0x3FFF;
         if filter[slot] != packed {
             filter[slot] = packed;
             local_names.push(packed);
@@ -257,7 +249,7 @@ fn main() {
     for t in 0..num_threads {
         let (rec_ref, rlookup_ref, start, end) = (Arc::clone(&rec_mmap), Arc::clone(&rlookup_arc), splits[t], splits[t + 1]);
         handles.push(thread::spawn(move || {
-            let (mut local_aggs, mut local_names) = (vec![LocalCountryAgg::new(); num_countries], Vec::with_capacity(16384));
+            let (mut local_aggs, mut local_names) = (vec![LocalCountryAgg::new(); num_countries], Vec::with_capacity(32768));
             let d = rec_ref.as_slice();
             parse_csv_chunk(d, start, end, &rlookup_ref, &mut local_aggs, &mut local_names);
             unsafe { madvise_dontneed(d.as_ptr().add(start), end - start); }
@@ -266,15 +258,22 @@ fn main() {
     }
 
     let mut thread_results = Vec::with_capacity(num_threads);
-    let mut country_names: Vec<Vec<u64>> = vec![Vec::new(); num_countries];
+    let mut all_names: Vec<u64> = Vec::with_capacity(250_000);
     for h in handles {
         let (aggs, names) = h.join().unwrap();
         thread_results.push(aggs);
-        for packed in names {
-            country_names[(packed >> 48) as usize].push(packed & 0x0000_FFFF_FFFF_FFFF);
-        }
+        all_names.extend_from_slice(&names);
     }
     drop(rec_mmap);
+
+    all_names.sort_unstable();
+    all_names.dedup();
+
+    for &packed in &all_names {
+        let cid = (packed >> 48) as usize;
+        countries[cid].distinct_names += 1;
+    }
+    drop(all_names);
 
     for c in 0..num_countries {
         let dest = &mut countries[c];
@@ -289,26 +288,6 @@ fn main() {
         }
     }
     drop(thread_results);
-
-    let country_names_ptr = country_names.as_mut_ptr() as usize;
-    let mut dedup_handles = Vec::with_capacity(num_threads);
-    let c_per_thread = (num_countries + num_threads - 1) / num_threads;
-    for t in 0..num_threads {
-        let (start_c, end_c) = (t * c_per_thread, (t * c_per_thread + c_per_thread).min(num_countries));
-        dedup_handles.push(thread::spawn(move || {
-            let c_ptr = country_names_ptr as *mut Vec<u64>;
-            let mut counts = Vec::with_capacity(end_c - start_c);
-            for c in start_c..end_c {
-                let list = unsafe { &mut *c_ptr.add(c) };
-                if list.is_empty() { counts.push((c, 0)); }
-                else { list.sort_unstable(); list.dedup(); counts.push((c, list.len())); }
-            }
-            counts
-        }));
-    }
-    for dh in dedup_handles {
-        for (c, distinct) in dh.join().unwrap() { countries[c].distinct_names = distinct; }
-    }
 
     countries.sort_unstable_by(|a, b| a.key.cmp(&b.key));
 
