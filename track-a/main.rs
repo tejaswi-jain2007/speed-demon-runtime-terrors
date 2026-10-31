@@ -175,7 +175,17 @@ impl<'a> Worker<'a> {
             std::process::exit(1);
         }
 
+        let mut last_evict = p as usize;
         while p < end {
+            if (p as usize) - last_evict >= 1024 * 1024 {
+                let s = (last_evict + 4095) & !4095;
+                let e = (p as usize) & !4095;
+                if e > s {
+                    madvise(s as *mut u8, e - s, MADV_DONTNEED);
+                }
+                last_evict = p as usize;
+            }
+
             let day_idx = if *p.add(6) == b'0' {
                 (*p.add(9) - b'0') as i32
             } else {
@@ -229,6 +239,11 @@ impl<'a> Worker<'a> {
             let b_ref = &mut *(*b);
             b_ref.rec[b_ref.n as usize] = (lat << KEY_BITS) | key;
             b_ref.n += 1;
+        }
+        let s = (last_evict + 4095) & !4095;
+        let e = (end as usize) & !4095;
+        if e > s {
+            madvise(s as *mut u8, e - s, MADV_DONTNEED);
         }
     }
 }
@@ -501,9 +516,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     lat[dst] = rec >> KEY_BITS;
                                     cursor[e] += 1;
                                 }
-                                let next_b = b_ref.next;
-                                madvise(b as *mut u8, std::mem::size_of::<Block>(), MADV_DONTNEED);
-                                b = next_b;
+                                b = b_ref.next;
                             }
                         }
                         for &(l, key) in &w.big[h] {
@@ -527,7 +540,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         let slice = &mut lat[start..end];
-                        let (p50, p95, p99) = if n <= 64 {
+                        let (p50, p95, p99) = if n <= 256 {
                             slice.sort_unstable();
                             (
                                 slice[(50 * n + 99) / 100 - 1],

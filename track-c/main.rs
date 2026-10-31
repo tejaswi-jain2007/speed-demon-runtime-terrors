@@ -8,6 +8,7 @@ extern "C" {
     fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
     fn munmap(a: *mut u8, l: usize) -> i32;
     fn madvise(a: *mut u8, l: usize, adv: i32) -> i32;
+    fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
 }
 
 #[inline(always)]
@@ -27,7 +28,7 @@ impl FastMmap {
         if len == 0 { return None; }
         let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0) };
         if ptr == std::ptr::null_mut() || ptr as isize == -1 { return None; }
-        unsafe { madvise(ptr, len, 2); }
+        unsafe { madvise(ptr, len, 1); } // MADV_SEQUENTIAL
         Some(FastMmap { ptr, len })
     }
     #[inline(always)]
@@ -78,7 +79,7 @@ fn parse_csv_chunk(rec_data: &[u8], start: usize, end: usize, rlookup: &[u8], lo
     let mut p = start;
     let mut last_evict = start;
     while p < end {
-        if p - last_evict >= 2 * 1024 * 1024 {
+        if p - last_evict >= 1024 * 1024 {
             unsafe { madvise_dontneed(rec_data.as_ptr().add(last_evict), p - last_evict); }
             last_evict = p;
         }
@@ -163,6 +164,9 @@ fn parse_csv_chunk(rec_data: &[u8], start: usize, end: usize, rlookup: &[u8], lo
 }
 
 fn main() {
+    unsafe {
+        prctl(14, 1, 0, 0, 0); // PR_SET_THP_DISABLE = 14
+    }
     let (mut data_dir, mut out_dir) = (String::from("/data"), String::from("/out"));
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
