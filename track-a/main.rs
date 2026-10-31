@@ -183,19 +183,8 @@ impl<'a> Worker<'a> {
         if (*b).is_null() || (*(*b)).n as usize == BLOCK_CAP {
             if self.used + std::mem::size_of::<Block>() > self.reserved {
                 let extra = 16 * std::mem::size_of::<Block>();
-                let p = mmap(
-                    std::ptr::null_mut(),
-                    extra,
-                    PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS,
-                    -1,
-                    0,
-                );
-                if p != MAP_FAILED {
-                    self.region = p;
-                    self.used = 0;
-                    self.reserved = extra;
-                }
+                let p = mmap(std::ptr::null_mut(), extra, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if p != MAP_FAILED { self.region = p; self.used = 0; self.reserved = extra; }
             }
             let fresh = self.region.add(self.used) as *mut Block;
             self.used += std::mem::size_of::<Block>();
@@ -427,7 +416,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             b_start_ref.wait(); // Wait until Phase 2 starts!
             for h in 0..HOURS {
                 while !done_ref[h].load(Ordering::Acquire) {
-                    std::hint::spin_loop();
+                    std::thread::yield_now();
                 }
                 let buf = unsafe { &mut *text_ref[h].0.get() };
                 out_file.write_all(buf).ok();
@@ -596,10 +585,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         let slice = &mut lat[start..end];
-                        slice.sort_unstable();
-                        let p50 = slice[(50 * n + 99) / 100 - 1];
-                        let p95 = slice[(95 * n + 99) / 100 - 1];
-                        let p99 = slice[(99 * n + 99) / 100 - 1];
+                        let (p50, p95, p99) = if n <= 256 {
+                            slice.sort_unstable();
+                            (slice[(50 * n + 99) / 100 - 1], slice[(95 * n + 99) / 100 - 1], slice[(99 * n + 99) / 100 - 1])
+                        } else {
+                            let (r50, r95, r99) = ((50 * n + 99) / 100 - 1, (95 * n + 99) / 100 - 1, (99 * n + 99) / 100 - 1);
+                            slice.select_nth_unstable(r99);
+                            let p99 = slice[r99];
+                            let p95 = if r95 == r99 { p99 } else { slice[..r99].select_nth_unstable(r95); slice[r95] };
+                            let p50 = if r50 == r95 { p95 } else { slice[..r95].select_nth_unstable(r50); slice[r50] };
+                            (p50, p95, p99)
+                        };
 
                         let err = errors[e];
                         let ppm = ((err as u64) * 1000000 / (n as u64)) as u32;
