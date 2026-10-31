@@ -1,4 +1,4 @@
-// Speed Demon 2026 - Track D (Traverse) - Turbo Packed Bidirectional Dijkstra & 4-ary Heap
+// Speed Demon 2026 - Track D (Traverse) - Turbo Packed Bidirectional Dijkstra & Branchless 4-ary Heap
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
@@ -24,13 +24,13 @@ struct Edge {
     weight: u16,
 }
 
-struct Heap4 {
+struct Heap4Fast {
     data: Vec<u64>,
 }
 
-impl Heap4 {
+impl Heap4Fast {
     fn new() -> Self {
-        Heap4 { data: Vec::with_capacity(4096) }
+        Heap4Fast { data: Vec::with_capacity(4096) }
     }
     #[inline(always)] fn clear(&mut self) { self.data.clear(); }
     #[inline(always)] fn is_empty(&self) -> bool { self.data.is_empty() }
@@ -58,32 +58,38 @@ impl Heap4 {
         let len = self.data.len();
         if len > 0 {
             let mut idx = 0;
+            let full_bound = if len >= 4 { len - 4 } else { 0 };
             loop {
                 let first_child = (idx << 2) + 1;
-                if first_child >= len { break; }
-                let mut best_child = first_child;
-                let mut best_val = unsafe { *self.data.get_unchecked(first_child) };
-
-                let c2 = first_child + 1;
-                if c2 < len {
-                    let v2 = unsafe { *self.data.get_unchecked(c2) };
-                    if v2 < best_val { best_val = v2; best_child = c2; }
+                if first_child <= full_bound {
+                    let v1 = unsafe { *self.data.get_unchecked(first_child) };
+                    let v2 = unsafe { *self.data.get_unchecked(first_child + 1) };
+                    let v3 = unsafe { *self.data.get_unchecked(first_child + 2) };
+                    let v4 = unsafe { *self.data.get_unchecked(first_child + 3) };
+                    let (min12, c12) = if v1 <= v2 { (v1, first_child) } else { (v2, first_child + 1) };
+                    let (min34, c34) = if v3 <= v4 { (v3, first_child + 2) } else { (v4, first_child + 3) };
+                    let (best_val, best_child) = if min12 <= min34 { (min12, c12) } else { (min34, c34) };
+                    if best_val < last {
+                        unsafe { *self.data.get_unchecked_mut(idx) = best_val; }
+                        idx = best_child;
+                    } else { break; }
+                } else if first_child < len {
+                    let mut best_child = first_child;
+                    let mut best_val = unsafe { *self.data.get_unchecked(first_child) };
+                    for offset in 1..4 {
+                        let c = first_child + offset;
+                        if c < len {
+                            let v = unsafe { *self.data.get_unchecked(c) };
+                            if v < best_val { best_val = v; best_child = c; }
+                        }
+                    }
+                    if best_val < last {
+                        unsafe { *self.data.get_unchecked_mut(idx) = best_val; }
+                        idx = best_child;
+                    } else { break; }
+                } else {
+                    break;
                 }
-                let c3 = first_child + 2;
-                if c3 < len {
-                    let v3 = unsafe { *self.data.get_unchecked(c3) };
-                    if v3 < best_val { best_val = v3; best_child = c3; }
-                }
-                let c4 = first_child + 3;
-                if c4 < len {
-                    let v4 = unsafe { *self.data.get_unchecked(c4) };
-                    if v4 < best_val { best_val = v4; best_child = c4; }
-                }
-
-                if best_val < last {
-                    unsafe { *self.data.get_unchecked_mut(idx) = best_val; }
-                    idx = best_child;
-                } else { break; }
             }
             unsafe { *self.data.get_unchecked_mut(idx) = last; }
         }
@@ -282,16 +288,19 @@ fn main() {
     }
     drop(g_file);
 
-    let mut final_head = vec![0u32; (n + 2) as usize];
-    let mut final_rev_head = vec![0u32; (n + 2) as usize];
-    final_head[0] = 0; final_rev_head[0] = 0;
-    for j in 0..n as usize {
-        final_head[j + 1] = head[j].load(Ordering::Relaxed);
-        final_rev_head[j + 1] = rev_head[j].load(Ordering::Relaxed);
+    // Shift in-place to form [0, count(0), count(0)+count(1), ..., total]
+    head[(n + 1) as usize].store(cur_fwd, Ordering::Relaxed);
+    rev_head[(n + 1) as usize].store(cur_rev, Ordering::Relaxed);
+    for j in (1..=n as usize).rev() {
+        head[j].store(head[j - 1].load(Ordering::Relaxed), Ordering::Relaxed);
+        rev_head[j].store(rev_head[j - 1].load(Ordering::Relaxed), Ordering::Relaxed);
     }
-    final_head[(n + 1) as usize] = cur_fwd;
-    final_rev_head[(n + 1) as usize] = cur_rev;
-    drop(head); drop(rev_head);
+    head[0].store(0, Ordering::Relaxed);
+    rev_head[0].store(0, Ordering::Relaxed);
+
+    // Zero-allocation transmute from Vec<AtomicU32> to Vec<u32> (eliminates 14MB duplicate heap allocation)
+    let final_head: Vec<u32> = unsafe { std::mem::transmute(head) };
+    let final_rev_head: Vec<u32> = unsafe { std::mem::transmute(rev_head) };
 
     let q_mmap = match File::open(&queries_path) {
         Ok(f) => {
@@ -326,7 +335,7 @@ fn main() {
         return;
     }
 
-    let num_workers = 10.min(num_queries).max(1);
+    let num_workers = 6.min(num_queries).max(1);
     let head_arc = Arc::new(final_head);
     let rhead_arc = Arc::new(final_rev_head);
     let edges_arc = Arc::new(edges);
@@ -354,8 +363,8 @@ fn main() {
             let out_ptr = answers_ptr as *mut i64;
             let mut dist: Vec<u32> = vec![!0u32; total_nodes];
             let mut touched: Vec<u32> = Vec::with_capacity(4096);
-            let mut pq_fwd = Heap4::new();
-            let mut pq_bwd = Heap4::new();
+            let mut pq_fwd = Heap4Fast::new();
+            let mut pq_bwd = Heap4Fast::new();
 
             loop {
                 let qi = next_q.fetch_add(1, Ordering::Relaxed);
@@ -400,6 +409,11 @@ fn main() {
                             let nd = d + ew;
                             if nd >= best || nd >= 65534 { continue; }
 
+                            if to == t {
+                                if nd < best { best = nd; }
+                                continue;
+                            }
+
                             let to_idx = to as usize;
                             let packed = unsafe { *dist.get_unchecked(to_idx) };
                             let cur_fwd = (packed >> 16) as u16;
@@ -431,6 +445,11 @@ fn main() {
                             if ew >= 65534 { had_large = true; continue; }
                             let nd = d + ew;
                             if nd >= best || nd >= 65534 { continue; }
+
+                            if to == s {
+                                if nd < best { best = nd; }
+                                continue;
+                            }
 
                             let to_idx = to as usize;
                             let packed = unsafe { *dist.get_unchecked(to_idx) };
