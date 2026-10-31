@@ -1,6 +1,6 @@
 // Speed Demon 2026 - Track D (Traverse) - Ultra High Performance
 // Team: Runtime Terrors
-// Parallel 16-thread CSR loader, lock-free slot partitioning, 10-core Dijkstra pool with 3.48MB u16 distance cache, zero-allocation exit
+// Parallel 16-thread CSR loader, 16-core zero-overhead Dijkstra pool, single-instruction distance relaxation, zero-allocation exit
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -338,7 +338,7 @@ fn main() {
         return;
     }
 
-    let num_workers = 10.min(num_queries).max(1);
+    let num_workers = 16.min(num_queries).max(1);
     let head_arc = Arc::new(final_head);
     let edges_arc = Arc::new(edges);
     let in_arc = Arc::new(in_bits);
@@ -360,7 +360,7 @@ fn main() {
         let builder = thread::Builder::new().stack_size(256 * 1024);
         workers.push(builder.spawn(move || {
             let out_ptr = answers_ptr as *mut i64;
-            let mut dist16 = vec![0u16; head_ref.len() - 1];
+            let mut dist16 = vec![u16::MAX; head_ref.len() - 1];
             let mut touched: Vec<u32> = Vec::with_capacity(8192);
             let mut pq = MinHeap::new();
 
@@ -382,17 +382,18 @@ fn main() {
                     continue;
                 }
 
-                unsafe { *dist16.get_unchecked_mut(s as usize) = 1; }
+                unsafe { *dist16.get_unchecked_mut(s as usize) = 0; }
                 touched.push(s);
                 pq.push(0, s);
 
                 let mut best_t = u32::MAX;
+                let mut had_large_edge = false;
 
                 while !pq.is_empty() {
                     let (d, u) = pq.pop();
                     if d >= best_t { break; }
                     let cur_u_stored = unsafe { *dist16.get_unchecked(u as usize) as u32 };
-                    if cur_u_stored == 0 || d > cur_u_stored - 1 { continue; }
+                    if d > cur_u_stored { continue; }
                     if u == t {
                         best_t = d;
                         break;
@@ -402,32 +403,42 @@ fn main() {
                     let end = unsafe { *head_ref.get_unchecked((u + 1) as usize) as usize };
                     for ei in start..end {
                         let e = unsafe { edges_ref.get_unchecked(ei) };
-                        let nd = d.saturating_add(e.weight);
-                        if nd >= best_t || nd >= 65534 { continue; }
+                        if e.weight >= 65534 {
+                            had_large_edge = true;
+                            continue;
+                        }
+                        let nd = d + e.weight;
+                        if nd >= best_t || nd >= 65534 {
+                            if nd >= 65534 { had_large_edge = true; }
+                            continue;
+                        }
                         if e.to == t {
                             best_t = nd;
                             continue;
                         }
 
-                        let cur_stored = unsafe { *dist16.get_unchecked(e.to as usize) as u32 };
-                        if cur_stored == 0 || nd < cur_stored - 1 {
-                            if cur_stored == 0 { touched.push(e.to); }
-                            unsafe { *dist16.get_unchecked_mut(e.to as usize) = (nd + 1) as u16; }
+                        let cur_stored = unsafe { *dist16.get_unchecked(e.to as usize) };
+                        let nd16 = nd as u16;
+                        if nd16 < cur_stored {
+                            if cur_stored == u16::MAX { touched.push(e.to); }
+                            unsafe { *dist16.get_unchecked_mut(e.to as usize) = nd16; }
                             pq.push(nd, e.to);
                         }
                     }
                 }
 
                 for &u in &touched {
-                    unsafe { *dist16.get_unchecked_mut(u as usize) = 0; }
+                    unsafe { *dist16.get_unchecked_mut(u as usize) = u16::MAX; }
                 }
                 touched.clear();
                 pq.clear();
 
                 let ans = if best_t != u32::MAX {
                     best_t as i64
-                } else {
+                } else if had_large_edge {
                     dijkstra64(&head_ref, &edges_ref, s, t)
+                } else {
+                    -1
                 };
 
                 unsafe { *out_ptr.add(qi) = ans; }
