@@ -2,8 +2,6 @@
 // Team: Runtime Terrors
 // 1-Pass Forward Star graph ingestion (0.15s) + 16-bit compact weights + 8-worker fast Dijkstra
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
@@ -174,42 +172,6 @@ fn get_weight(idx: usize, weights: &[u16], overflow: &[(u32, u32)]) -> u32 {
     }
 }
 
-fn dijkstra64(
-    head: &[i32],
-    to: &[u32],
-    weights: &[u16],
-    next_edge: &[i32],
-    overflow: &[(u32, u32)],
-    source: u32,
-    target: u32,
-) -> i64 {
-    let mut distances: HashMap<u32, u64> = HashMap::with_capacity(256);
-    let mut heap: BinaryHeap<Reverse<(u64, u32)>> = BinaryHeap::with_capacity(256);
-    distances.insert(source, 0);
-    heap.push(Reverse((0, source)));
-
-    while let Some(Reverse((distance, node))) = heap.pop() {
-        if node == target {
-            return distance as i64;
-        }
-        if distance > *distances.get(&node).unwrap_or(&u64::MAX) {
-            continue;
-        }
-        let mut e = unsafe { *head.get_unchecked(node as usize) };
-        while e != -1 {
-            let next = unsafe { *to.get_unchecked(e as usize) };
-            let weight = get_weight(e as usize, weights, overflow) as u64;
-            let candidate = distance + weight;
-            if candidate < *distances.get(&next).unwrap_or(&u64::MAX) {
-                distances.insert(next, candidate);
-                heap.push(Reverse((candidate, next)));
-            }
-            e = unsafe { *next_edge.get_unchecked(e as usize) };
-        }
-    }
-    -1
-}
-
 #[inline(always)]
 fn append_i64(output: &mut Vec<u8>, value: i64) {
     if value < 0 {
@@ -358,7 +320,7 @@ fn main() {
         let worker = thread::Builder::new()
             .stack_size(256 * 1024)
             .spawn(move || {
-                let mut dist16 = vec![0u16; head_ref.len()];
+                let mut dist32 = vec![0u32; head_ref.len()];
                 let mut touched = Vec::<u32>::with_capacity(8192);
                 let mut heap = MinHeap::with_capacity(8192);
 
@@ -386,7 +348,7 @@ fn main() {
                         continue;
                     }
 
-                    unsafe { *dist16.get_unchecked_mut(source as usize) = 1; }
+                    unsafe { *dist32.get_unchecked_mut(source as usize) = 1; }
                     touched.push(source);
                     heap.push(0, source);
 
@@ -397,7 +359,7 @@ fn main() {
                         if distance >= best_t {
                             break;
                         }
-                        let cur_node_stored = unsafe { *dist16.get_unchecked(node as usize) as u32 };
+                        let cur_node_stored = unsafe { *dist32.get_unchecked(node as usize) };
                         if cur_node_stored == 0 || distance > cur_node_stored - 1 {
                             continue;
                         }
@@ -411,16 +373,16 @@ fn main() {
                             let next = unsafe { *to_ref.get_unchecked(e as usize) };
                             let weight = get_weight(e as usize, &weights_ref, &overflow_ref);
                             let candidate = distance.saturating_add(weight);
-                            if candidate < best_t && candidate < 65534 {
+                            if candidate < best_t {
                                 if next == target {
                                     best_t = candidate;
                                 } else {
-                                    let cur_stored = unsafe { *dist16.get_unchecked(next as usize) as u32 };
+                                    let cur_stored = unsafe { *dist32.get_unchecked(next as usize) };
                                     if cur_stored == 0 || candidate < cur_stored - 1 {
                                         if cur_stored == 0 {
                                             touched.push(next);
                                         }
-                                        unsafe { *dist16.get_unchecked_mut(next as usize) = (candidate + 1) as u16; }
+                                        unsafe { *dist32.get_unchecked_mut(next as usize) = candidate + 1; }
                                         heap.push(candidate, next);
                                     }
                                 }
@@ -431,7 +393,7 @@ fn main() {
 
                     for &node in &touched {
                         unsafe {
-                            *dist16.get_unchecked_mut(node as usize) = 0;
+                            *dist32.get_unchecked_mut(node as usize) = 0;
                         }
                     }
                     touched.clear();
@@ -440,15 +402,7 @@ fn main() {
                     let result = if best_t != u32::MAX {
                         best_t as i64
                     } else {
-                        dijkstra64(
-                            &head_ref,
-                            &to_ref,
-                            &weights_ref,
-                            &next_edge_ref,
-                            &overflow_ref,
-                            source,
-                            target,
-                        )
+                        -1
                     };
 
                     unsafe {
