@@ -34,6 +34,7 @@ impl Heap4Fast {
     }
     #[inline(always)] fn clear(&mut self) { self.data.clear(); }
     #[inline(always)] fn is_empty(&self) -> bool { self.data.is_empty() }
+    #[inline(always)] fn peek_dist(&self) -> u32 { (unsafe { *self.data.get_unchecked(0) } >> 32) as u32 }
 
     #[inline(always)]
     fn push(&mut self, dist: u32, u: u32) {
@@ -464,76 +465,77 @@ fn main() {
                 let mut had_large = false;
 
                 while !pq_fwd.is_empty() && !pq_bwd.is_empty() {
-                    let (df, uf) = pq_fwd.pop();
-                    let (db, ub) = pq_bwd.pop();
+                    let min_f = pq_fwd.peek_dist();
+                    let min_b = pq_bwd.peek_dist();
+                    if min_f + min_b >= best { break; }
 
-                    if df + db >= best { break; }
+                    if min_f <= min_b {
+                        let (df, uf) = pq_fwd.pop();
+                        let cur_f = (map.get(uf) >> 16) as u16;
+                        if (df as u16) <= cur_f {
+                            let e_start = head_ref[uf as usize] as usize;
+                            let e_end = head_ref[(uf + 1) as usize] as usize;
+                            for ei in e_start..e_end {
+                                let e = unsafe { *edges_ref.get_unchecked(ei) };
+                                let to = e.to;
+                                let ew = e.weight as u32;
+                                if ew == 65535 { had_large = true; }
+                                let nd = df + ew;
+                                if nd >= best || nd >= 65534 { continue; }
 
-                    // Forward expansion
-                    let cur_f = (map.get(uf) >> 16) as u16;
-                    if (df as u16) <= cur_f {
-                        let e_start = head_ref[uf as usize] as usize;
-                        let e_end = head_ref[(uf + 1) as usize] as usize;
-                        for ei in e_start..e_end {
-                            let e = unsafe { *edges_ref.get_unchecked(ei) };
-                            let to = e.to;
-                            let ew = e.weight as u32;
-                            if ew == 65535 { had_large = true; }
-                            let nd = df + ew;
-                            if nd >= best || nd >= 65534 { continue; }
+                                if to == t {
+                                    if nd < best { best = nd; }
+                                    continue;
+                                }
 
-                            if to == t {
-                                if nd < best { best = nd; }
-                                continue;
-                            }
+                                let packed = map.get(to);
+                                let cur_fwd = (packed >> 16) as u16;
+                                let nd16 = nd as u16;
+                                if nd16 < cur_fwd {
+                                    if packed == !0u32 { touched.push(to); }
+                                    map.insert(to, ((nd16 as u32) << 16) | (packed & 0xFFFF));
+                                    pq_fwd.push(nd, to);
 
-                            let packed = map.get(to);
-                            let cur_fwd = (packed >> 16) as u16;
-                            let nd16 = nd as u16;
-                            if nd16 < cur_fwd {
-                                if packed == !0u32 { touched.push(to); }
-                                map.insert(to, ((nd16 as u32) << 16) | (packed & 0xFFFF));
-                                pq_fwd.push(nd, to);
-
-                                let bwd_d = (packed & 0xFFFF) as u16;
-                                if bwd_d != u16::MAX {
-                                    let total = nd + (bwd_d as u32);
-                                    if total < best { best = total; }
+                                    let bwd_d = (packed & 0xFFFF) as u16;
+                                    if bwd_d != u16::MAX {
+                                        let total = nd + (bwd_d as u32);
+                                        if total < best { best = total; }
+                                    }
                                 }
                             }
                         }
-                    }
+                    } else {
+                        let (db, ub) = pq_bwd.pop();
+                        let cur_b = (map.get(ub) & 0xFFFF) as u16;
+                        if (db as u16) <= cur_b {
+                            let re_start = rhead_ref[ub as usize] as usize;
+                            let re_end = rhead_ref[(ub + 1) as usize] as usize;
+                            for ei in re_start..re_end {
+                                let e = unsafe { *redges_ref.get_unchecked(ei) };
+                                let to = e.to;
+                                let ew = e.weight as u32;
+                                if ew == 65535 { had_large = true; }
+                                let nd = db + ew;
+                                if nd >= best || nd >= 65534 { continue; }
 
-                    // Backward expansion
-                    let cur_b = (map.get(ub) & 0xFFFF) as u16;
-                    if (db as u16) <= cur_b {
-                        let re_start = rhead_ref[ub as usize] as usize;
-                        let re_end = rhead_ref[(ub + 1) as usize] as usize;
-                        for ei in re_start..re_end {
-                            let e = unsafe { *redges_ref.get_unchecked(ei) };
-                            let to = e.to;
-                            let ew = e.weight as u32;
-                            if ew == 65535 { had_large = true; }
-                            let nd = db + ew;
-                            if nd >= best || nd >= 65534 { continue; }
+                                if to == s {
+                                    if nd < best { best = nd; }
+                                    continue;
+                                }
 
-                            if to == s {
-                                if nd < best { best = nd; }
-                                continue;
-                            }
+                                let packed = map.get(to);
+                                let cur_bwd = packed as u16;
+                                let nd16 = nd as u16;
+                                if nd16 < cur_bwd {
+                                    if packed == !0u32 { touched.push(to); }
+                                    map.insert(to, (packed & 0xFFFF_0000) | (nd16 as u32));
+                                    pq_bwd.push(nd, to);
 
-                            let packed = map.get(to);
-                            let cur_bwd = packed as u16;
-                            let nd16 = nd as u16;
-                            if nd16 < cur_bwd {
-                                if packed == !0u32 { touched.push(to); }
-                                map.insert(to, (packed & 0xFFFF_0000) | (nd16 as u32));
-                                pq_bwd.push(nd, to);
-
-                                let fwd_d = (packed >> 16) as u16;
-                                if fwd_d != u16::MAX {
-                                    let total = nd + (fwd_d as u32);
-                                    if total < best { best = total; }
+                                    let fwd_d = (packed >> 16) as u16;
+                                    if fwd_d != u16::MAX {
+                                        let total = nd + (fwd_d as u32);
+                                        if total < best { best = total; }
+                                    }
                                 }
                             }
                         }

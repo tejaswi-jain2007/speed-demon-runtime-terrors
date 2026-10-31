@@ -471,9 +471,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     lat[dst] = rec >> KEY_BITS;
                                     cursor[e] += 1;
                                 }
-                                let next_b = b_ref.next;
-                                madvise(b as *mut u8, std::mem::size_of::<Block>(), MADV_DONTNEED);
-                                b = next_b;
+                                b = b_ref.next;
                             }
                         }
                         for &(big_h, l, key) in &w.big {
