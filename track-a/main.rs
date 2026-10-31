@@ -138,6 +138,7 @@ struct Worker<'a> {
     big: Vec<Vec<(u32, u32)>>,
     region: *mut u8,
     used: usize,
+    reserved: usize,
 }
 
 unsafe impl<'a> Send for Worker<'a> {}
@@ -151,6 +152,7 @@ impl<'a> Worker<'a> {
             big: (0..HOURS).map(|_| Vec::new()).collect(),
             region: std::ptr::null_mut(),
             used: 0,
+            reserved: 0,
         }
     }
 
@@ -159,7 +161,8 @@ impl<'a> Worker<'a> {
             return;
         }
         let chunk_bytes = end as usize - p as usize;
-        let reserve = (chunk_bytes / 65 / BLOCK_CAP + 2 + HOURS) * std::mem::size_of::<Block>();
+        let reserve = (chunk_bytes / 72 / BLOCK_CAP + 18) * std::mem::size_of::<Block>();
+        self.reserved = reserve;
         self.region = mmap(
             std::ptr::null_mut(),
             reserve,
@@ -208,6 +211,15 @@ impl<'a> Worker<'a> {
 
             let b = &mut self.head[h];
             if (*b).is_null() || (*(*b)).n as usize == BLOCK_CAP {
+                if self.used + std::mem::size_of::<Block>() > self.reserved {
+                    let extra = 32 * std::mem::size_of::<Block>();
+                    let p = mmap(std::ptr::null_mut(), extra, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                    if p != MAP_FAILED {
+                        self.region = p;
+                        self.used = 0;
+                        self.reserved = extra;
+                    }
+                }
                 let fresh = self.region.add(self.used) as *mut Block;
                 self.used += std::mem::size_of::<Block>();
                 (*fresh).next = *b;
@@ -340,7 +352,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let next_hour = AtomicUsize::new(0);
     let done: Vec<AtomicBool> = (0..HOURS).map(|_| AtomicBool::new(false)).collect();
     let text_boxes: Vec<std::sync::Mutex<Vec<u8>>> =
-        (0..HOURS).map(|_| std::sync::Mutex::new(Vec::with_capacity(131072))).collect();
+        (0..HOURS).map(|_| std::sync::Mutex::new(Vec::new())).collect();
 
     let mut rank = vec![Vec::new(); NTHREADS];
 
@@ -404,8 +416,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 while !done_ref[h].load(Ordering::Acquire) {
                     std::hint::spin_loop();
                 }
-                let buf = text_ref[h].lock().unwrap();
+                let mut buf = text_ref[h].lock().unwrap();
                 out_file.write_all(&buf).ok();
+                *buf = Vec::new();
             }
             out_file.flush().ok();
         });
@@ -514,7 +527,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         let slice = &mut lat[start..end];
-                        let (p50, p95, p99) = if n <= 256 {
+                        let (p50, p95, p99) = if n <= 64 {
                             slice.sort_unstable();
                             (
                                 slice[(50 * n + 99) / 100 - 1],
