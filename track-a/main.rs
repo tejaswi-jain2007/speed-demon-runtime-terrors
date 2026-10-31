@@ -1,12 +1,11 @@
-// Speed Demon 2026 - Track A (Ingest) - Runtime Terrors
+// Speed Demon 2026 - Track A (Ingest) - Ultra High-Speed Runtime Terrors
 use std::arch::x86_64::*;
 use std::cell::UnsafeCell;
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Barrier;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
 extern "C" {
@@ -26,21 +25,29 @@ const BLOCK_CAP: usize = (16384 - 16) / 4;
 const SLOTS: usize = 8192;
 
 #[inline(always)]
-unsafe fn load8(p: *const u8) -> u64 { (p as *const u64).read_unaligned() }
+unsafe fn load8(p: *const u8) -> u64 {
+    (p as *const u64).read_unaligned()
+}
 
 #[inline(always)]
 unsafe fn find(mut s: *const u8, c: u8) -> *const u8 {
     let t = _mm256_set1_epi8(c as i8);
     loop {
-        let m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(s as *const _), t)) as u32;
-        if m != 0 { return s.add(m.trailing_zeros() as usize); }
+        let m =
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(s as *const _), t)) as u32;
+        if m != 0 {
+            return s.add(m.trailing_zeros() as usize);
+        }
         s = s.add(32);
     }
 }
 
 #[inline(always)]
 unsafe fn parse_digits(end: *const u8, len: u32) -> u32 {
-    let v = _mm_subs_epu8(_mm_loadu_si128(end.sub(16) as *const __m128i), _mm_set1_epi8(b'0' as i8));
+    let v = _mm_subs_epu8(
+        _mm_loadu_si128(end.sub(16) as *const __m128i),
+        _mm_set1_epi8(b'0' as i8),
+    );
     let lane = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
     let v = _mm_and_si128(v, _mm_cmpgt_epi8(lane, _mm_set1_epi8((15 - len) as i8)));
     let v = _mm_maddubs_epi16(v, _mm_set1_epi16(0x010A));
@@ -54,28 +61,62 @@ unsafe fn parse_digits(end: *const u8, len: u32) -> u32 {
 
 #[inline(always)]
 fn append_u32(buf: &mut [u8], mut val: u32, mut pos: usize) -> usize {
-    if val == 0 { buf[pos] = b'0'; return pos + 1; }
-    let mut temp = [0u8; 10]; let mut len = 0;
-    while val > 0 { temp[len] = b'0' + (val % 10) as u8; val /= 10; len += 1; }
-    while len > 0 { len -= 1; buf[pos] = temp[len]; pos += 1; }
+    if val == 0 {
+        buf[pos] = b'0';
+        return pos + 1;
+    }
+    let mut temp = [0u8; 10];
+    let mut len = 0;
+    while val > 0 {
+        temp[len] = b'0' + (val % 10) as u8;
+        val /= 10;
+        len += 1;
+    }
+    while len > 0 {
+        len -= 1;
+        buf[pos] = temp[len];
+        pos += 1;
+    }
     pos
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)]
-struct Slot { fp: u64, id: u16, len: u16, ptr: *const u8 }
+struct Slot {
+    fp: u64,
+    id: u16,
+    len: u16,
+    ptr: *const u8,
+}
 
-struct Table<'a> { slots: [Slot; SLOTS], names: Vec<&'a [u8]> }
+struct Table<'a> {
+    slots: [Slot; SLOTS],
+    names: Vec<&'a [u8]>,
+}
 impl<'a> Table<'a> {
     fn new() -> Self {
-        Self { slots: [Slot { fp: 0, id: 0, len: 0, ptr: std::ptr::null() }; SLOTS], names: Vec::with_capacity(256) }
+        Self {
+            slots: [Slot {
+                fp: 0,
+                id: 0,
+                len: 0,
+                ptr: std::ptr::null(),
+            }; SLOTS],
+            names: Vec::with_capacity(256),
+        }
     }
     #[inline(always)]
     unsafe fn intern(&mut self, s: *const u8, len: usize) -> u32 {
         let mut a = load8(s);
         let b = if len >= 8 { load8(s.add(len - 8)) } else { 0 };
-        let c = if len >= 16 { load8(s.add((len - 8) / 2)) } else { 0 };
-        if len < 8 { a &= (1u64 << (8 * len)) - 1; }
+        let c = if len >= 16 {
+            load8(s.add((len - 8) / 2))
+        } else {
+            0
+        };
+        if len < 8 {
+            a &= (1u64 << (8 * len)) - 1;
+        }
         let h = _mm_crc32_u64(_mm_crc32_u64(_mm_crc32_u64(len as u64, a), c), b);
         let fp = h | 1;
         let mut i = (h as usize) & (SLOTS - 1);
@@ -83,11 +124,19 @@ impl<'a> Table<'a> {
             let slot = self.slots.get_unchecked_mut(i);
             if slot.fp == 0 {
                 let idx = self.names.len() as u16;
-                *slot = Slot { fp, id: idx, len: len as u16, ptr: s };
+                *slot = Slot {
+                    fp,
+                    id: idx,
+                    len: len as u16,
+                    ptr: s,
+                };
                 self.names.push(std::slice::from_raw_parts(s, len));
                 return idx as u32;
             }
-            if slot.fp == fp && slot.len as usize == len && std::slice::from_raw_parts(slot.ptr, len) == std::slice::from_raw_parts(s, len) {
+            if slot.fp == fp
+                && slot.len as usize == len
+                && std::slice::from_raw_parts(slot.ptr, len) == std::slice::from_raw_parts(s, len)
+            {
                 return slot.id as u32;
             }
             i = (i + 1) & (SLOTS - 1);
@@ -96,7 +145,11 @@ impl<'a> Table<'a> {
 }
 
 #[repr(C)]
-struct Block { next: *mut Block, n: u32, rec: [u32; BLOCK_CAP] }
+struct Block {
+    next: *mut Block,
+    n: u32,
+    rec: [u32; BLOCK_CAP],
+}
 
 struct Worker<'a> {
     ep: Table<'a>,
@@ -111,23 +164,37 @@ unsafe impl<'a> Sync for Worker<'a> {}
 
 impl<'a> Worker<'a> {
     fn new() -> Self {
-        Self { ep: Table::new(), head: [std::ptr::null_mut(); HOURS], big: (0..HOURS).map(|_| Vec::new()).collect(), arena: std::ptr::null_mut(), used: 0, cap: 0 }
+        Self {
+            ep: Table::new(),
+            head: [std::ptr::null_mut(); HOURS],
+            big: (0..HOURS).map(|_| Vec::new()).collect(),
+            arena: std::ptr::null_mut(),
+            used: 0,
+            cap: 0,
+        }
     }
     #[inline(always)]
     unsafe fn alloc_block(&mut self) -> *mut Block {
         if self.used + std::mem::size_of::<Block>() > self.cap {
             let chunk = 256 * 1024;
             let p = mmap(std::ptr::null_mut(), chunk, 3, 0x22, -1, 0);
-            if p == !0 as *mut u8 { _exit(1); }
-            self.arena = p; self.used = 0; self.cap = chunk;
+            if p == !0 as *mut u8 {
+                _exit(1);
+            }
+            self.arena = p;
+            self.used = 0;
+            self.cap = chunk;
         }
         let b = self.arena.add(self.used) as *mut Block;
         self.used += std::mem::size_of::<Block>();
-        (*b).next = std::ptr::null_mut(); (*b).n = 0;
+        (*b).next = std::ptr::null_mut();
+        (*b).n = 0;
         b
     }
     unsafe fn parse(&mut self, mut p: *const u8, end: *const u8) {
-        if p >= end { return; }
+        if p >= end {
+            return;
+        }
         let (space_vec, nl_vec) = (_mm256_set1_epi8(b' ' as i8), _mm256_set1_epi8(b'\n' as i8));
         let mut cur_b: [*mut Block; HOURS] = [std::ptr::null_mut(); HOURS];
         while p < end {
@@ -140,23 +207,35 @@ impl<'a> Worker<'a> {
             let sp1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, space_vec)) as u32;
             let nl0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, nl_vec)) as u32;
             let nl1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, nl_vec)) as u32;
-            let (sp, nl) = ((sp0 as u64) | ((sp1 as u64) << 32), (nl0 as u64) | ((nl1 as u64) << 32));
+            let (sp, nl) = (
+                (sp0 as u64) | ((sp1 as u64) << 32),
+                (nl0 as u64) | ((nl1 as u64) << 32),
+            );
             let ep = m.add(sp.trailing_zeros() as usize + 1);
             let (ee, eol) = if nl != 0 {
-                (m.add((sp & (sp - 1)).trailing_zeros() as usize), m.add(nl.trailing_zeros() as usize))
+                (
+                    m.add((sp & (sp - 1)).trailing_zeros() as usize),
+                    m.add(nl.trailing_zeros() as usize),
+                )
             } else {
-                let ee = find(ep, b' '); (ee, find(ee.add(5), b'\n'))
+                let ee = find(ep, b' ');
+                (ee, find(ee.add(5), b'\n'))
             };
             let is_err = ((*ee.add(1) == b'5') as u32) << 11;
             let key = self.ep.intern(ep, ee as usize - ep as usize) | is_err;
             let lat = parse_digits(eol, (eol as usize - ee as usize - 5) as u32);
             p = eol.add(1);
-            if lat >= BIG { self.big[h].push((lat, key)); continue; }
+            if lat >= BIG {
+                self.big[h].push((lat, key));
+                continue;
+            }
             let mut b = cur_b[h];
             if b.is_null() || (*b).n as usize == BLOCK_CAP {
                 let fresh = self.alloc_block();
                 (*fresh).next = self.head[h];
-                self.head[h] = fresh; cur_b[h] = fresh; b = fresh;
+                self.head[h] = fresh;
+                cur_b[h] = fresh;
+                b = fresh;
             }
             let br = &mut *b;
             br.rec[br.n as usize] = (lat << KEY_BITS) | key;
@@ -165,39 +244,95 @@ impl<'a> Worker<'a> {
     }
 }
 
+struct SpinBarrier {
+    count: AtomicUsize,
+    epoch: AtomicUsize,
+}
+impl SpinBarrier {
+    fn new() -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+            epoch: AtomicUsize::new(0),
+        }
+    }
+    #[inline(always)]
+    fn wait(&self) {
+        let cur = self.epoch.load(Ordering::Acquire);
+        if self.count.fetch_add(1, Ordering::AcqRel) + 1 == NTHREADS {
+            self.count.store(0, Ordering::Release);
+            self.epoch.fetch_add(1, Ordering::Release);
+        } else {
+            while self.epoch.load(Ordering::Acquire) == cur {
+                std::hint::spin_loop();
+            }
+        }
+    }
+}
+
 struct Shared<'a> {
     workers: UnsafeCell<[Worker<'a>; NTHREADS]>,
-    bar: Barrier,
+    bar1: SpinBarrier,
+    bar2: SpinBarrier,
     global_names: UnsafeCell<Vec<&'a [u8]>>,
     rank: UnsafeCell<[Vec<u32>; NTHREADS]>,
     next_h: AtomicUsize,
     out_bufs: UnsafeCell<[Vec<u8>; HOURS]>,
+    hour_done: [AtomicBool; HOURS],
     ne: AtomicUsize,
 }
 unsafe impl<'a> Sync for Shared<'a> {}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    unsafe { prctl(14, 1, 0, 0, 0); }
+    unsafe {
+        prctl(14, 1, 0, 0, 0);
+    }
     let (mut d_dir, mut o_dir) = (PathBuf::from("/data"), PathBuf::from("/out"));
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--data" { if let Some(v) = args.next() { d_dir = PathBuf::from(v); } }
-        else if arg == "--out" { if let Some(v) = args.next() { o_dir = PathBuf::from(v); } }
+        if arg == "--data" {
+            if let Some(v) = args.next() {
+                d_dir = PathBuf::from(v);
+            }
+        } else if arg == "--out" {
+            if let Some(v) = args.next() {
+                o_dir = PathBuf::from(v);
+            }
+        }
     }
-    if let Ok(e) = std::env::var("DATA_DIR") { if !e.is_empty() { d_dir = PathBuf::from(e); } }
-    if let Ok(e) = std::env::var("OUT_DIR") { if !e.is_empty() { o_dir = PathBuf::from(e); } }
+    if let Ok(e) = std::env::var("DATA_DIR") {
+        if !e.is_empty() {
+            d_dir = PathBuf::from(e);
+        }
+    }
+    if let Ok(e) = std::env::var("OUT_DIR") {
+        if !e.is_empty() {
+            o_dir = PathBuf::from(e);
+        }
+    }
     std::fs::create_dir_all(&o_dir).ok();
 
-    let in_p = if d_dir.is_file() { d_dir } else { d_dir.join("requests.log") };
+    let in_p = if d_dir.is_file() {
+        d_dir
+    } else {
+        d_dir.join("requests.log")
+    };
     let out_p = o_dir.join("summary.txt");
-    if !in_p.exists() { File::create(&out_p)?; return Ok(()); }
+    if !in_p.exists() {
+        File::create(&out_p)?;
+        return Ok(());
+    }
     let file = File::open(&in_p)?;
     let size = file.metadata()?.len() as usize;
-    if size == 0 { File::create(&out_p)?; return Ok(()); }
+    if size == 0 {
+        File::create(&out_p)?;
+        return Ok(());
+    }
 
     let data = unsafe {
         let p = mmap(std::ptr::null_mut(), size + 4096, 1, 2, file.as_raw_fd(), 0);
-        if p == !0 as *mut u8 { _exit(1); }
+        if p == !0 as *mut u8 {
+            _exit(1);
+        }
         madvise(p, size, 2);
         p as *const u8
     };
@@ -205,68 +340,116 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut labels = [[0u8; 20]; HOURS];
     for h in 0..HOURS {
         let day = (h + 18) / 24;
-        let (m, d) = if day < 2 { (10, 30 + day) } else { (11, day - 1) };
-        labels[h].copy_from_slice(format!("2026-{m:02}-{d:02}T{:02}:00:00Z", (h + 18) % 24).as_bytes());
+        let (m, d) = if day < 2 {
+            (10, 30 + day)
+        } else {
+            (11, day - 1)
+        };
+        labels[h]
+            .copy_from_slice(format!("2026-{m:02}-{d:02}T{:02}:00:00Z", (h + 18) % 24).as_bytes());
     }
 
-    let mut cut = vec![size; NTHREADS + 1]; cut[0] = 0;
+    let mut cut = vec![size; NTHREADS + 1];
+    cut[0] = 0;
     for t in 1..NTHREADS {
         let mut c = cut[t - 1].max(size * t / NTHREADS);
-        while c < size && unsafe { *data.add(c - 1) } != b'\n' { c += 1; }
+        while c < size && unsafe { *data.add(c - 1) } != b'\n' {
+            c += 1;
+        }
         cut[t] = c;
     }
 
     let shared = Shared {
         workers: UnsafeCell::new(std::array::from_fn(|_| Worker::new())),
-        bar: Barrier::new(NTHREADS),
+        bar1: SpinBarrier::new(),
+        bar2: SpinBarrier::new(),
         global_names: UnsafeCell::new(Vec::new()),
         rank: UnsafeCell::new(std::array::from_fn(|_| Vec::new())),
         next_h: AtomicUsize::new(0),
         out_bufs: UnsafeCell::new(std::array::from_fn(|_| Vec::new())),
+        hour_done: std::array::from_fn(|_| AtomicBool::new(false)),
         ne: AtomicUsize::new(0),
     };
 
     let data_addr = data as usize;
 
     thread::scope(|s| {
+        // Parallel writer thread streaming completed hours
+        let (sh_w, out_path) = (&shared, out_p.clone());
+        s.spawn(move || {
+            let mut writer = match File::create(&out_path) {
+                Ok(f) => std::io::BufWriter::with_capacity(256 * 1024, f),
+                Err(_) => return,
+            };
+            for h in 0..HOURS {
+                while !sh_w.hour_done[h].load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                let buf = unsafe { &(*sh_w.out_bufs.get())[h] };
+                writer.write_all(buf).ok();
+            }
+            writer.flush().ok();
+            unsafe {
+                _exit(0);
+            }
+        });
+
         for t in 0..NTHREADS {
             let (sh, lbls, cuts) = (&shared, &labels, &cut);
             s.spawn(move || unsafe {
                 let w = &mut (*sh.workers.get())[t];
-                w.parse((data_addr + cuts[t]) as *const u8, (data_addr + cuts[t + 1]) as *const u8);
+                w.parse(
+                    (data_addr + cuts[t]) as *const u8,
+                    (data_addr + cuts[t + 1]) as *const u8,
+                );
 
-                sh.bar.wait();
+                sh.bar1.wait();
 
                 if t == 0 {
                     let mut global = Table::new();
                     let (workers, rank) = (&*sh.workers.get(), &mut *sh.rank.get());
                     for wt in 0..NTHREADS {
-                        for n in &workers[wt].ep.names { rank[wt].push(global.intern(n.as_ptr(), n.len())); }
+                        for n in &workers[wt].ep.names {
+                            rank[wt].push(global.intern(n.as_ptr(), n.len()));
+                        }
                     }
                     let mut sorted = global.names.clone();
                     sorted.sort_unstable();
                     let mut rank_of = vec![0u32; sorted.len()];
-                    for (i, n) in sorted.iter().enumerate() { rank_of[global.intern(n.as_ptr(), n.len()) as usize] = i as u32; }
+                    for (i, n) in sorted.iter().enumerate() {
+                        rank_of[global.intern(n.as_ptr(), n.len()) as usize] = i as u32;
+                    }
                     for wt in 0..NTHREADS {
-                        for id in &mut rank[wt] { *id = rank_of[*id as usize]; }
+                        for id in &mut rank[wt] {
+                            *id = rank_of[*id as usize];
+                        }
                     }
                     sh.ne.store(sorted.len(), Ordering::Relaxed);
                     *sh.global_names.get() = sorted;
                     madvise(data_addr as *mut u8, size + 4096, 4);
                 }
 
-                sh.bar.wait();
+                sh.bar2.wait();
 
-                let (ne, wrk, rk, names) = (sh.ne.load(Ordering::Relaxed), &*sh.workers.get(), &*sh.rank.get(), &*sh.global_names.get());
-                let (mut count, mut errors, mut cursor) = (vec![0u32; ne + 1], vec![0u32; ne], vec![0u32; ne]);
+                let (ne, wrk, rk, names) = (
+                    sh.ne.load(Ordering::Relaxed),
+                    &*sh.workers.get(),
+                    &*sh.rank.get(),
+                    &*sh.global_names.get(),
+                );
+                let (mut count, mut errors, mut cursor) =
+                    (vec![0u32; ne + 1], vec![0u32; ne], vec![0u32; ne]);
                 let mut lat: Vec<u32> = Vec::new();
                 let mut line = [0u8; 512];
 
                 loop {
                     let h = sh.next_h.fetch_add(1, Ordering::Relaxed);
-                    if h >= HOURS { break; }
+                    if h >= HOURS {
+                        break;
+                    }
 
-                    count.fill(0); errors.fill(0);
+                    count.fill(0);
+                    errors.fill(0);
                     for wt in 0..NTHREADS {
                         let (w, r) = (&wrk[wt], &rk[wt]);
                         let mut b = w.head[h];
@@ -287,10 +470,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    for e in 0..ne { count[e + 1] += count[e]; }
+                    for e in 0..ne {
+                        count[e + 1] += count[e];
+                    }
                     cursor.copy_from_slice(&count[..ne]);
                     let total_lat = count[ne] as usize;
-                    lat.clear(); lat.reserve(total_lat);
+                    lat.clear();
+                    lat.reserve(total_lat);
                     lat.set_len(total_lat);
 
                     for wt in 0..NTHREADS {
@@ -304,9 +490,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 lat[cursor[e] as usize] = rec >> KEY_BITS;
                                 cursor[e] += 1;
                             }
-                            let next_b = br.next;
-                            madvise(b as *mut u8, std::mem::size_of::<Block>(), 4);
-                            b = next_b;
+                            b = br.next;
                         }
                         for &(l, key) in &w.big[h] {
                             let e = r[(key & ID_MASK) as usize] as usize;
@@ -321,41 +505,76 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for e in 0..ne {
                         let (start, end) = (count[e] as usize, count[e + 1] as usize);
                         let n = end - start;
-                        if n == 0 { continue; }
+                        if n == 0 {
+                            continue;
+                        }
                         let slice = &mut lat[start..end];
                         let (p50, p95, p99) = if n <= 2 {
-                            if n == 1 { (slice[0], slice[0], slice[0]) }
-                            else { (slice[0].min(slice[1]), slice[0].max(slice[1]), slice[0].max(slice[1])) }
+                            if n == 1 {
+                                (slice[0], slice[0], slice[0])
+                            } else {
+                                (
+                                    slice[0].min(slice[1]),
+                                    slice[0].max(slice[1]),
+                                    slice[0].max(slice[1]),
+                                )
+                            }
                         } else if n <= 256 {
                             slice.sort_unstable();
-                            (slice[(50 * n + 99) / 100 - 1], slice[(95 * n + 99) / 100 - 1], slice[(99 * n + 99) / 100 - 1])
+                            (
+                                slice[(50 * n + 99) / 100 - 1],
+                                slice[(95 * n + 99) / 100 - 1],
+                                slice[(99 * n + 99) / 100 - 1],
+                            )
                         } else {
-                            let (r99, r95, r50) = ((99 * n + 99) / 100 - 1, (95 * n + 99) / 100 - 1, (50 * n + 99) / 100 - 1);
+                            let (r99, r95, r50) = (
+                                (99 * n + 99) / 100 - 1,
+                                (95 * n + 99) / 100 - 1,
+                                (50 * n + 99) / 100 - 1,
+                            );
                             slice.select_nth_unstable(r99);
                             let p99 = slice[r99];
-                            let p95 = if r95 == r99 { p99 } else { slice[..r99].select_nth_unstable(r95); slice[r95] };
-                            let p50 = if r50 == r95 { p95 } else { slice[..r95].select_nth_unstable(r50); slice[r50] };
+                            let p95 = if r95 == r99 {
+                                p99
+                            } else {
+                                slice[..r99].select_nth_unstable(r95);
+                                slice[r95]
+                            };
+                            let p50 = if r50 == r95 {
+                                p95
+                            } else {
+                                slice[..r95].select_nth_unstable(r50);
+                                slice[r50]
+                            };
                             (p50, p95, p99)
                         };
 
                         let (err, mut pos) = (errors[e], 0);
                         let ppm = ((err as u64) * 1_000_000 / (n as u64)) as u32;
-                        line[..20].copy_from_slice(label); pos += 20;
-                        line[pos] = b' '; pos += 1;
+                        line[..20].copy_from_slice(label);
+                        pos += 20;
+                        line[pos] = b' ';
+                        pos += 1;
                         let ep_name = names[e];
-                        line[pos..pos + ep_name.len()].copy_from_slice(ep_name); pos += ep_name.len();
-                        for v in [n as u32, p50, p95, p99, err, ppm] { line[pos] = b' '; pos += 1; pos = append_u32(&mut line, v, pos); }
-                        line[pos] = b'\n'; pos += 1;
+                        line[pos..pos + ep_name.len()].copy_from_slice(ep_name);
+                        pos += ep_name.len();
+                        for v in [n as u32, p50, p95, p99, err, ppm] {
+                            line[pos] = b' ';
+                            pos += 1;
+                            pos = append_u32(&mut line, v, pos);
+                        }
+                        line[pos] = b'\n';
+                        pos += 1;
                         out_buf.extend_from_slice(&line[..pos]);
                     }
+
+                    sh.hour_done[h].store(true, Ordering::Release);
                 }
             });
         }
     });
 
-    let out_bufs = unsafe { &*shared.out_bufs.get() };
-    let mut writer = std::io::BufWriter::with_capacity(512 * 1024, File::create(&out_p)?);
-    for h in 0..HOURS { writer.write_all(&out_bufs[h]).ok(); }
-    writer.flush().ok();
-    unsafe { _exit(0); }
+    unsafe {
+        _exit(0);
+    }
 }
