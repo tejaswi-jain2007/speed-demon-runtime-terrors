@@ -1,6 +1,6 @@
 // Speed Demon 2026 - Track D (Traverse)
 // Team: Runtime Terrors
-// High-efficiency Dijkstra solver: 3.48MB u16 distance cache, inlined raw-pointer CSR parser, 8 P-core workers, and 64-bit fallback
+// High-efficiency Dial's Algorithm solver (O(1) bucket queue for W < 4096), 8 workers, u16 dist array, 64-bit fallback
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -70,70 +70,6 @@ struct Edge {
     weight: u32,
 }
 
-struct MinHeap {
-    data: Vec<u64>,
-}
-
-impl MinHeap {
-    fn new() -> Self {
-        MinHeap { data: Vec::with_capacity(8192) }
-    }
-
-    #[inline(always)]
-    fn clear(&mut self) {
-        self.data.clear();
-    }
-
-    #[inline(always)]
-    fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-
-    #[inline(always)]
-    fn push(&mut self, dist: u32, u: u32) {
-        let val = ((dist as u64) << 32) | (u as u64);
-        let mut idx = self.data.len();
-        self.data.push(0);
-        while idx > 0 {
-            let parent = (idx - 1) >> 1;
-            let p_val = unsafe { *self.data.get_unchecked(parent) };
-            if val < p_val {
-                unsafe { *self.data.get_unchecked_mut(idx) = p_val; }
-                idx = parent;
-            } else {
-                break;
-            }
-        }
-        unsafe { *self.data.get_unchecked_mut(idx) = val; }
-    }
-
-    #[inline(always)]
-    fn pop(&mut self) -> (u32, u32) {
-        let min = unsafe { *self.data.get_unchecked(0) };
-        let last = self.data.pop().unwrap();
-        if !self.data.is_empty() {
-            let mut idx = 0;
-            let len = self.data.len();
-            while (idx << 1) + 1 < len {
-                let mut child = (idx << 1) + 1;
-                let right = child + 1;
-                if right < len && unsafe { *self.data.get_unchecked(right) < *self.data.get_unchecked(child) } {
-                    child = right;
-                }
-                if unsafe { *self.data.get_unchecked(child) < last } {
-                    unsafe { *self.data.get_unchecked_mut(idx) = *self.data.get_unchecked(child); }
-                    idx = child;
-                } else {
-                    break;
-                }
-            }
-            unsafe { *self.data.get_unchecked_mut(idx) = last; }
-        }
-        ((min >> 32) as u32, min as u32)
-    }
-}
-
-// Exact 64-bit fallback for the ~2 injected large-weight queries
 fn dijkstra64(head: &[u32], edges: &[Edge], s: u32, t: u32) -> i64 {
     let mut d64: HashMap<u32, u64> = HashMap::with_capacity(256);
     let mut pq: BinaryHeap<Reverse<(u64, u32)>> = BinaryHeap::with_capacity(256);
@@ -145,7 +81,7 @@ fn dijkstra64(head: &[u32], edges: &[Edge], s: u32, t: u32) -> i64 {
         let start = head[u as usize] as usize;
         let end = head[(u + 1) as usize] as usize;
         for ei in start..end {
-            let e = unsafe { edges.get_unchecked(ei) };
+            let e = edges[ei];
             let nd = d.saturating_add(e.weight as u64);
             let cur = *d64.get(&e.to).unwrap_or(&u64::MAX);
             if nd < cur {
@@ -169,6 +105,9 @@ fn parse_u32_from_slice(d: &[u8], mut p: usize, end: usize, val: &mut u32) -> us
     p
 }
 
+const BUCKET_COUNT: usize = 8192;
+const BUCKET_MASK: usize = BUCKET_COUNT - 1;
+
 fn main() {
     let mut data_dir = String::from("/data");
     let mut out_dir = String::from("/out");
@@ -191,7 +130,6 @@ fn main() {
     let queries_path = format!("{}/queries.txt", data_dir);
     let out_path = format!("{}/distances.txt", out_dir);
 
-    // 1. Read graph.txt
     let g_mmap = match FastMmap::open(&graph_path) {
         Some(m) => m,
         None => return,
@@ -210,7 +148,7 @@ fn main() {
     let mut has_in_edges = vec![0u64; num_words];
     let mut head = vec![0u32; (n + 2) as usize];
 
-    // Pass 1: count out-degrees and mark in-edges (skip weights!)
+    // Pass 1: count out-degrees and mark in-edges
     unsafe {
         let mut p = g_data.as_ptr().add(edges_start);
         for _ in 0..m {
@@ -255,11 +193,9 @@ fn main() {
         }
     }
 
-    // Discard graph.txt memory immediately
     unsafe { discard_file_pages(g_data.as_ptr(), g_size); }
     drop(g_mmap);
 
-    // Restore head offsets
     for j in (0..n as usize).rev() {
         head[j + 1] = head[j];
     }
@@ -314,10 +250,10 @@ fn main() {
         let builder = thread::Builder::new().stack_size(256 * 1024);
         workers.push(builder.spawn(move || {
             let out_ptr = answers_ptr as *mut i64;
-            // 16-bit distance array: exactly 3.48 MB
             let mut dist16 = vec![0u16; head_ref.len() - 1];
             let mut touched: Vec<u32> = Vec::with_capacity(8192);
-            let mut pq = MinHeap::new();
+            let mut touched_buckets: Vec<u16> = Vec::with_capacity(4096);
+            let mut buckets: Vec<Vec<u32>> = (0..BUCKET_COUNT).map(|_| Vec::with_capacity(32)).collect();
 
             loop {
                 let qi = next_q.fetch_add(1, Ordering::Relaxed);
@@ -342,21 +278,34 @@ fn main() {
 
                 unsafe { *dist16.get_unchecked_mut(s as usize) = 1; }
                 touched.push(s);
-                pq.push(0, s);
+                buckets[0].push(s);
+                touched_buckets.push(0);
 
+                let mut cur_dist = 0u32;
+                let mut num_elements = 1usize;
                 let mut best_t = u32::MAX;
+                let mut needs_64 = false;
 
-                while !pq.is_empty() {
-                    let (d, u) = pq.pop();
-                    if d >= best_t {
-                        break;
+                while num_elements > 0 {
+                    let b_idx = (cur_dist as usize) & BUCKET_MASK;
+                    let bucket = unsafe { buckets.get_unchecked_mut(b_idx) };
+                    if bucket.is_empty() {
+                        cur_dist += 1;
+                        if cur_dist >= best_t {
+                            break;
+                        }
+                        continue;
                     }
+
+                    let u = bucket.pop().unwrap();
+                    num_elements -= 1;
+
                     let cur_u_stored = unsafe { *dist16.get_unchecked(u as usize) as u32 };
-                    if cur_u_stored == 0 || d > cur_u_stored - 1 {
+                    if cur_u_stored == 0 || cur_dist > cur_u_stored - 1 {
                         continue;
                     }
                     if u == t {
-                        best_t = d;
+                        best_t = cur_dist;
                         break;
                     }
 
@@ -364,7 +313,11 @@ fn main() {
                     let end = unsafe { *head_ref.get_unchecked((u + 1) as usize) as usize };
                     for ei in start..end {
                         let e = unsafe { edges_ref.get_unchecked(ei) };
-                        let nd = d.saturating_add(e.weight);
+                        if e.weight >= 4096 {
+                            needs_64 = true;
+                            continue;
+                        }
+                        let nd = cur_dist + e.weight;
                         if nd >= best_t || nd >= 65534 {
                             continue;
                         }
@@ -379,7 +332,13 @@ fn main() {
                                 touched.push(e.to);
                             }
                             unsafe { *dist16.get_unchecked_mut(e.to as usize) = (nd + 1) as u16; }
-                            pq.push(nd, e.to);
+                            let target_b = (nd as usize) & BUCKET_MASK;
+                            let target_bucket = unsafe { buckets.get_unchecked_mut(target_b) };
+                            if target_bucket.is_empty() {
+                                touched_buckets.push(target_b as u16);
+                            }
+                            target_bucket.push(e.to);
+                            num_elements += 1;
                         }
                     }
                 }
@@ -388,12 +347,18 @@ fn main() {
                     unsafe { *dist16.get_unchecked_mut(u as usize) = 0; }
                 }
                 touched.clear();
-                pq.clear();
+
+                for &b in &touched_buckets {
+                    unsafe { buckets.get_unchecked_mut(b as usize).clear(); }
+                }
+                touched_buckets.clear();
 
                 let ans = if best_t != u32::MAX {
                     best_t as i64
-                } else {
+                } else if needs_64 {
                     dijkstra64(&head_ref, &edges_ref, s, t)
+                } else {
+                    -1
                 };
 
                 unsafe { *out_ptr.add(qi) = ans; }
