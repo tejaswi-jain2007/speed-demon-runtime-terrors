@@ -159,7 +159,7 @@ impl<'a> Worker<'a> {
             return;
         }
         let chunk_bytes = end as usize - p as usize;
-        let reserve = (chunk_bytes / 40 / BLOCK_CAP + 1 + HOURS) * std::mem::size_of::<Block>();
+        let reserve = (chunk_bytes / 65 / BLOCK_CAP + 2 + HOURS) * std::mem::size_of::<Block>();
         self.region = mmap(
             std::ptr::null_mut(),
             reserve,
@@ -384,6 +384,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let num_endpoints = sorted_names.len();
 
+    // Immediately evict requests.log mapped pages from RAM!
+    unsafe {
+        madvise(data as *mut u8, size + 4096, MADV_DONTNEED);
+    }
+
     // Second phase: parallel hour reduction and streaming writer
     thread::scope(|s| {
         // Spawn background writer thread
@@ -397,7 +402,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             for h in 0..HOURS {
                 while !done_ref[h].load(Ordering::Acquire) {
-                    std::thread::yield_now();
+                    std::hint::spin_loop();
                 }
                 let buf = text_ref[h].lock().unwrap();
                 out_file.write_all(&buf).ok();
@@ -462,7 +467,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     cursor.copy_from_slice(&count[..ne]);
                     let total_lat = count[ne] as usize;
-                    lat.resize(total_lat, 0u32);
+                    lat.clear();
+                    lat.reserve(total_lat);
+                    unsafe {
+                        lat.set_len(total_lat);
+                    }
 
                     // Scatter latencies
                     for wt in 0..NTHREADS {
