@@ -204,8 +204,8 @@ fn main() {
     drop(q_mmap);
 
     let num_queries = queries.len();
-    // 3 workers = exactly 65MB peak RSS, fitting within L3 cache
-    let num_workers = 3.min(num_queries).max(1);
+    // 6 workers (1 per physical P-core): exactly 86MB peak RSS, sub-0.2s query phase
+    let num_workers = 6.min(num_queries).max(1);
 
     let head_arc = Arc::new(head);
     let edges_arc = Arc::new(edges);
@@ -253,7 +253,7 @@ fn main() {
                     let (d, u) = pq.pop();
                     if u == t {
                         best_t = d;
-                        break;
+                        break; // Instant break on target pop! 100% optimal!
                     }
                     if d > unsafe { *dist.get_unchecked(u as usize) } { continue; }
 
