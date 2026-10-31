@@ -1,7 +1,3 @@
-// Speed Demon 2026 - Track D (Traverse)
-// Team: Runtime Terrors
-// Multi-Chunk CSR: 4 embarrassingly parallel parsers (0.025s), 16-bit compact weights, 71MB peak RSS
-
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
@@ -43,7 +39,7 @@ impl FastMmap {
     }
 
     #[inline(always)]
-    fn as_slice(&self) -> &[u8] {
+    fn bytes(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
@@ -66,21 +62,20 @@ unsafe fn discard_file_pages(ptr: *const u8, len: usize) {
 }
 
 #[inline(always)]
-fn parse_u32_from_slice(data: &[u8], mut pos: usize, end: usize, out: &mut u32) -> usize {
-    while pos < end && unsafe { *data.get_unchecked(pos) } <= b' ' {
+fn parse_u32(data: &[u8], mut pos: usize, end: usize) -> (u32, usize) {
+    while pos < end && data[pos] <= b' ' {
         pos += 1;
     }
-    let mut v = 0u32;
+    let mut value = 0u32;
     while pos < end {
         let c = unsafe { *data.get_unchecked(pos) };
         if c < b'0' || c > b'9' {
             break;
         }
-        v = v * 10 + (c - b'0') as u32;
+        value = value * 10 + (c - b'0') as u32;
         pos += 1;
     }
-    *out = v;
-    pos
+    (value, pos)
 }
 
 struct MinHeap {
@@ -159,30 +154,25 @@ impl MinHeap {
     }
 }
 
-struct ChunkCSR {
-    head: Vec<u32>,
-    targets: Vec<u32>,
-    weights: Vec<u16>,
-    overflow: Vec<(u32, u32)>,
-}
-
 #[inline(always)]
-fn get_weight(idx: usize, weights: &[u16], overflow: &[(u32, u32)]) -> u32 {
-    let w = unsafe { *weights.get_unchecked(idx) };
-    if w != u16::MAX {
-        w as u32
+fn get_weight(index: usize, weights: &[u16], overflow: &[(u32, u32)]) -> u32 {
+    let compact = unsafe { *weights.get_unchecked(index) };
+    if compact != u16::MAX {
+        compact as u32
     } else {
-        let key = idx as u32;
-        if let Ok(slot) = overflow.binary_search_by_key(&key, |entry| entry.0) {
-            overflow[slot].1
-        } else {
-            u16::MAX as u32
-        }
+        let key = index as u32;
+        let slot = overflow
+            .binary_search_by_key(&key, |entry| entry.0)
+            .expect("overflow edge index missing");
+        overflow[slot].1
     }
 }
 
 fn dijkstra_u64(
-    chunks: &[ChunkCSR],
+    offsets: &[u32],
+    targets: &[u32],
+    weights: &[u16],
+    overflow: &[(u32, u32)],
     source: u32,
     target: u32,
 ) -> i64 {
@@ -198,17 +188,15 @@ fn dijkstra_u64(
         if distance > *distances.get(&node).unwrap_or(&u64::MAX) {
             continue;
         }
-        for chunk in chunks {
-            let begin = unsafe { *chunk.head.get_unchecked(node as usize) as usize };
-            let end = unsafe { *chunk.head.get_unchecked(node as usize + 1) as usize };
-            for edge_index in begin..end {
-                let next = unsafe { *chunk.targets.get_unchecked(edge_index) };
-                let weight = get_weight(edge_index, &chunk.weights, &chunk.overflow) as u64;
-                let candidate = distance + weight;
-                if candidate < *distances.get(&next).unwrap_or(&u64::MAX) {
-                    distances.insert(next, candidate);
-                    heap.push(Reverse((candidate, next)));
-                }
+        let begin = offsets[node as usize] as usize;
+        let end = offsets[node as usize + 1] as usize;
+        for edge_index in begin..end {
+            let next = unsafe { *targets.get_unchecked(edge_index) };
+            let weight = get_weight(edge_index, weights, overflow) as u64;
+            let candidate = distance + weight;
+            if candidate < *distances.get(&next).unwrap_or(&u64::MAX) {
+                distances.insert(next, candidate);
+                heap.push(Reverse((candidate, next)));
             }
         }
     }
@@ -258,140 +246,84 @@ fn main() {
     let output_path = format!("{}/distances.txt", out_dir);
 
     let graph_map = match FastMmap::open(&graph_path) {
-        Some(mapping) => Arc::new(mapping),
+        Some(mapping) => mapping,
         None => return,
     };
-    let graph = graph_map.as_slice();
+    let graph = graph_map.bytes();
     let graph_len = graph.len();
 
-    let mut n = 0u32;
-    let mut m = 0u32;
-    let mut pos = 0;
-    pos = parse_u32_from_slice(graph, pos, graph_len, &mut n);
-    pos = parse_u32_from_slice(graph, pos, graph_len, &mut m);
-    let edges_start = pos;
+    let (n, mut pos) = parse_u32(graph, 0, graph_len);
+    let (m, next) = parse_u32(graph, pos, graph_len);
+    pos = next;
 
-    let num_chunks = 4usize;
-    let payload_len = graph_len - edges_start;
-    let mut splits = vec![edges_start; num_chunks + 1];
-    splits[num_chunks] = graph_len;
-    for t in 1..num_chunks {
-        let mut pt = edges_start + t * (payload_len / num_chunks);
-        while pt < graph_len && graph[pt] != b'\n' { pt += 1; }
-        if pt < graph_len { pt += 1; }
-        splits[t] = pt;
+    let mut offsets = vec![0u32; n as usize + 1];
+    let mut has_incoming = vec![0u64; (n as usize + 63) >> 6];
+
+    let mut scan = pos;
+    for _ in 0..m {
+        let (u, p1) = parse_u32(graph, scan, graph_len);
+        let (v, p2) = parse_u32(graph, p1, graph_len);
+        let (_, p3) = parse_u32(graph, p2, graph_len);
+        scan = p3;
+        offsets[u as usize + 1] += 1;
+        has_incoming[v as usize >> 6] |= 1u64 << (v & 63);
     }
 
-    // Spawn 4 threads to build independent ChunkCSRs in parallel (0.025s)
-    let mut handles = Vec::with_capacity(num_chunks);
-    for c in 0..num_chunks {
-        let (m_ref, start, end) = (Arc::clone(&graph_map), splits[c], splits[c + 1]);
-        handles.push(thread::spawn(move || {
-            let d = m_ref.as_slice();
-            let mut head = vec![0u32; (n + 2) as usize];
-            let mut local_in = vec![0u64; ((n as usize) + 63) >> 6];
-            let mut chunk_edge_count = 0usize;
-
-            // Pass 1: count out-degrees in this chunk
-            unsafe {
-                let mut p = d.as_ptr().add(start);
-                let end_ptr = d.as_ptr().add(end);
-                while p < end_ptr {
-                    while p < end_ptr && *p <= b' ' { p = p.add(1); }
-                    if p >= end_ptr { break; }
-                    let mut u = (*p - b'0') as u32; p = p.add(1);
-                    while p < end_ptr && *p >= b'0' { u = u * 10 + (*p - b'0') as u32; p = p.add(1); }
-                    while p < end_ptr && *p <= b' ' { p = p.add(1); }
-                    if p >= end_ptr { break; }
-                    let mut v = (*p - b'0') as u32; p = p.add(1);
-                    while p < end_ptr && *p >= b'0' { v = v * 10 + (*p - b'0') as u32; p = p.add(1); }
-                    while p < end_ptr && *p <= b' ' { p = p.add(1); }
-                    while p < end_ptr && *p >= b'0' { p = p.add(1); }
-
-                    head[(u + 1) as usize] += 1;
-                    *local_in.get_unchecked_mut((v as usize) >> 6) |= 1u64 << ((v as usize) & 63);
-                    chunk_edge_count += 1;
-                }
-            }
-
-            // Prefix sum for this chunk
-            for j in 0..=n as usize {
-                head[j + 1] += head[j];
-            }
-
-            let mut targets = vec![0u32; chunk_edge_count];
-            let mut weights = vec![0u16; chunk_edge_count];
-            let mut overflow = Vec::<(u32, u32)>::with_capacity(32);
-
-            // Pass 2: fill targets and weights for this chunk
-            unsafe {
-                let mut p = d.as_ptr().add(start);
-                let end_ptr = d.as_ptr().add(end);
-                while p < end_ptr {
-                    while p < end_ptr && *p <= b' ' { p = p.add(1); }
-                    if p >= end_ptr { break; }
-                    let mut u = (*p - b'0') as u32; p = p.add(1);
-                    while p < end_ptr && *p >= b'0' { u = u * 10 + (*p - b'0') as u32; p = p.add(1); }
-                    while p < end_ptr && *p <= b' ' { p = p.add(1); }
-                    if p >= end_ptr { break; }
-                    let mut v = (*p - b'0') as u32; p = p.add(1);
-                    while p < end_ptr && *p >= b'0' { v = v * 10 + (*p - b'0') as u32; p = p.add(1); }
-                    while p < end_ptr && *p <= b' ' { p = p.add(1); }
-                    if p >= end_ptr { break; }
-                    let mut w = (*p - b'0') as u32; p = p.add(1);
-                    while p < end_ptr && *p >= b'0' { w = w * 10 + (*p - b'0') as u32; p = p.add(1); }
-
-                    let idx = head[u as usize] as usize;
-                    head[u as usize] += 1;
-                    *targets.get_unchecked_mut(idx) = v;
-                    if w >= u16::MAX as u32 {
-                        *weights.get_unchecked_mut(idx) = u16::MAX;
-                        overflow.push((idx as u32, w));
-                    } else {
-                        *weights.get_unchecked_mut(idx) = w as u16;
-                    }
-                }
-            }
-
-            // Restore head offsets
-            for j in (0..n as usize).rev() {
-                head[j + 1] = head[j];
-            }
-            head[0] = 0;
-            overflow.sort_unstable_by_key(|entry| entry.0);
-
-            (ChunkCSR { head, targets, weights, overflow }, local_in)
-        }));
+    for node in 0..n as usize {
+        offsets[node + 1] += offsets[node];
     }
 
-    let mut chunks = Vec::with_capacity(num_chunks);
-    let mut has_incoming = vec![0u64; ((n as usize) + 63) >> 6];
-    for h in handles {
-        let (chunk_csr, local_in) = h.join().unwrap();
-        chunks.push(chunk_csr);
-        for w in 0..has_incoming.len() {
-            has_incoming[w] |= local_in[w];
+    let mut targets = vec![0u32; m as usize];
+    let mut weights = vec![0u16; m as usize];
+    let mut overflow = Vec::<(u32, u32)>::with_capacity(128);
+
+    scan = pos;
+    for _ in 0..m {
+        let (u, p1) = parse_u32(graph, scan, graph_len);
+        let (v, p2) = parse_u32(graph, p1, graph_len);
+        let (weight, p3) = parse_u32(graph, p2, graph_len);
+        scan = p3;
+
+        let edge_index = offsets[u as usize] as usize;
+        offsets[u as usize] += 1;
+        targets[edge_index] = v;
+        if weight >= u16::MAX as u32 {
+            weights[edge_index] = u16::MAX;
+            overflow.push((edge_index as u32, weight));
+        } else {
+            weights[edge_index] = weight as u16;
         }
     }
 
-    unsafe { discard_file_pages(graph.as_ptr(), graph_len); }
+    for node in (0..n as usize).rev() {
+        offsets[node + 1] = offsets[node];
+    }
+    offsets[0] = 0;
+    overflow.sort_unstable_by_key(|entry| entry.0);
+
+    unsafe {
+        discard_file_pages(graph.as_ptr(), graph_len);
+    }
     drop(graph_map);
 
     let query_map = match FastMmap::open(&query_path) {
         Some(mapping) => mapping,
         None => return,
     };
-    let query_bytes = query_map.as_slice();
-    let q_size = query_bytes.len();
-    let mut queries = Vec::with_capacity(2048);
-    let mut qp = 0usize;
-    while qp < q_size {
-        let mut s = 0u32;
-        let mut t = 0u32;
-        qp = parse_u32_from_slice(query_bytes, qp, q_size, &mut s);
-        if qp >= q_size { break; }
-        qp = parse_u32_from_slice(query_bytes, qp, q_size, &mut t);
-        queries.push((s, t));
+    let query_bytes = query_map.bytes();
+    let mut queries = Vec::<(u32, u32)>::with_capacity(2048);
+    let mut query_pos = 0usize;
+    while query_pos < query_bytes.len() {
+        while query_pos < query_bytes.len() && query_bytes[query_pos] <= b' ' {
+            query_pos += 1;
+        }
+        if query_pos == query_bytes.len() {
+            break;
+        }
+        let (source, p1) = parse_u32(query_bytes, query_pos, query_bytes.len());
+        let (target, p2) = parse_u32(query_bytes, p1, query_bytes.len());
+        queries.push((source, target));
+        query_pos = p2;
     }
     drop(query_map);
 
@@ -403,26 +335,31 @@ fn main() {
     }
 
     let worker_count = 4usize.min(query_count);
-    let chunks_arc = Arc::new(chunks);
-    let has_incoming_arc = Arc::new(has_incoming);
-    let queries_arc = Arc::new(queries);
-    let next_query_arc = Arc::new(AtomicUsize::new(0));
-
+    let offsets = Arc::new(offsets);
+    let targets = Arc::new(targets);
+    let weights = Arc::new(weights);
+    let overflow = Arc::new(overflow);
+    let has_incoming = Arc::new(has_incoming);
+    let queries = Arc::new(queries);
+    let next_query = Arc::new(AtomicUsize::new(0));
     let mut answers = vec![-1i64; query_count];
     let answers_ptr = answers.as_mut_ptr() as usize;
 
     let mut workers = Vec::with_capacity(worker_count);
     for _ in 0..worker_count {
-        let chunks_ref = Arc::clone(&chunks_arc);
-        let incoming_ref = Arc::clone(&has_incoming_arc);
-        let queries_ref = Arc::clone(&queries_arc);
-        let next_ref = Arc::clone(&next_query_arc);
+        let offsets_ref = Arc::clone(&offsets);
+        let targets_ref = Arc::clone(&targets);
+        let weights_ref = Arc::clone(&weights);
+        let overflow_ref = Arc::clone(&overflow);
+        let incoming_ref = Arc::clone(&has_incoming);
+        let queries_ref = Arc::clone(&queries);
+        let next_ref = Arc::clone(&next_query);
         let output_ptr = answers_ptr;
 
         let worker = thread::Builder::new()
             .stack_size(256 * 1024)
             .spawn(move || {
-                let mut distances = vec![u32::MAX; n as usize];
+                let mut distances = vec![u32::MAX; offsets_ref.len() - 1];
                 let mut touched = Vec::<u32>::with_capacity(8192);
                 let mut heap = MinHeap::with_capacity(8192);
 
@@ -440,9 +377,12 @@ fn main() {
                         continue;
                     }
 
-                    let target_has_incoming = (incoming_ref[target as usize >> 6]
-                        & (1u64 << (target & 63))) != 0;
-                    if !target_has_incoming {
+                    let target_has_incoming = incoming_ref[target as usize >> 6]
+                        & (1u64 << (target & 63))
+                        != 0;
+                    let source_begin = offsets_ref[source as usize];
+                    let source_end = offsets_ref[source as usize + 1];
+                    if !target_has_incoming || source_begin == source_end {
                         unsafe {
                             *((output_ptr as *mut i64).add(query_index)) = -1;
                         }
@@ -466,30 +406,28 @@ fn main() {
                             break;
                         }
 
-                        for chunk in chunks_ref.iter() {
-                            let begin = unsafe { *chunk.head.get_unchecked(node as usize) as usize };
-                            let end = unsafe { *chunk.head.get_unchecked(node as usize + 1) as usize };
-                            for edge_index in begin..end {
-                                let next = unsafe { *chunk.targets.get_unchecked(edge_index) };
-                                let weight = get_weight(edge_index, &chunk.weights, &chunk.overflow);
-                                let candidate = distance.saturating_add(weight);
-                                if candidate == u32::MAX {
-                                    needs_u64 = true;
-                                    continue;
-                                }
+                        let begin = offsets_ref[node as usize] as usize;
+                        let end = offsets_ref[node as usize + 1] as usize;
+                        for edge_index in begin..end {
+                            let next = unsafe { *targets_ref.get_unchecked(edge_index) };
+                            let weight = get_weight(edge_index, &weights_ref, &overflow_ref);
+                            let candidate = distance.saturating_add(weight);
+                            if candidate == u32::MAX {
+                                needs_u64 = true;
+                                continue;
+                            }
 
-                                let current = unsafe {
-                                    *distances.get_unchecked(next as usize)
-                                };
-                                if candidate < current {
-                                    if current == u32::MAX {
-                                        touched.push(next);
-                                    }
-                                    unsafe {
-                                        *distances.get_unchecked_mut(next as usize) = candidate;
-                                    }
-                                    heap.push(candidate, next);
+                            let current = unsafe {
+                                *distances.get_unchecked(next as usize)
+                            };
+                            if candidate < current {
+                                if current == u32::MAX {
+                                    touched.push(next);
                                 }
+                                unsafe {
+                                    *distances.get_unchecked_mut(next as usize) = candidate;
+                                }
+                                heap.push(candidate, next);
                             }
                         }
                     }
@@ -506,7 +444,10 @@ fn main() {
                         answer as i64
                     } else if needs_u64 {
                         dijkstra_u64(
-                            &chunks_ref,
+                            &offsets_ref,
+                            &targets_ref,
+                            &weights_ref,
+                            &overflow_ref,
                             source,
                             target,
                         )
