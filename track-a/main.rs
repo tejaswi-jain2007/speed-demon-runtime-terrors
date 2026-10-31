@@ -1,4 +1,4 @@
-// Speed Demon 2026 - Track A (Ingest) - Ultra High Performance
+// Speed Demon 2026 - Track A (Ingest) - Ultra High Performance Flat Vec
 use std::arch::x86_64::*;
 use std::cell::UnsafeCell;
 use std::fs::File;
@@ -21,7 +21,6 @@ const ID_MASK: u32 = (1 << 11) - 1;
 const ERR_BIT: u32 = 1 << 11;
 const BIG: u32 = 1 << 20;
 const NTHREADS: usize = 12;
-const BLOCK_CAP: usize = (16384 - 16) / 4;
 const TABLE_SLOTS: usize = 4096;
 
 #[inline(always)]
@@ -69,7 +68,7 @@ impl<'a> Table<'a> {
     fn new() -> Self {
         Self {
             slots: [0; TABLE_SLOTS],
-            names: Vec::with_capacity(512),
+            names: Vec::with_capacity(2048),
         }
     }
     #[inline(always)]
@@ -98,20 +97,10 @@ impl<'a> Table<'a> {
     }
 }
 
-#[repr(C)]
-struct Block {
-    next: *mut Block,
-    n: u32,
-    rec: [u32; BLOCK_CAP],
-}
-
 struct Worker<'a> {
     ep: Table<'a>,
-    head: [*mut Block; HOURS],
+    hours: [UnsafeCell<Vec<u32>>; HOURS],
     big: Vec<Vec<(u32, u32)>>,
-    region: *mut u8,
-    used: usize,
-    reserved: usize,
 }
 unsafe impl<'a> Send for Worker<'a> {}
 unsafe impl<'a> Sync for Worker<'a> {}
@@ -120,28 +109,18 @@ impl<'a> Worker<'a> {
     fn new() -> Self {
         Self {
             ep: Table::new(),
-            head: [std::ptr::null_mut(); HOURS],
+            hours: std::array::from_fn(|_| UnsafeCell::new(Vec::new())),
             big: (0..HOURS).map(|_| Vec::new()).collect(),
-            region: std::ptr::null_mut(),
-            used: 0,
-            reserved: 0,
         }
     }
     unsafe fn parse(&mut self, mut p: *const u8, end: *const u8) {
         if p >= end {
             return;
         }
-        self.reserved = 32 * std::mem::size_of::<Block>();
-        self.region = mmap(std::ptr::null_mut(), self.reserved, 3, 0x22, -1, 0);
-        if self.region == !0 as *mut u8 {
-            _exit(1);
-        }
-
-        let mut cur_b: [*mut Block; HOURS] = [std::ptr::null_mut(); HOURS];
 
         while p < end {
-            let day = (*p.add(9) - b'0' + *p.add(6) - b'0') as usize;
-            let h = day * 24 + ((*p.add(11) - b'0') * 10 + (*p.add(12) - b'0')) as usize - 18;
+            let day = (*p.add(9) + *p.add(6) - 96) as usize;
+            let h = day * 24 + ((*p.add(11) - b'0') * 10 + *p.add(12) - b'0') as usize - 18;
 
             let v = load8(p.add(31)) ^ 0x2020202020202020u64;
             let mask = v.wrapping_sub(0x0101010101010101u64) & !v & 0x8080808080808080u64;
@@ -149,7 +128,6 @@ impl<'a> Worker<'a> {
 
             let eol = find_nl(p.add(39));
 
-            // Fast backwards latency & status parsing directly from eol
             let mut lat = 0u32;
             let mut cur = eol.sub(1);
             let mut mul = 1u32;
@@ -163,31 +141,15 @@ impl<'a> Worker<'a> {
             let key = self.ep.intern(ep, ee as usize - ep as usize) | is_err;
             p = eol.add(1);
 
-            if lat >= BIG {
-                self.big[h].push((lat, key));
-                continue;
-            }
-            let mut b = cur_b[h];
-            if b.is_null() || (*b).n as usize == BLOCK_CAP {
-                if self.used + std::mem::size_of::<Block>() > self.reserved {
-                    let extra = 16 * std::mem::size_of::<Block>();
-                    let p = mmap(std::ptr::null_mut(), extra, 3, 0x22, -1, 0);
-                    if p != !0 as *mut u8 {
-                        self.region = p;
-                        self.used = 0;
-                        self.reserved = extra;
-                    }
+            if lat < BIG {
+                let hb = &mut *self.hours.get_unchecked(h).get();
+                if hb.is_empty() {
+                    hb.reserve(8192);
                 }
-                let fresh = self.region.add(self.used) as *mut Block;
-                self.used += std::mem::size_of::<Block>();
-                (*fresh).next = self.head[h];
-                self.head[h] = fresh;
-                cur_b[h] = fresh;
-                b = fresh;
+                hb.push((lat << KEY_BITS) | key);
+            } else {
+                self.big[h].push((lat, key));
             }
-            let br = &mut *b;
-            br.rec[br.n as usize] = (lat << KEY_BITS) | key;
-            br.n += 1;
         }
     }
 }
@@ -368,18 +330,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     errors.fill(0);
                     for wt in 0..NTHREADS {
                         let (w, r) = (&wrk_r[wt], &rk_r[wt]);
-                        let mut b = w.head[h];
-                        while !b.is_null() {
-                            unsafe {
-                                let br = &*b;
-                                for i in 0..br.n as usize {
-                                    let rec = br.rec[i];
-                                    let e = r[(rec & ID_MASK) as usize] as usize;
-                                    count[e + 1] += 1;
-                                    errors[e] += (rec & ERR_BIT) >> 11;
-                                }
-                                b = br.next;
-                            }
+                        let hb = unsafe { &*w.hours[h].get() };
+                        for &rec in hb.iter() {
+                            let e = r[(rec & ID_MASK) as usize] as usize;
+                            count[e + 1] += 1;
+                            errors[e] += (rec & ERR_BIT) >> 11;
                         }
                         for &(_, key) in &w.big[h] {
                             let e = r[(key & ID_MASK) as usize] as usize;
@@ -401,21 +356,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     for wt in 0..NTHREADS {
                         let (w, r) = (&wrk_r[wt], &rk_r[wt]);
-                        let mut b = w.head[h];
-                        while !b.is_null() {
-                            unsafe {
-                                let br = &*b;
-                                for i in 0..br.n as usize {
-                                    let rec = br.rec[i];
-                                    let e = r[(rec & ID_MASK) as usize] as usize;
-                                    lat[cursor[e] as usize] = rec >> KEY_BITS;
-                                    cursor[e] += 1;
-                                }
-                                let next_b = br.next;
-                                madvise(b as *mut u8, std::mem::size_of::<Block>(), 4);
-                                b = next_b;
-                            }
+                        let hb = unsafe { &mut *w.hours[h].get() };
+                        for &rec in hb.iter() {
+                            let e = r[(rec & ID_MASK) as usize] as usize;
+                            lat[cursor[e] as usize] = rec >> KEY_BITS;
+                            cursor[e] += 1;
                         }
+                        hb.clear();
+                        hb.shrink_to_fit();
                         for &(l, key) in &w.big[h] {
                             let e = r[(key & ID_MASK) as usize] as usize;
                             lat[cursor[e] as usize] = l;
@@ -457,7 +405,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     rdy_r[h].store(true, Ordering::Release);
 
-                    // Cooperative progressive writer: flush ready hours immediately
                     if let Ok(mut writer) = file_m.try_lock() {
                         let mut cur = next_w.load(Ordering::Relaxed);
                         while cur < HOURS && rdy_r[cur].load(Ordering::Acquire) {
