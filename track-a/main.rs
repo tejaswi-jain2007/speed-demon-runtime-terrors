@@ -17,15 +17,10 @@ extern "C" {
 }
 
 const PROT_READ: i32 = 1; const PROT_WRITE: i32 = 2; const MAP_PRIVATE: i32 = 0x02;
-
 const MAP_ANONYMOUS: i32 = 0x20; const MAP_FIXED: i32 = 0x10; const MAP_FAILED: *mut u8 = !0 as *mut u8;
-
 const MADV_DONTNEED: i32 = 4;
-
 const HOURS: usize = 72; const KEY_BITS: u32 = 12; const ID_MASK: u32 = (1 << 11) - 1;
-
 const ERR_BIT: u32 = 1 << 11; const BIG: u32 = 1 << 20; const NTHREADS: usize = 12;
-
 const TABLE_SLOTS: usize = 1 << 12; const BLOCK_CAP: usize = (16384 - 16) / 4;
 #[inline(always)]
 unsafe fn load8(p: *const u8) -> u64 {
@@ -58,8 +53,7 @@ unsafe fn parse_digits(end: *const u8, len: u32) -> u32 {
     high.wrapping_mul(100000000) + low
 }
 #[derive(Copy, Clone)] struct SendPtr<T>(*const T);
-unsafe impl<T> Send for SendPtr<T> {}
-unsafe impl<T> Sync for SendPtr<T> {}
+unsafe impl<T> Send for SendPtr<T> {} unsafe impl<T> Sync for SendPtr<T> {}
 impl<T> SendPtr<T> { #[inline(always)] fn as_ptr(&self) -> *const T { self.0 } }
 
 struct EndpointTable<'a> {
@@ -108,8 +102,7 @@ struct Worker<'a> {
     used: usize,
     reserved: usize,
 }
-unsafe impl<'a> Send for Worker<'a> {}
-unsafe impl<'a> Sync for Worker<'a> {}
+unsafe impl<'a> Send for Worker<'a> {} unsafe impl<'a> Sync for Worker<'a> {}
 impl<'a> Worker<'a> {
     fn new() -> Self {
         Self {
@@ -140,7 +133,15 @@ impl<'a> Worker<'a> {
         }
         let sp_mask = _mm256_set1_epi8(b' ' as i8);
         let nl_mask = _mm256_set1_epi8(b'\n' as i8);
+        let mut last_drop = (p as usize + 4095) & !4095;
         while p < end {
+            if (p as usize) - last_drop >= 2 * 1024 * 1024 {
+                let cur = (p as usize) & !4095;
+                if cur > last_drop {
+                    madvise(last_drop as *mut u8, cur - last_drop, MADV_DONTNEED);
+                    last_drop = cur;
+                }
+            }
             let day_idx = (*p.add(9) - b'0' + (*p.add(6) & 1)) as usize;
             let hour = ((*p.add(11) - b'0') * 10 + (*p.add(12) - b'0')) as usize;
             let h = day_idx * 24 + hour - 18;
@@ -196,24 +197,11 @@ impl<'a> Worker<'a> {
     }
 }
 #[inline(always)]
-
 fn append_u32(buf: &mut [u8], mut val: u32, mut pos: usize) -> usize {
-    if val == 0 {
-        buf[pos] = b'0';
-        return pos + 1;
-    }
-    let mut temp = [0u8; 10];
-    let mut len = 0;
-    while val > 0 {
-        temp[len] = b'0' + (val % 10) as u8;
-        val /= 10;
-        len += 1;
-    }
-    while len > 0 {
-        len -= 1;
-        buf[pos] = temp[len];
-        pos += 1;
-    }
+    if val == 0 { buf[pos] = b'0'; return pos + 1; }
+    let mut temp = [0u8; 10]; let mut len = 0;
+    while val > 0 { temp[len] = b'0' + (val % 10) as u8; val /= 10; len += 1; }
+    while len > 0 { len -= 1; buf[pos] = temp[len]; pos += 1; }
     pos
 }
 
@@ -253,16 +241,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         data_dir.join("requests.log")
     };
     let out_path = out_dir.join("summary.txt");
-    if !in_path.exists() {
-        File::create(&out_path)?;
-        return Ok(());
-    }
+    if !in_path.exists() { File::create(&out_path)?; return Ok(()); }
     let file = File::open(&in_path)?;
     let size = file.metadata()?.len() as usize;
-    if size == 0 {
-        File::create(&out_path)?;
-        return Ok(());
-    }
+    if size == 0 { File::create(&out_path)?; return Ok(()); }
     let fd = file.as_raw_fd();
     let data = unsafe {
         let p = mmap(
@@ -437,7 +419,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     lat[dst] = rec >> KEY_BITS;
                                     cursor[e] += 1;
                                 }
-                                b = b_ref.next;
+                                let next_b = b_ref.next;
+                                madvise(b as *mut u8, std::mem::size_of::<Block>(), MADV_DONTNEED);
+                                b = next_b;
                             }
                         }
                         for &(l, key) in &w.big[h] {
