@@ -137,7 +137,6 @@ impl<'a> Worker<'a> {
         if p >= end {
             return;
         }
-        // let _chunk_bytes = end as usize - p as usize;
         let reserve = 72 * std::mem::size_of::<Block>();
         self.reserved = reserve;
         self.region = mmap(
