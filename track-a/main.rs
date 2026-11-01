@@ -1,40 +1,48 @@
 // Speed Demon 2026 - Track A (Turbo Ingest) - Team: Runtime Terrors
-use std::{arch::x86_64::*, fs::File, io::Write, os::unix::io::AsRawFd, path::PathBuf,
-    sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, Mutex}, thread};
-
+// Multi-threaded SIMD architecture targeting 85+ points
+use std::arch::x86_64::*;
+use std::fs::File;
+use std::io::Write;
+use std::os::unix::io::AsRawFd;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Barrier;
+use std::sync::Mutex;
+use std::thread;
 extern "C" {
-    fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
-    fn madvise(a: *mut u8, l: usize, adv: i32) -> i32;
-    fn _exit(s: i32) -> !;
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
+    fn _exit(status: i32) -> !;
 }
 
-const HOURS: usize = 72;
-const KEY_BITS: u32 = 12;
-const ID_MASK: u32 = (1 << 11) - 1;
-const ERR_BIT: u32 = 1 << 11;
-const BIG: u32 = 1 << 20;
-const NTHREADS: usize = 12;
-const TABLE_SLOTS: usize = 1 << 12;
-const BLOCK_CAP: usize = (16384 - 16) / 4;
+const PROT_READ: i32 = 1; const PROT_WRITE: i32 = 2; const MAP_PRIVATE: i32 = 0x02;
 
-#[repr(C)]
-struct Block { next: *mut Block, n: u32, rec: [u32; BLOCK_CAP] }
+const MAP_ANONYMOUS: i32 = 0x20; const MAP_FIXED: i32 = 0x10; const MAP_FAILED: *mut u8 = !0 as *mut u8;
 
-#[derive(Copy, Clone)]
-struct SP<T>(*const T);
-unsafe impl<T> Send for SP<T> {}
-unsafe impl<T> Sync for SP<T> {}
-impl<T> SP<T> { #[inline(always)] fn p(&self) -> *const T { self.0 } }
+const MADV_DONTNEED: i32 = 4;
 
-#[inline(always)] unsafe fn ld8(p: *const u8) -> u64 { (p as *const u64).read_unaligned() }
-#[inline(always)] unsafe fn m32(p: *const u8, c: u8) -> u32 {
-    _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(p as *const __m256i), _mm256_set1_epi8(c as i8))) as u32
+const HOURS: usize = 72; const KEY_BITS: u32 = 12; const ID_MASK: u32 = (1 << 11) - 1;
+
+const ERR_BIT: u32 = 1 << 11; const BIG: u32 = 1 << 20; const NTHREADS: usize = 12;
+
+const TABLE_SLOTS: usize = 1 << 12; const BLOCK_CAP: usize = (16384 - 16) / 4;
+#[inline(always)]
+unsafe fn load8(p: *const u8) -> u64 {
+    (p as *const u64).read_unaligned()
 }
-#[inline(always)] unsafe fn find(mut s: *const u8, c: u8) -> *const u8 {
-    loop { let m = m32(s, c); if m != 0 { return s.add(m.trailing_zeros() as usize); } s = s.add(32); }
+#[inline(always)]
+unsafe fn find(mut s: *const u8, c: u8) -> *const u8 {
+    let mask = _mm256_set1_epi8(c as i8);
+    loop {
+        let v = _mm256_loadu_si256(s as *const __m256i);
+        let m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, mask)) as u32;
+        if m != 0 {
+            return s.add(m.trailing_zeros() as usize);
+        }
+        s = s.add(32);
+    }
 }
-
-/// SSE-accelerated 1-10 digit decimal parse: reads 16 bytes ending at `end`.
 #[inline(always)]
 unsafe fn parse_digits(end: *const u8, len: u32) -> u32 {
     let v = _mm_loadu_si128(end.sub(16) as *const __m128i);
@@ -45,20 +53,33 @@ unsafe fn parse_digits(end: *const u8, len: u32) -> u32 {
     let v = _mm_madd_epi16(v, _mm_set1_epi32(0x00010064));
     let v = _mm_packus_epi32(v, v);
     let v = _mm_madd_epi16(v, _mm_set1_epi32(0x00012710));
-    (_mm_cvtsi128_si32(v) as u32).wrapping_mul(100000000) + (_mm_extract_epi32(v, 1) as u32)
+    let high = _mm_cvtsi128_si32(v) as u32;
+    let low = _mm_extract_epi32(v, 1) as u32;
+    high.wrapping_mul(100000000) + low
 }
+#[derive(Copy, Clone)] struct SendPtr<T>(*const T);
+unsafe impl<T> Send for SendPtr<T> {}
+unsafe impl<T> Sync for SendPtr<T> {}
+impl<T> SendPtr<T> { #[inline(always)] fn as_ptr(&self) -> *const T { self.0 } }
 
-struct EPTable<'a> {
+struct EndpointTable<'a> {
     slots: [u32; TABLE_SLOTS],
     names: Vec<&'a [u8]>,
 }
-impl<'a> EPTable<'a> {
-    fn new() -> Self { Self { slots: [0; TABLE_SLOTS], names: Vec::with_capacity(512) } }
+impl<'a> EndpointTable<'a> {
+    fn new() -> Self {
+        Self {
+            slots: [0; TABLE_SLOTS],
+            names: Vec::with_capacity(512),
+        }
+    }
     #[inline(always)]
     unsafe fn intern(&mut self, s: *const u8, len: usize) -> u32 {
-        let mut a = ld8(s);
-        let b = if len >= 8 { ld8(s.add(len - 8)) } else { 0 };
-        if len < 8 { a &= (1u64 << (8 * len)) - 1; }
+        let mut a = load8(s);
+        let b = if len >= 8 { load8(s.add(len - 8)) } else { 0 };
+        if len < 8 {
+            a &= (1u64 << (8 * len)) - 1;
+        }
         let h1 = _mm_crc32_u64(len as u64, a);
         let mut i = _mm_crc32_u64(h1, b) as usize;
         loop {
@@ -70,169 +91,291 @@ impl<'a> EPTable<'a> {
                 return idx;
             }
             let n = self.names[(*slot - 1) as usize];
-            if n.len() == len && std::slice::from_raw_parts(s, len) == n { return *slot - 1; }
+            if n.len() == len && std::slice::from_raw_parts(s, len) == n {
+                return *slot - 1;
+            }
             i += 1;
         }
     }
 }
+#[repr(C)] struct Block { next: *mut Block, n: u32, rec: [u32; BLOCK_CAP] }
 
 struct Worker<'a> {
-    ep: EPTable<'a>,
+    endpoints: EndpointTable<'a>,
     head: [*mut Block; HOURS],
     big: Vec<Vec<(u32, u32)>>,
-    region: *mut u8, used: usize, reserved: usize,
+    region: *mut u8,
+    used: usize,
+    reserved: usize,
 }
 unsafe impl<'a> Send for Worker<'a> {}
 unsafe impl<'a> Sync for Worker<'a> {}
 impl<'a> Worker<'a> {
     fn new() -> Self {
-        Self { ep: EPTable::new(), head: [std::ptr::null_mut(); HOURS],
+        Self {
+            endpoints: EndpointTable::new(),
+            head: [std::ptr::null_mut(); HOURS],
             big: (0..HOURS).map(|_| Vec::new()).collect(),
-            region: std::ptr::null_mut(), used: 0, reserved: 0 }
+            region: std::ptr::null_mut(),
+            used: 0,
+            reserved: 0,
+        }
     }
     unsafe fn parse(&mut self, mut p: *const u8, end: *const u8) {
-        if p >= end { return; }
+        if p >= end {
+            return;
+        }
         let reserve = 72 * std::mem::size_of::<Block>();
         self.reserved = reserve;
-        self.region = mmap(std::ptr::null_mut(), reserve, 3, 0x22, -1, 0);
-        if self.region == !0 as *mut u8 { _exit(1); }
+        self.region = mmap(
+            std::ptr::null_mut(),
+            reserve,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if self.region == MAP_FAILED {
+            _exit(1);
+        }
+        let sp_mask = _mm256_set1_epi8(b' ' as i8);
+        let nl_mask = _mm256_set1_epi8(b'\n' as i8);
         while p < end {
-            let day_idx = if *p.add(6) == b'0' { (*p.add(9) - b'0') as i32 }
-                          else { (*p.add(9) - b'0' + 1) as i32 };
-            let hour = ((*p.add(11) - b'0') * 10 + (*p.add(12) - b'0')) as i32;
-            let h = (day_idx * 24 + hour - 18) as usize;
+            let day_idx = (*p.add(9) - b'0' + (*p.add(6) & 1)) as usize;
+            let hour = ((*p.add(11) - b'0') * 10 + (*p.add(12) - b'0')) as usize;
+            let h = day_idx * 24 + hour - 18;
             let m = p.add(28);
-            let sp = (m32(m, b' ') as u64) | ((m32(m.add(32), b' ') as u64) << 32);
-            let nl = (m32(m, b'\n') as u64) | ((m32(m.add(32), b'\n') as u64) << 32);
+            let v0 = _mm256_loadu_si256(m as *const __m256i);
+            let v1 = _mm256_loadu_si256(m.add(32) as *const __m256i);
+            let sp0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, sp_mask)) as u32;
+            let sp1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, sp_mask)) as u32;
+            let nl0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, nl_mask)) as u32;
+            let nl1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, nl_mask)) as u32;
+            let sp = (sp0 as u64) | ((sp1 as u64) << 32);
+            let nl = (nl0 as u64) | ((nl1 as u64) << 32);
             let ep = m.add(sp.trailing_zeros() as usize + 1);
-            let ee = if nl != 0 { m.add((sp & (sp - 1)).trailing_zeros() as usize) } else { find(ep, b' ') };
-            let eol = if nl != 0 { m.add(nl.trailing_zeros() as usize) } else { find(ee.add(5), b'\n') };
+            let ee = if nl != 0 {
+                m.add((sp & (sp - 1)).trailing_zeros() as usize)
+            } else {
+                find(ep, b' ')
+            };
+            let eol = if nl != 0 {
+                m.add(nl.trailing_zeros() as usize)
+            } else {
+                find(ee.add(5), b'\n')
+            };
             let is_err = if *ee.add(1) == b'5' { ERR_BIT } else { 0 };
-            let key = self.ep.intern(ep, ee as usize - ep as usize) | is_err;
+            let key = self.endpoints.intern(ep, ee as usize - ep as usize) | is_err;
             let lat = parse_digits(eol, (eol as usize - ee as usize - 5) as u32);
             p = eol.add(1);
-            if lat >= BIG { self.big[h].push((lat, key)); continue; }
+            if lat >= BIG {
+                self.big[h].push((lat, key));
+                continue;
+            }
             let b = &mut self.head[h];
             if (*b).is_null() || (*(*b)).n as usize == BLOCK_CAP {
                 if self.used + std::mem::size_of::<Block>() > self.reserved {
                     let extra = 16 * std::mem::size_of::<Block>();
-                    let pf = mmap(std::ptr::null_mut(), extra, 3, 0x22, -1, 0);
-                    if pf != !0 as *mut u8 { self.region = pf; self.used = 0; self.reserved = extra; }
+                    let ptr = mmap(std::ptr::null_mut(), extra, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                    if ptr != MAP_FAILED {
+                        self.region = ptr;
+                        self.used = 0;
+                        self.reserved = extra;
+                    }
                 }
                 let fresh = self.region.add(self.used) as *mut Block;
                 self.used += std::mem::size_of::<Block>();
-                (*fresh).next = *b; (*fresh).n = 0; *b = fresh;
+                (*fresh).next = *b;
+                (*fresh).n = 0;
+                *b = fresh;
             }
-            let br = &mut *(*b);
-            br.rec[br.n as usize] = (lat << KEY_BITS) | key;
-            br.n += 1;
+            let b_ref = &mut *(*b);
+            b_ref.rec[b_ref.n as usize] = (lat << KEY_BITS) | key;
+            b_ref.n += 1;
         }
     }
 }
-
 #[inline(always)]
-fn wr_u32(buf: &mut [u8], mut v: u32, mut pos: usize) -> usize {
-    if v == 0 { buf[pos] = b'0'; return pos + 1; }
-    let (mut t, mut n) = ([0u8; 10], 0);
-    while v > 0 { t[n] = b'0' + (v % 10) as u8; v /= 10; n += 1; }
-    while n > 0 { n -= 1; buf[pos] = t[n]; pos += 1; }
+
+fn append_u32(buf: &mut [u8], mut val: u32, mut pos: usize) -> usize {
+    if val == 0 {
+        buf[pos] = b'0';
+        return pos + 1;
+    }
+    let mut temp = [0u8; 10];
+    let mut len = 0;
+    while val > 0 {
+        temp[len] = b'0' + (val % 10) as u8;
+        val /= 10;
+        len += 1;
+    }
+    while len > 0 {
+        len -= 1;
+        buf[pos] = temp[len];
+        pos += 1;
+    }
     pos
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut data_dir = PathBuf::from("/data");
-    let mut out_dir = if PathBuf::from("/out").exists() { PathBuf::from("/out") } else { PathBuf::from("output") };
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        if a == "--data" { if let Some(v) = args.next() { data_dir = PathBuf::from(v); } }
-        else if a == "--out" { if let Some(v) = args.next() { out_dir = PathBuf::from(v); } }
+    unsafe {
+        prctl(14, 1, 0, 0, 0); // PR_SET_THP_DISABLE = 14
     }
-    if let Ok(v) = std::env::var("DATA_DIR") { if !v.is_empty() { data_dir = PathBuf::from(v); } }
-    if let Ok(v) = std::env::var("OUT_DIR") { if !v.is_empty() { out_dir = PathBuf::from(v); } }
+    let mut data_dir = PathBuf::from("/data");
+    let mut out_dir = PathBuf::from("/out");
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--data" && i + 1 < args.len() {
+            data_dir = PathBuf::from(&args[i + 1]);
+            i += 2;
+        } else if args[i] == "--out" && i + 1 < args.len() {
+            out_dir = PathBuf::from(&args[i + 1]);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    if let Ok(env_data) = std::env::var("DATA_DIR") {
+        if !env_data.is_empty() {
+            data_dir = PathBuf::from(env_data);
+        }
+    }
+    if let Ok(env_out) = std::env::var("OUT_DIR") {
+        if !env_out.is_empty() {
+            out_dir = PathBuf::from(env_out);
+        }
+    }
     std::fs::create_dir_all(&out_dir).ok();
-
-    let in_path = if data_dir.is_file() { data_dir } else { data_dir.join("requests.log") };
+    let in_path = if data_dir.is_file() {
+        data_dir
+    } else {
+        data_dir.join("requests.log")
+    };
     let out_path = out_dir.join("summary.txt");
-    if !in_path.exists() { File::create(&out_path)?; return Ok(()); }
+    if !in_path.exists() {
+        File::create(&out_path)?;
+        return Ok(());
+    }
     let file = File::open(&in_path)?;
     let size = file.metadata()?.len() as usize;
-    if size == 0 { File::create(&out_path)?; return Ok(()); }
-
+    if size == 0 {
+        File::create(&out_path)?;
+        return Ok(());
+    }
     let fd = file.as_raw_fd();
-    // Map file + guard page (4096 extra) so AVX2 loads past EOF are safe
     let data = unsafe {
-        let p = mmap(std::ptr::null_mut(), size + 4096, 3, 0x22, -1, 0);
-        if p == !0 as *mut u8 { _exit(1); }
-        if mmap(p, size, 1, 0x12, fd, 0) == !0 as *mut u8 { _exit(1); }
+        let p = mmap(
+            std::ptr::null_mut(),
+            size + 4096,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if p == MAP_FAILED {
+            _exit(1);
+        }
+        if mmap(p, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED {
+            _exit(1);
+        }
         p as *const u8
     };
-
     let mut labels = [[0u8; 20]; HOURS];
     for h in 0..HOURS {
-        let (day, hr) = ((h + 18) / 24, (h + 18) % 24);
-        let (m, d) = if day < 2 { (10, 30 + day) } else { (11, day - 1) };
-        labels[h].copy_from_slice(format!("2026-{m:02}-{d:02}T{hr:02}:00:00Z").as_bytes());
+        let day = (h + 18) / 24;
+        let m = if day < 2 { 10 } else { 11 };
+        let d = if day < 2 { 30 + day } else { day - 1 };
+        let hr = (h + 18) % 24;
+        let s = format!("2026-{m:02}-{d:02}T{hr:02}:00:00Z");
+        labels[h].copy_from_slice(s.as_bytes());
     }
-
-    let mut cut = vec![size; NTHREADS + 1]; cut[0] = 0;
+    let mut cut = vec![size; NTHREADS + 1];
+    cut[0] = 0;
     for t in 1..NTHREADS {
         let mut c = cut[t - 1].max(size * t / NTHREADS);
-        while c < size && unsafe { *data.add(c - 1) } != b'\n' { c += 1; }
+        while c < size && unsafe { *data.add(c - 1) } != b'\n' {
+            c += 1;
+        }
         cut[t] = c;
     }
-
     let mut workers: Vec<Worker> = (0..NTHREADS).map(|_| Worker::new()).collect();
+    let barrier = Barrier::new(NTHREADS);
     let next_hour = AtomicUsize::new(0);
     let done: Vec<AtomicBool> = (0..HOURS).map(|_| AtomicBool::new(false)).collect();
     let text_boxes: Vec<Mutex<Vec<u8>>> = (0..HOURS).map(|_| Mutex::new(Vec::new())).collect();
     let mut rank = vec![Vec::new(); NTHREADS];
-    let ds = SP(data);
-
-    // Phase 1: parallel parse
+    let data_send = SendPtr(data);
+    // First phase: parse chunks in parallel
     thread::scope(|s| {
-        let cr = &cut; let d = ds;
+        let cut_ref = &cut;
+        let barrier_ref = &barrier;
+        let d_send = data_send;
         for (t, w) in workers.iter_mut().enumerate() {
             s.spawn(move || unsafe {
-                let from = d.p().add(cr[t]); let to = d.p().add(cr[t + 1]);
+                let from = d_send.as_ptr().add(cut_ref[t]);
+                let to = d_send.as_ptr().add(cut_ref[t + 1]);
                 w.parse(from, to);
-                let (sf, ef) = ((from as usize + 4095) & !4095, (to as usize) & !4095);
-                if ef > sf { madvise(sf as *mut u8, ef - sf, 4); }
+                let sf = (from as usize + 4095) & !4095;
+                let ef = (to as usize) & !4095;
+                if ef > sf {
+                    madvise(sf as *mut u8, ef - sf, MADV_DONTNEED);
+                }
+                barrier_ref.wait();
             });
         }
     });
-
-    let mut global = EPTable::new();
+    // Reconcile endpoints across workers
+    let mut global = EndpointTable::new();
     for t in 0..NTHREADS {
-        for n in &workers[t].ep.names {
+        for n in &workers[t].endpoints.names {
             rank[t].push(unsafe { global.intern(n.as_ptr(), n.len()) });
         }
     }
-    let mut sorted = global.names.clone();
-    sorted.sort_unstable();
-    let mut rank_of = vec![0u32; sorted.len()];
-    for (i, n) in sorted.iter().enumerate() {
-        rank_of[unsafe { global.intern(n.as_ptr(), n.len()) } as usize] = i as u32;
+    let mut sorted_names = global.names.clone();
+    sorted_names.sort_unstable();
+    let mut rank_of = vec![0u32; sorted_names.len()];
+    for (i, n) in sorted_names.iter().enumerate() {
+        let global_id = unsafe { global.intern(n.as_ptr(), n.len()) } as usize;
+        rank_of[global_id] = i as u32;
     }
-    for r in &mut rank { for id in r { *id = rank_of[*id as usize]; } }
-    let ne = sorted.len();
-    unsafe { madvise(data as *mut u8, size, 4); }
-
-    // Phase 2: parallel hour reduction + streaming write
+    for r in &mut rank {
+        for id in r {
+            *id = rank_of[*id as usize];
+        }
+    }
+    let ne = sorted_names.len();
+    // Evict requests.log mapped pages from RAM
+    unsafe {
+        madvise(data as *mut u8, size + 4096, MADV_DONTNEED);
+    }
+    // Second phase: parallel hour reduction and streaming writer
     thread::scope(|s| {
-        let dr = &done; let tr = &text_boxes; let op = out_path.clone();
+        let done_ref = &done;
+        let text_ref = &text_boxes;
+        let out_p = out_path.clone();
         s.spawn(move || {
-            let mut f = match File::create(&op) { Ok(f) => f, Err(_) => return };
+            let mut out_file = match File::create(&out_p) {
+                Ok(f) => f,
+                Err(_) => return,
+            };
             for h in 0..HOURS {
-                while !dr[h].load(Ordering::Acquire) { std::hint::spin_loop(); }
-                let mut buf = tr[h].lock().unwrap();
-                f.write_all(&buf).ok(); *buf = Vec::new();
+                while !done_ref[h].load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                let mut buf = text_ref[h].lock().unwrap();
+                out_file.write_all(&buf).ok();
+                *buf = Vec::new();
             }
-            f.flush().ok();
+            out_file.flush().ok();
         });
-
-        let nhr = &next_hour; let dr = &done; let tr = &text_boxes;
-        let wr = &workers; let rr = &rank; let lr = &labels; let nr = &sorted;
-
+        let next_h_ref = &next_hour;
+        let done_ref = &done;
+        let text_ref = &text_boxes;
+        let workers_ref = &workers;
+        let rank_ref = &rank;
+        let labels_ref = &labels;
+        let names_ref = &sorted_names;
         for _ in 0..NTHREADS {
             s.spawn(move || {
                 let mut count = vec![0u32; ne + 1];
@@ -241,82 +384,126 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut lat = Vec::new();
                 let mut line = [0u8; 512];
                 loop {
-                    let h = nhr.fetch_add(1, Ordering::Relaxed);
-                    if h >= HOURS { break; }
-                    count.fill(0); errors.fill(0);
+                    let h = next_h_ref.fetch_add(1, Ordering::Relaxed);
+                    if h >= HOURS {
+                        break;
+                    }
+                    count.fill(0);
+                    errors.fill(0);
                     for wt in 0..NTHREADS {
-                        let (w, r) = (&wr[wt], &rr[wt]);
+                        let w = &workers_ref[wt];
+                        let r = &rank_ref[wt];
                         let mut b = w.head[h];
                         while !b.is_null() {
                             unsafe {
-                                let br = &*b;
-                                for i in 0..br.n as usize {
-                                    let k = br.rec[i]; let e = r[(k & ID_MASK) as usize] as usize;
-                                    count[e + 1] += 1; errors[e] += ((k & ERR_BIT) != 0) as u32;
+                                let b_ref = &*b;
+                                for i in 0..b_ref.n as usize {
+                                    let key = b_ref.rec[i];
+                                    let e = r[(key & ID_MASK) as usize] as usize;
+                                    count[e + 1] += 1;
+                                    errors[e] += ((key & ERR_BIT) != 0) as u32;
                                 }
-                                b = br.next;
+                                b = b_ref.next;
                             }
                         }
-                        for &(_, k) in &w.big[h] {
-                            let e = r[(k & ID_MASK) as usize] as usize;
-                            count[e + 1] += 1; errors[e] += ((k & ERR_BIT) != 0) as u32;
+                        for &(l, key) in &w.big[h] {
+                            let _ = l;
+                            let e = r[(key & ID_MASK) as usize] as usize;
+                            count[e + 1] += 1;
+                            errors[e] += ((key & ERR_BIT) != 0) as u32;
                         }
                     }
-                    for e in 0..ne { count[e + 1] += count[e]; }
-                    cursor.copy_from_slice(&count[..ne]);
-                    let tl = count[ne] as usize;
-                    lat.clear(); lat.reserve(tl); unsafe { lat.set_len(tl); }
-                    for wt in 0..NTHREADS {
-                        let (w, r) = (&wr[wt], &rr[wt]);
-                        let mut b = w.head[h];
-                        while !b.is_null() {
-                            unsafe {
-                                let br = &*b;
-                                for i in 0..br.n as usize {
-                                    let rec = br.rec[i]; let e = r[(rec & ID_MASK) as usize] as usize;
-                                    lat[cursor[e] as usize] = rec >> KEY_BITS; cursor[e] += 1;
-                                }
-                                let nb = br.next;
-                                madvise(b as *mut u8, std::mem::size_of::<Block>(), 4);
-                                b = nb;
-                            }
-                        }
-                        for &(l, k) in &w.big[h] {
-                            let e = r[(k & ID_MASK) as usize] as usize;
-                            lat[cursor[e] as usize] = l; cursor[e] += 1;
-                        }
-                    }
-                    let label = &lr[h];
-                    let mut out = tr[h].lock().unwrap();
-                    out.reserve(ne * 64);
                     for e in 0..ne {
-                        let (st, en) = (count[e] as usize, count[e + 1] as usize);
-                        let n = en - st; if n == 0 { continue; }
-                        let sl = &mut lat[st..en];
+                        count[e + 1] += count[e];
+                    }
+                    cursor.copy_from_slice(&count[..ne]);
+                    let total_lat = count[ne] as usize;
+                    lat.clear();
+                    lat.reserve(total_lat);
+                    unsafe {
+                        lat.set_len(total_lat);
+                    }
+                    for wt in 0..NTHREADS {
+                        let w = &workers_ref[wt];
+                        let r = &rank_ref[wt];
+                        let mut b = w.head[h];
+                        while !b.is_null() {
+                            unsafe {
+                                let b_ref = &*b;
+                                for i in 0..b_ref.n as usize {
+                                    let rec = b_ref.rec[i];
+                                    let e = r[(rec & ID_MASK) as usize] as usize;
+                                    let dst = cursor[e] as usize;
+                                    lat[dst] = rec >> KEY_BITS;
+                                    cursor[e] += 1;
+                                }
+                                b = b_ref.next;
+                            }
+                        }
+                        for &(l, key) in &w.big[h] {
+                            let e = r[(key & ID_MASK) as usize] as usize;
+                            let dst = cursor[e] as usize;
+                            lat[dst] = l;
+                            cursor[e] += 1;
+                        }
+                    }
+                    let label = &labels_ref[h];
+                    let mut out_text = text_ref[h].lock().unwrap();
+                    out_text.reserve(ne * 64);
+                    for e in 0..ne {
+                        let start = count[e] as usize;
+                        let end = count[e + 1] as usize;
+                        let n = end - start;
+                        if n == 0 {
+                            continue;
+                        }
+                        let slice = &mut lat[start..end];
                         let (p50, p95, p99) = if n <= 256 {
-                            sl.sort_unstable();
-                            (sl[(50*n+99)/100-1], sl[(95*n+99)/100-1], sl[(99*n+99)/100-1])
+                            slice.sort_unstable();
+                            (
+                                slice[(50 * n + 99) / 100 - 1],
+                                slice[(95 * n + 99) / 100 - 1],
+                                slice[(99 * n + 99) / 100 - 1],
+                            )
                         } else {
-                            let (r99,r95,r50) = ((99*n+99)/100-1,(95*n+99)/100-1,(50*n+99)/100-1);
-                            sl.select_nth_unstable(r99);
-                            let p99 = sl[r99];
-                            let p95 = if r95 == r99 { p99 } else { sl[..r99].select_nth_unstable(r95); sl[r95] };
-                            let p50 = if r50 == r95 { p95 } else { sl[..r95].select_nth_unstable(r50); sl[r50] };
+                            let r99 = (99 * n + 99) / 100 - 1;
+                            let r95 = (95 * n + 99) / 100 - 1;
+                            let r50 = (50 * n + 99) / 100 - 1;
+                            slice.select_nth_unstable(r99);
+                            let p99 = slice[r99];
+                            let p95 = if r95 == r99 {
+                                p99
+                            } else {
+                                slice[..r99].select_nth_unstable(r95);
+                                slice[r95]
+                            };
+                            let p50 = if r50 == r95 {
+                                p95
+                            } else {
+                                slice[..r95].select_nth_unstable(r50);
+                                slice[r50]
+                            };
                             (p50, p95, p99)
                         };
-                        let err = errors[e]; let ppm = ((err as u64)*1000000/(n as u64)) as u32;
+                        let err = errors[e];
+                        let ppm = ((err as u64) * 1000000 / (n as u64)) as u32;
                         let mut pos = 0;
                         line[..20].copy_from_slice(label); pos += 20;
-                        let ep = nr[e];
-                        line[pos] = b' '; line[pos+1..pos+1+ep.len()].copy_from_slice(ep); pos += 1 + ep.len();
-                        for v in [n as u32, p50, p95, p99, err, ppm] { line[pos] = b' '; pos = wr_u32(&mut line, v, pos+1); }
-                        line[pos] = b'\n'; pos += 1;
-                        out.extend_from_slice(&line[..pos]);
+                        let ep_name = names_ref[e];
+                        line[pos] = b' '; line[pos + 1..pos + 1 + ep_name.len()].copy_from_slice(ep_name);
+                        pos += 1 + ep_name.len();
+                        for val in [n as u32, p50, p95, p99, err, ppm] {
+                            line[pos] = b' '; pos = append_u32(&mut line, val, pos + 1);
+                        }
+                        pos += 1;
+                        out_text.extend_from_slice(&line[..pos]);
                     }
-                    dr[h].store(true, Ordering::Release);
+                    done_ref[h].store(true, Ordering::Release);
                 }
             });
         }
     });
-    unsafe { _exit(0); }
+    unsafe {
+        _exit(0);
+    }
 }
