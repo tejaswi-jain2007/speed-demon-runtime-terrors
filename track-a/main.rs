@@ -1,4 +1,4 @@
-// Speed Demon 2026 - Track A (Turbo Ingest) - Runtime Terrors (compact)
+// Speed Demon 2026 - Track A (Turbo Ingest) - Runtime Terrors (ultra-fast compact)
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
@@ -85,15 +85,20 @@ impl<'a> Worker<'a> {
         self.reserved = 72 * BS;
         self.region = mmap(std::ptr::null_mut(), self.reserved, RW, PRIV | ANON, -1, 0);
         if self.region == FAIL { _exit(1); }
-        let (spm, nlm) = (_mm256_set1_epi8(b' ' as i8), _mm256_set1_epi8(b'\n' as i8));
+        let sp_mask = _mm256_set1_epi8(b' ' as i8);
+        let nl_mask = _mm256_set1_epi8(b'\n' as i8);
         while p < end {
             let day = (*p.add(9) - b'0' + (*p.add(6) & 1)) as usize;
             let h = day * 24 + ((*p.add(11) - b'0') * 10 + (*p.add(12) - b'0')) as usize - 18;
             let m = p.add(28);
-            let (v0, v1) = (_mm256_loadu_si256(m as *const __m256i), _mm256_loadu_si256(m.add(32) as *const __m256i));
-            let mk = |v, k| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, k)) as u32 as u64;
-            let sp = mk(v0, spm) | (mk(v1, spm) << 32);
-            let nl = mk(v0, nlm) | (mk(v1, nlm) << 32);
+            let v0 = _mm256_loadu_si256(m as *const __m256i);
+            let v1 = _mm256_loadu_si256(m.add(32) as *const __m256i);
+            let sp0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, sp_mask)) as u32;
+            let sp1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, sp_mask)) as u32;
+            let nl0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, nl_mask)) as u32;
+            let nl1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, nl_mask)) as u32;
+            let sp = (sp0 as u64) | ((sp1 as u64) << 32);
+            let nl = (nl0 as u64) | ((nl1 as u64) << 32);
             let ep = m.add(sp.trailing_zeros() as usize + 1);
             let ee = if nl != 0 { m.add((sp & (sp - 1)).trailing_zeros() as usize) } else { find(ep, b' ') };
             let eol = if nl != 0 { m.add(nl.trailing_zeros() as usize) } else { find(ee.add(5), b'\n') };
@@ -149,7 +154,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if p == FAIL || mmap(p, size, 1, PRIV | FIXED, file.as_raw_fd(), 0) == FAIL { _exit(1); }
         p as *const u8
     };
-    let nt = thread::available_parallelism().map_or(8, |n| n.get()).min(12);
+    let nt = 12;
     let labels: Vec<[u8; 20]> = (0..HOURS).map(|h| {
         let day = (h + 18) / 24;
         let (m, d) = if day < 2 { (10, 30 + day) } else { (11, day - 1) };
@@ -223,7 +228,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     for e in 0..ne { count[e + 1] += count[e]; }
                     cursor.copy_from_slice(&count[..ne]);
-                    lat.clear(); lat.resize(count[ne] as usize, 0);
+                    let total_lat = count[ne] as usize;
+                    lat.clear();
+                    lat.reserve(total_lat);
+                    unsafe { lat.set_len(total_lat); }
                     for (w, r) in workers.iter().zip(rank) {
                         let mut b = w.head[h];
                         while !b.is_null() { unsafe {
@@ -249,13 +257,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let sl = &mut lat[st..en];
                         let q = |p: usize| (p * n + 99) / 100 - 1;
                         let (r50, r95, r99) = (q(50), q(95), q(99));
-                        let (p50, p95, p99);
-                        if n <= 256 { sl.sort_unstable(); (p50, p95, p99) = (sl[r50], sl[r95], sl[r99]); }
-                        else {
-                            sl.select_nth_unstable(r99); p99 = sl[r99];
-                            p95 = if r95 == r99 { p99 } else { sl[..r99].select_nth_unstable(r95); sl[r95] };
-                            p50 = if r50 == r95 { p95 } else { sl[..r95].select_nth_unstable(r50); sl[r50] };
-                        }
+                        let (p50, p95, p99) = if n <= 256 {
+                            sl.sort_unstable(); (sl[r50], sl[r95], sl[r99])
+                        } else {
+                            sl.select_nth_unstable(r99);
+                            let p99 = sl[r99];
+                            let p95 = if r95 == r99 { p99 } else { sl[..r99].select_nth_unstable(r95); sl[r95] };
+                            let p50 = if r50 == r95 { p95 } else { sl[..r95].select_nth_unstable(r50); sl[r50] };
+                            (p50, p95, p99)
+                        };
                         let err = errors[e];
                         line[..20].copy_from_slice(&labels[h]);
                         let nm = sorted[e];
