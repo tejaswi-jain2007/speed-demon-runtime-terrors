@@ -133,15 +133,7 @@ impl<'a> Worker<'a> {
         }
         let sp_mask = _mm256_set1_epi8(b' ' as i8);
         let nl_mask = _mm256_set1_epi8(b'\n' as i8);
-        let mut last_drop = (p as usize + 4095) & !4095;
         while p < end {
-            if (p as usize) - last_drop >= 2 * 1024 * 1024 {
-                let cur = (p as usize) & !4095;
-                if cur > last_drop {
-                    madvise(last_drop as *mut u8, cur - last_drop, MADV_DONTNEED);
-                    last_drop = cur;
-                }
-            }
             let day_idx = (*p.add(9) - b'0' + (*p.add(6) & 1)) as usize;
             let hour = ((*p.add(11) - b'0') * 10 + (*p.add(12) - b'0')) as usize;
             let h = day_idx * 24 + hour - 18;
