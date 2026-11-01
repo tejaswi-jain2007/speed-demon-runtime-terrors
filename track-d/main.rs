@@ -127,7 +127,7 @@ impl SmallMap {
     }
 
     #[inline(always)]
-    fn insert(&mut self, k: u32, v: u32) {
+    fn insert(&mut self, k: u32, v: u32) -> usize {
         let mut idx = (k as usize).wrapping_mul(0x9e3779b9) & self.mask;
         loop {
             let key = unsafe { *self.keys.get_unchecked(idx) };
@@ -136,26 +136,18 @@ impl SmallMap {
                     *self.keys.get_unchecked_mut(idx) = k;
                     *self.vals.get_unchecked_mut(idx) = v;
                 }
-                return;
+                return idx;
             }
             idx = (idx + 1) & self.mask;
         }
     }
 
     #[inline(always)]
-    fn clear_keys(&mut self, touched: &[u32]) {
-        for &k in touched {
-            let mut idx = (k as usize).wrapping_mul(0x9e3779b9) & self.mask;
-            loop {
-                let key = unsafe { *self.keys.get_unchecked(idx) };
-                if key == k {
-                    unsafe {
-                        *self.keys.get_unchecked_mut(idx) = !0u32;
-                        *self.vals.get_unchecked_mut(idx) = !0u32;
-                    }
-                    break;
-                }
-                idx = (idx + 1) & self.mask;
+    fn reset_slots(&mut self, slots: &[usize]) {
+        for &idx in slots {
+            unsafe {
+                *self.keys.get_unchecked_mut(idx) = !0u32;
+                *self.vals.get_unchecked_mut(idx) = !0u32;
             }
         }
     }
@@ -314,7 +306,15 @@ fn main() {
                 let mut local_large = Vec::with_capacity(8);
                 let mut p = (g_ptr_val + start) as *const u8;
                 let end_p = (g_ptr_val + end) as *const u8;
+                let mut last_drop = (p as usize + 4095) & !4095;
                 while p < end_p {
+                    if (p as usize).saturating_sub(last_drop) >= 2 * 1024 * 1024 {
+                        let cur = (p as usize) & !4095;
+                        if cur > last_drop {
+                            unsafe { madvise(last_drop as *mut u8, cur - last_drop, 4); }
+                            last_drop = cur;
+                        }
+                    }
                     while unsafe { *p } <= b' ' { p = unsafe { p.add(1) }; }
                     if p >= end_p { break; }
                     let mut u = unsafe { (*p - b'0') as u32 }; p = unsafe { p.add(1) };
@@ -436,7 +436,7 @@ fn main() {
             let out_ptr = answers_ptr as *mut i64;
             // 2MB L3-resident map per worker
             let mut map = SmallMap::new(1 << 17);
-            let mut touched: Vec<u32> = Vec::with_capacity(4096);
+            let mut touched_slots: Vec<usize> = Vec::with_capacity(4096);
             let mut pq_fwd = Heap4Fast::new();
             let mut pq_bwd = Heap4Fast::new();
 
@@ -451,12 +451,12 @@ fn main() {
 
                 pq_fwd.clear();
                 pq_bwd.clear();
-                touched.clear();
+                touched_slots.clear();
 
-                map.insert(s, (0 << 16) | 0xFFFF);
-                map.insert(t, (0xFFFF << 16) | 0);
-                touched.push(s);
-                touched.push(t);
+                let slot_s = map.insert(s, (0 << 16) | 0xFFFF);
+                let slot_t = map.insert(t, (0xFFFF << 16) | 0);
+                touched_slots.push(slot_s);
+                touched_slots.push(slot_t);
                 pq_fwd.push(0, s);
                 pq_bwd.push(0, t);
 
@@ -491,8 +491,8 @@ fn main() {
                             let cur_fwd = (packed >> 16) as u16;
                             let nd16 = nd as u16;
                             if nd16 < cur_fwd {
-                                if packed == !0u32 { touched.push(to); }
-                                map.insert(to, ((nd16 as u32) << 16) | (packed & 0xFFFF));
+                                let slot = map.insert(to, ((nd16 as u32) << 16) | (packed & 0xFFFF));
+                                if packed == !0u32 { touched_slots.push(slot); }
                                 pq_fwd.push(nd, to);
 
                                 let bwd_d = (packed & 0xFFFF) as u16;
@@ -526,8 +526,8 @@ fn main() {
                             let cur_bwd = packed as u16;
                             let nd16 = nd as u16;
                             if nd16 < cur_bwd {
-                                if packed == !0u32 { touched.push(to); }
-                                map.insert(to, (packed & 0xFFFF_0000) | (nd16 as u32));
+                                let slot = map.insert(to, (packed & 0xFFFF_0000) | (nd16 as u32));
+                                if packed == !0u32 { touched_slots.push(slot); }
                                 pq_bwd.push(nd, to);
 
                                 let fwd_d = (packed >> 16) as u16;
@@ -540,8 +540,8 @@ fn main() {
                     }
                 }
 
-                map.clear_keys(&touched);
-                touched.clear();
+                map.reset_slots(&touched_slots);
+                touched_slots.clear();
 
                 let ans = if best != u32::MAX {
                     best as i64
