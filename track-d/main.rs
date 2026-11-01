@@ -1,4 +1,3 @@
-// Speed Demon 2026 - Track D (Traverse) - Turbo Packed Bidirectional Dijkstra & L3 Cache SmallMap
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
@@ -6,35 +5,29 @@ use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
-
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
-
 extern "C" {
     fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
     fn munmap(a: *mut u8, l: usize) -> i32;
     fn madvise(a: *mut u8, l: usize, adv: i32) -> i32;
     fn _exit(status: i32) -> !;
 }
-
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
 struct Edge {
     to: u32,
     weight: u16,
 }
-
 struct Heap4Fast {
     data: Vec<u64>,
 }
-
 impl Heap4Fast {
     fn new() -> Self {
         Heap4Fast { data: Vec::with_capacity(4096) }
     }
     #[inline(always)] fn clear(&mut self) { self.data.clear(); }
     #[inline(always)] fn is_empty(&self) -> bool { self.data.is_empty() }
-
     #[inline(always)]
     fn push(&mut self, dist: u32, u: u32) {
         let val = ((dist as u64) << 32) | (u as u64);
@@ -52,7 +45,6 @@ impl Heap4Fast {
         }
         unsafe { *self.data.get_unchecked_mut(idx) = val; }
     }
-
     #[inline(always)]
     fn pop(&mut self) -> (u32, u32) {
         let min = unsafe { *self.data.get_unchecked(0) };
@@ -98,14 +90,11 @@ impl Heap4Fast {
         ((min >> 32) as u32, min as u32)
     }
 }
-
-// 262,144 entries = 2MB per worker (eliminates 84MB of per-thread dist buffers)
 struct SmallMap {
     mask: usize,
     keys: Vec<u32>,
     vals: Vec<u32>,
 }
-
 impl SmallMap {
     fn new(cap: usize) -> Self {
         SmallMap {
@@ -114,7 +103,6 @@ impl SmallMap {
             vals: vec![!0u32; cap],
         }
     }
-
     #[inline(always)]
     fn get(&self, k: u32) -> u32 {
         let mut idx = (k as usize).wrapping_mul(0x9e3779b9) & self.mask;
@@ -125,7 +113,6 @@ impl SmallMap {
             idx = (idx + 1) & self.mask;
         }
     }
-
     #[inline(always)]
     fn insert(&mut self, k: u32, v: u32) -> usize {
         let mut idx = (k as usize).wrapping_mul(0x9e3779b9) & self.mask;
@@ -141,7 +128,6 @@ impl SmallMap {
             idx = (idx + 1) & self.mask;
         }
     }
-
     #[inline(always)]
     fn reset_slots(&mut self, slots: &[usize]) {
         for &idx in slots {
@@ -152,7 +138,6 @@ impl SmallMap {
         }
     }
 }
-
 fn dijkstra64(
     head: &[u32],
     edges: &[Edge],
@@ -187,7 +172,6 @@ fn dijkstra64(
     }
     -1
 }
-
 #[inline(always)]
 fn parse_u32(d: &[u8], mut p: usize, val: &mut u32) -> usize {
     while p < d.len() && unsafe { *d.get_unchecked(p) } <= b' ' { p += 1; }
@@ -199,7 +183,6 @@ fn parse_u32(d: &[u8], mut p: usize, val: &mut u32) -> usize {
     *val = v;
     p
 }
-
 fn main() {
     let mut data_dir = String::from("/data");
     let mut out_dir = String::from("/out");
@@ -210,28 +193,23 @@ fn main() {
         else if args[i] == "--out" && i + 1 < args.len() { out_dir = args[i + 1].clone(); i += 2; }
         else { i += 1; }
     }
-
     let graph_path = format!("{}/graph.txt", data_dir);
     let queries_path = format!("{}/queries.txt", data_dir);
     let out_path = format!("{}/distances.txt", out_dir);
-
     let g_file = match File::open(&graph_path) { Ok(f) => f, Err(_) => return };
     let g_len = match g_file.metadata() { Ok(m) => m.len() as usize, Err(_) => return };
     if g_len == 0 { return; }
     let fd = g_file.as_raw_fd();
-
     let g_ptr = unsafe { mmap(std::ptr::null_mut(), g_len, PROT_READ, MAP_PRIVATE, fd, 0) };
     if g_ptr.is_null() || g_ptr as isize == -1 { return; }
     let g_data = unsafe { std::slice::from_raw_parts(g_ptr, g_len) };
     let g_ptr_val = g_data.as_ptr() as usize;
-
     let mut n = 0u32; let mut m = 0u32;
     let mut gp = 0;
     gp = parse_u32(g_data, gp, &mut n);
     gp = parse_u32(g_data, gp, &mut m);
     let edges_start = gp;
-
-    let num_load_threads = 12;
+    let num_load_threads = 16;
     let edges_len = g_len - edges_start;
     let chunk_size = edges_len / num_load_threads;
     let mut bounds = vec![edges_start; num_load_threads + 1];
@@ -241,11 +219,8 @@ fn main() {
         bounds[t] = target;
     }
     bounds[num_load_threads] = g_len;
-
     let head = (0..=(n + 1)).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
     let rev_head = (0..=(n + 1)).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
-
-    // Pass 1: count out-degrees and in-degrees
     std::thread::scope(|s| {
         for t in 0..num_load_threads {
             let start = bounds[t];
@@ -271,7 +246,6 @@ fn main() {
             });
         }
     });
-
     let mut cur_fwd = 0u32;
     let mut cur_rev = 0u32;
     for i in 0..=n as usize {
@@ -284,15 +258,11 @@ fn main() {
     }
     head[(n + 1) as usize].store(cur_fwd, Ordering::Relaxed);
     rev_head[(n + 1) as usize].store(cur_rev, Ordering::Relaxed);
-
     let mut edges = vec![Edge { to: 0, weight: 0 }; m as usize];
     let mut rev_edges = vec![Edge { to: 0, weight: 0 }; m as usize];
     let ep_raw = edges.as_mut_ptr() as usize;
     let rep_raw = rev_edges.as_mut_ptr() as usize;
-
     let large_mutex = std::sync::Mutex::new(HashMap::<(u32, u32), u64>::with_capacity(64));
-
-    // Pass 2: populate both forward and reverse edges and capture large edges in-flight
     std::thread::scope(|s| {
         for t in 0..num_load_threads {
             let start = bounds[t];
@@ -327,7 +297,6 @@ fn main() {
                     while unsafe { *p } >= b'0' { w = w * 10 + unsafe { (*p - b'0') as u64 }; p = unsafe { p.add(1) }; }
                     while unsafe { *p } != b'\n' { p = unsafe { p.add(1) }; }
                     p = unsafe { p.add(1) };
-
                     let slot = h_ref[u as usize].fetch_add(1, Ordering::Relaxed) as usize;
                     let rslot = rh_ref[v as usize].fetch_add(1, Ordering::Relaxed) as usize;
                     let w16 = if w >= 65534 {
@@ -348,10 +317,7 @@ fn main() {
             });
         }
     });
-
     let large_map = large_mutex.into_inner().unwrap();
-
-    // Immediately discard mmap physical pages
     unsafe {
         let p = g_ptr as usize;
         let s = (p + 4095) & !4095;
@@ -360,8 +326,6 @@ fn main() {
         munmap(g_ptr, g_len);
     }
     drop(g_file);
-
-    // Shift in-place to form [0, count(0), count(0)+count(1), ..., total]
     head[(n + 1) as usize].store(cur_fwd, Ordering::Relaxed);
     rev_head[(n + 1) as usize].store(cur_rev, Ordering::Relaxed);
     for j in (1..=n as usize).rev() {
@@ -370,11 +334,8 @@ fn main() {
     }
     head[0].store(0, Ordering::Relaxed);
     rev_head[0].store(0, Ordering::Relaxed);
-
-    // Zero-allocation transmute from Vec<AtomicU32> to Vec<u32> (eliminates 14MB duplicate heap allocation)
     let final_head: Vec<u32> = unsafe { std::mem::transmute(head) };
     let final_rev_head: Vec<u32> = unsafe { std::mem::transmute(rev_head) };
-
     let q_mmap = match File::open(&queries_path) {
         Ok(f) => {
             let len = f.metadata().map(|m| m.len() as usize).unwrap_or(0);
@@ -387,7 +348,6 @@ fn main() {
         }
         Err(_) => None,
     };
-
     let mut queries = Vec::with_capacity(2048);
     if let Some((q_ptr, q_len)) = q_mmap {
         let q_data = unsafe { std::slice::from_raw_parts(q_ptr, q_len) };
@@ -402,27 +362,22 @@ fn main() {
         }
         unsafe { munmap(q_ptr, q_len); }
     }
-
     let num_queries = queries.len();
     if num_queries == 0 {
         let _ = std::fs::create_dir_all(&out_dir);
         let _ = File::create(&out_path);
         return;
     }
-
-    let num_workers = 12.min(num_queries).max(1);
+    let num_workers = 16.min(num_queries).max(1);
     let head_arc = Arc::new(final_head);
     let rhead_arc = Arc::new(final_rev_head);
     let edges_arc = Arc::new(edges);
     let redges_arc = Arc::new(rev_edges);
     let large_arc = Arc::new(large_map);
-
     let mut all_answers = vec![-1i64; num_queries];
     let answers_ptr = all_answers.as_mut_ptr() as usize;
-
     let next_q = Arc::new(AtomicUsize::new(0));
     let mut workers = Vec::with_capacity(num_workers);
-
     for _ in 0..num_workers {
         let head_ref = Arc::clone(&head_arc);
         let rhead_ref = Arc::clone(&rhead_arc);
@@ -431,15 +386,12 @@ fn main() {
         let large_ref = Arc::clone(&large_arc);
         let queries_ref = queries.clone();
         let next_q = Arc::clone(&next_q);
-
         workers.push(std::thread::Builder::new().spawn(move || {
             let out_ptr = answers_ptr as *mut i64;
-            // 2MB L3-resident map per worker
             let mut map = SmallMap::new(1 << 17);
             let mut touched_slots: Vec<usize> = Vec::with_capacity(4096);
             let mut pq_fwd = Heap4Fast::new();
             let mut pq_bwd = Heap4Fast::new();
-
             loop {
                 let qi = next_q.fetch_add(1, Ordering::Relaxed);
                 if qi >= num_queries { break; }
@@ -448,28 +400,21 @@ fn main() {
                     unsafe { *out_ptr.add(qi) = 0; }
                     continue;
                 }
-
                 pq_fwd.clear();
                 pq_bwd.clear();
                 touched_slots.clear();
-
                 let slot_s = map.insert(s, (0 << 16) | 0xFFFF);
                 let slot_t = map.insert(t, (0xFFFF << 16) | 0);
                 touched_slots.push(slot_s);
                 touched_slots.push(slot_t);
                 pq_fwd.push(0, s);
                 pq_bwd.push(0, t);
-
                 let mut best = u32::MAX;
                 let mut had_large = false;
-
                 while !pq_fwd.is_empty() && !pq_bwd.is_empty() {
                     let (df, uf) = pq_fwd.pop();
                     let (db, ub) = pq_bwd.pop();
-
                     if df + db >= best { break; }
-
-                    // Forward expansion
                     let cur_f = (map.get(uf) >> 16) as u16;
                     if (df as u16) <= cur_f {
                         let e_start = head_ref[uf as usize] as usize;
@@ -481,12 +426,10 @@ fn main() {
                             if ew == 65535 { had_large = true; }
                             let nd = df + ew;
                             if nd >= best || nd >= 65534 { continue; }
-
                             if to == t {
                                 if nd < best { best = nd; }
                                 continue;
                             }
-
                             let packed = map.get(to);
                             let cur_fwd = (packed >> 16) as u16;
                             let nd16 = nd as u16;
@@ -494,7 +437,6 @@ fn main() {
                                 let slot = map.insert(to, ((nd16 as u32) << 16) | (packed & 0xFFFF));
                                 if packed == !0u32 { touched_slots.push(slot); }
                                 pq_fwd.push(nd, to);
-
                                 let bwd_d = (packed & 0xFFFF) as u16;
                                 if bwd_d != u16::MAX {
                                     let total = nd + (bwd_d as u32);
@@ -503,8 +445,6 @@ fn main() {
                             }
                         }
                     }
-
-                    // Backward expansion
                     let cur_b = (map.get(ub) & 0xFFFF) as u16;
                     if (db as u16) <= cur_b {
                         let re_start = rhead_ref[ub as usize] as usize;
@@ -516,12 +456,10 @@ fn main() {
                             if ew == 65535 { had_large = true; }
                             let nd = db + ew;
                             if nd >= best || nd >= 65534 { continue; }
-
                             if to == s {
                                 if nd < best { best = nd; }
                                 continue;
                             }
-
                             let packed = map.get(to);
                             let cur_bwd = packed as u16;
                             let nd16 = nd as u16;
@@ -529,7 +467,6 @@ fn main() {
                                 let slot = map.insert(to, (packed & 0xFFFF_0000) | (nd16 as u32));
                                 if packed == !0u32 { touched_slots.push(slot); }
                                 pq_bwd.push(nd, to);
-
                                 let fwd_d = (packed >> 16) as u16;
                                 if fwd_d != u16::MAX {
                                     let total = nd + (fwd_d as u32);
@@ -539,10 +476,8 @@ fn main() {
                         }
                     }
                 }
-
                 map.reset_slots(&touched_slots);
                 touched_slots.clear();
-
                 let ans = if best != u32::MAX {
                     best as i64
                 } else if had_large {
@@ -550,14 +485,11 @@ fn main() {
                 } else {
                     -1
                 };
-
                 unsafe { *out_ptr.add(qi) = ans; }
             }
         }).unwrap());
     }
-
     for w in workers { w.join().unwrap(); }
-
     let mut out_buffer = Vec::with_capacity(32 * 1024);
     for d in all_answers {
         if d < 0 {
@@ -579,7 +511,6 @@ fn main() {
             }
         }
     }
-
     let _ = std::fs::create_dir_all(&out_dir);
     if let Ok(mut f) = File::create(&out_path) {
         let _ = f.write_all(&out_buffer);
