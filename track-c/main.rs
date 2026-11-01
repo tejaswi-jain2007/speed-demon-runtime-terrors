@@ -3,7 +3,6 @@ use std::arch::x86_64::*;
 use std::cell::UnsafeCell;
 use std::fs::File;
 use std::io::Write;
-use std::mem::MaybeUninit;
 use std::os::unix::io::AsRawFd;
 use std::sync::Barrier;
 use std::thread;
@@ -59,13 +58,6 @@ impl FastMmap {
 impl Drop for FastMmap { fn drop(&mut self) { unsafe { munmap(self.ptr as *mut u8, self.len); } } }
 
 #[inline(always)]
-unsafe fn parse_u64_len(p: *const u8, len: usize) -> u64 {
-    let mut v = (*p - b'0') as u64;
-    for i in 1..len { v = v * 10 + (*p.add(i) - b'0') as u64; }
-    v
-}
-
-#[inline(always)]
 fn append_u64(buf: &mut Vec<u8>, mut v: u64) {
     if v == 0 { buf.push(b'0'); return; }
     let (mut t, mut i) = ([0u8; 20], 20);
@@ -101,7 +93,7 @@ impl LocalCountryAgg {
 const B_CAP: usize = 128;
 
 #[derive(Clone, Copy)]
-struct Block { next: u32, hashes: [MaybeUninit<u32>; B_CAP] }
+struct Block { next: u32, hashes: [u32; B_CAP] }
 
 struct ThreadPool {
     heads: [u32; 242],
@@ -111,19 +103,19 @@ struct ThreadPool {
 
 impl ThreadPool {
     fn new() -> Self {
-        ThreadPool { heads: [!0; 242], lens: [B_CAP as u16; 242], blocks: Vec::with_capacity(2600) }
+        ThreadPool { heads: [!0; 242], lens: [B_CAP as u16; 242], blocks: Vec::with_capacity(800) }
     }
     #[inline(always)]
     fn push(&mut self, cid: usize, hash: u32) {
         let cur_len = self.lens[cid];
         if cur_len < B_CAP as u16 {
             let h = self.heads[cid] as usize;
-            self.blocks[h].hashes[cur_len as usize].write(hash);
+            self.blocks[h].hashes[cur_len as usize] = hash;
             self.lens[cid] = cur_len + 1;
         } else {
             let new_idx = self.blocks.len() as u32;
-            let mut blk = Block { next: self.heads[cid], hashes: unsafe { MaybeUninit::uninit().assume_init() } };
-            blk.hashes[0].write(hash);
+            let mut blk = Block { next: self.heads[cid], hashes: [0; B_CAP] };
+            blk.hashes[0] = hash;
             self.blocks.push(blk);
             self.heads[cid] = new_idx;
             self.lens[cid] = 1;
@@ -144,12 +136,10 @@ unsafe fn parse_csv_chunk(
         if *p == 0xEF && p.add(3) <= end_ptr && *p.add(1) == 0xBB && *p.add(2) == 0xBF { p = p.add(3); }
         if p >= end_ptr { break; }
 
-        let w = (p as *const u64).read_unaligned();
-        let v = w ^ 0x2C2C2C2C2C2C2C2Cu64;
-        let z = v.wrapping_sub(0x0101010101010101u64) & !v & 0x8080808080808080u64;
-        let id_len = (z.trailing_zeros() >> 3) as usize;
-        let record_id = parse_u64_len(p, id_len);
-        p = p.add(id_len + 1);
+        let mut record_id = (*p - b'0') as u64;
+        p = p.add(1);
+        while *p != b',' { record_id = record_id * 10 + (*p - b'0') as u64; p = p.add(1); }
+        p = p.add(1);
 
         let (name_hash, name_len) = if *p == b',' {
             p = p.add(1); (0u32, 0u64)
@@ -211,44 +201,40 @@ unsafe fn parse_csv_chunk(
         } else {
             let start_note = p;
             while *p != b',' { p = p.add(1); }
-            let nlen = p as usize - start_note as usize;
-            p = p.add(1);
-            nlen as u64
+            let nlen = (p as usize - start_note as usize) as u64;
+            p = p.add(1); nlen
         };
 
-        let w = (p as *const u64).read_unaligned();
-        let v = w ^ 0x2C2C2C2C2C2C2C2Cu64;
-        let z = v.wrapping_sub(0x0101010101010101u64) & !v & 0x8080808080808080u64;
-        let r_len = (z.trailing_zeros() >> 3) as usize;
-        let region_id = parse_u64_len(p, r_len) as u32;
-        p = p.add(r_len + 1);
+        let mut region_id = (*p - b'0') as u32;
+        p = p.add(1);
+        while *p != b',' { region_id = region_id * 10 + (*p - b'0') as u32; p = p.add(1); }
+        p = p.add(1);
 
         let neg = *p == b'-';
         if neg { p = p.add(1); }
-        let w = (p as *const u64).read_unaligned();
-        let v = w ^ 0x2E2E2E2E2E2E2E2Eu64;
-        let z = v.wrapping_sub(0x0101010101010101u64) & !v & 0x8080808080808080u64;
-        let w_len = (z.trailing_zeros() >> 3) as usize;
-        let whole = parse_u64_len(p, w_len) as i64;
-        p = p.add(w_len + 1);
+        let mut whole = (*p - b'0') as i64;
+        p = p.add(1);
+        while *p != b'.' { whole = whole * 10 + (*p - b'0') as i64; p = p.add(1); }
+        p = p.add(1);
         let cents_abs = whole * 100 + ((*p - b'0') as i64) * 10 + (*p.add(1) - b'0') as i64;
-        let cents = if neg { -cents_abs } else { cents_abs };
         p = p.add(2);
-        if *p == b'\r' { p = p.add(2); } else if *p == b'\n' { p = p.add(1); }
+        let cents = if neg { -cents_abs } else { cents_abs };
+        if *p == b'\r' { p = p.add(1); }
+        if *p == b'\n' { p = p.add(1); }
 
         let cid = if (region_id as usize) < rlookup.len() { *rlookup.get_unchecked(region_id as usize) as usize } else { 0 };
         let agg = local_aggs.get_unchecked_mut(cid);
         agg.count += 1;
         agg.id_sum += record_id;
         agg.amount_sum += cents;
-        agg.amount_min = agg.amount_min.min(cents);
-        agg.amount_max = agg.amount_max.max(cents);
+        if cents < agg.amount_min { agg.amount_min = cents; }
+        if cents > agg.amount_max { agg.amount_max = cents; }
         agg.name_bytes += name_len;
         agg.note_bytes += note_len;
 
         pool.push(cid, name_hash);
 
-        if (p as usize).saturating_sub(last_drop) >= 2 * 1024 * 1024 {
+        if (p as usize).saturating_sub(last_drop) >= 8 * 1024 * 1024 {
             drop_pages(last_drop as *const u8, p as usize - last_drop);
             last_drop = p as usize;
         }
@@ -368,8 +354,7 @@ fn main() {
                         while cur != !0 {
                             let blk = &pool.blocks[cur as usize];
                             let len = if first_block { first_block = false; pool.lens[c] as usize } else { B_CAP };
-                            let slice: &[u32] = unsafe { std::slice::from_raw_parts(blk.hashes.as_ptr() as *const u32, len) };
-                            buf.extend_from_slice(slice);
+                            buf.extend_from_slice(&blk.hashes[..len]);
                             cur = blk.next;
                         }
                     }
@@ -394,8 +379,8 @@ fn main() {
                 dest.count += src.count; dest.id_sum += src.id_sum; dest.amount_sum += src.amount_sum;
                 if first { dest.amount_min = src.amount_min; dest.amount_max = src.amount_max; first = false; }
                 else {
-                    dest.amount_min = dest.amount_min.min(src.amount_min);
-                    dest.amount_max = dest.amount_max.max(src.amount_max);
+                    if src.amount_min < dest.amount_min { dest.amount_min = src.amount_min; }
+                    if src.amount_max > dest.amount_max { dest.amount_max = src.amount_max; }
                 }
                 dest.name_bytes += src.name_bytes; dest.note_bytes += src.note_bytes;
             }
