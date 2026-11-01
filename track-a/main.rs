@@ -495,7 +495,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         for val in [n as u32, p50, p95, p99, err, ppm] {
                             line[pos] = b' '; pos = append_u32(&mut line, val, pos + 1);
                         }
-                        pos += 1;
+                        line[pos] = b'\n'; pos += 1;
                         out_text.extend_from_slice(&line[..pos]);
                     }
                     done_ref[h].store(true, Ordering::Release);
