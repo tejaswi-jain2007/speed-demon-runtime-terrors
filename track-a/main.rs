@@ -42,20 +42,6 @@ unsafe fn find(mut s: *const u8, c: u8) -> *const u8 {
         s = s.add(32);
     }
 }
-#[inline(always)]
-unsafe fn parse_digits(end: *const u8, len: u32) -> u32 {
-    let v = _mm_loadu_si128(end.sub(16) as *const __m128i);
-    let v = _mm_subs_epu8(v, _mm_set1_epi8(b'0' as i8));
-    let lane = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    let v = _mm_and_si128(v, _mm_cmpgt_epi8(lane, _mm_set1_epi8((15 - len) as i8)));
-    let v = _mm_maddubs_epi16(v, _mm_set1_epi16(0x010A));
-    let v = _mm_madd_epi16(v, _mm_set1_epi32(0x00010064));
-    let v = _mm_packus_epi32(v, v);
-    let v = _mm_madd_epi16(v, _mm_set1_epi32(0x00012710));
-    let high = _mm_cvtsi128_si32(v) as u32;
-    let low = _mm_extract_epi32(v, 1) as u32;
-    high.wrapping_mul(100000000) + low
-}
 #[derive(Copy, Clone)]
 struct SendPtr<T>(*const T);
 unsafe impl<T> Send for SendPtr<T> {} unsafe impl<T> Sync for SendPtr<T> {}
@@ -140,30 +126,30 @@ impl<'a> Worker<'a> {
             std::process::exit(1);
         }
         while p < end {
-            let day_idx = if *p.add(6) == b'0' {
-                (*p.add(9) - b'0') as i32
-            } else {
-                (*p.add(9) - b'0' + 1) as i32
-            };
+            let day_idx = if *p.add(6) == b'0' { (*p.add(9) - b'0') as i32 } else { (*p.add(9) - b'0' + 1) as i32 };
             let hour = ((*p.add(11) - b'0') * 10 + (*p.add(12) - b'0')) as i32;
             let h = (day_idx * 24 + hour - 18) as usize;
-            let m = p.add(28);
-            let sp = (match32(m, b' ') as u64) | ((match32(m.add(32), b' ') as u64) << 32);
-            let nl = (match32(m, b'\n') as u64) | ((match32(m.add(32), b'\n') as u64) << 32);
-            let ep = m.add(sp.trailing_zeros() as usize + 1);
-            let ee = if nl != 0 {
-                m.add((sp & (sp - 1)).trailing_zeros() as usize)
-            } else {
-                find(ep, b' ')
+            let ep = match *p.add(28) {
+                b'G' => p.add(32),
+                b'P' => match *p.add(29) {
+                    b'O' => p.add(33),
+                    b'U' => p.add(32),
+                    _ => p.add(34),
+                },
+                b'D' => p.add(35),
+                b'O' => p.add(36),
+                _ => p.add(33),
             };
-            let eol = if nl != 0 {
-                m.add(nl.trailing_zeros() as usize)
-            } else {
-                find(ee.add(5), b'\n')
-            };
+            let ee = find(ep, b' ');
+            let eol = find(ee.add(5), b'\n');
             let is_err = if *ee.add(1) == b'5' { ERR_BIT } else { 0 };
             let key = self.endpoints.intern(ep, ee as usize - ep as usize) | is_err;
-            let lat = parse_digits(eol, (eol as usize - ee as usize - 5) as u32);
+            let mut lat = 0u32;
+            let mut cur = ee.add(5);
+            while cur < eol {
+                lat = lat * 10 + (*cur - b'0') as u32;
+                cur = cur.add(1);
+            }
             p = eol.add(1);
             if lat >= BIG {
                 self.big[h].push((lat, key));
